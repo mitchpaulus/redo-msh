@@ -6,12 +6,16 @@
 //! (`redo-msh <targets...>`). This replaces the multi-binary symlink trick,
 //! which does not port to Windows.
 
+mod build;
 mod db;
+mod dofile;
 mod fsguard;
 mod paths;
 mod root;
+mod stamp;
 
 use anyhow::Result;
+use build::Ctx;
 use root::Root;
 use std::path::Path;
 
@@ -38,9 +42,11 @@ fn run(args: &[String]) -> Result<()> {
 
     match verb {
         "root" => cmd_root(rest),
-        "ifchange" | "ifcreate" | "always" | "sources" | "targets" | "ood" => {
-            // Implemented in later milestones (M2/M3/M7).
-            anyhow::bail!("`{verb}` is not implemented yet (coming in a later milestone)")
+        "ifchange" => build::ifchange(&Ctx::from_env()?, rest),
+        "ifcreate" => build::ifcreate(&Ctx::from_env()?, rest),
+        "always" => build::always(&Ctx::from_env()?),
+        "sources" | "targets" | "ood" => {
+            anyhow::bail!("`{verb}` is not implemented yet (coming in M7)")
         }
         "-h" | "--help" | "help" => {
             print_usage();
@@ -50,8 +56,8 @@ fn run(args: &[String]) -> Result<()> {
             println!("redo-msh {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        // No recognized verb: treat all args as targets to build (M2).
-        _ => anyhow::bail!("building targets is not implemented yet (coming in M2)"),
+        // No recognized verb: treat all args as targets to build.
+        _ => build::redo(args),
     }
 }
 
