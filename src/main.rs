@@ -10,6 +10,7 @@ mod build;
 mod db;
 mod dofile;
 mod fsguard;
+mod lock;
 mod paths;
 mod root;
 mod stamp;

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 blake3 = "1"
+fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]

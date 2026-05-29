@@ -217,9 +217,14 @@ fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
 
 // ---- the build operation ----------------------------------------------------
 
-/// Build `target_rel` (root-relative) by running its do-file. Always rebuilds
-/// (the caller decides whether a build is warranted).
-pub fn build(ctx: &Ctx, target_rel: &str) -> Result<()> {
+/// Build `target_rel`, acquiring the per-target lock for build exclusion.
+///
+/// The cross-process cycle check runs *before* locking (so a cycle errors
+/// instead of deadlocking). After acquiring the lock we re-check whether the
+/// target was built this session by whoever held the lock before us — the
+/// double-checked rebuild that makes concurrent builds safe. `force` (top-level
+/// `redo`) skips that check and always rebuilds.
+pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     if ctx.chain.iter().any(|t| t == target_rel) {
         bail!(
             "dependency cycle detected: {} -> {}",
@@ -227,7 +232,17 @@ pub fn build(ctx: &Ctx, target_rel: &str) -> Result<()> {
             target_rel
         );
     }
+    let _lock = crate::lock::lock_target(&ctx.root, target_rel)?;
+    if !force && file_runid(&ctx.conn, target_rel)? == Some(ctx.session) {
+        // Built by another process while we waited for the lock.
+        return Ok(());
+    }
+    build_inner(ctx, target_rel)
+}
 
+/// Run the target's do-file and commit its output. Assumes the per-target lock
+/// is held and a build has been determined necessary.
+fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     let (dofile_opt, absent) = dofile::find(&ctx.root, target_rel);
     let df = match dofile_opt {
         Some(d) => d,
@@ -382,7 +397,7 @@ pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
     }
     let result = (|| {
         if is_ood(ctx, target)? {
-            build(ctx, target)
+            build(ctx, target, false)
         } else {
             mark_verified(ctx, target)
         }
@@ -585,7 +600,7 @@ pub fn redo(targets: &[String]) -> Result<()> {
     let ctx = Ctx::top_level()?;
     for input in targets {
         let target_rel = normalize_target(&ctx.root, input)?;
-        build(&ctx, &target_rel)?;
+        build(&ctx, &target_rel, true)?;
     }
     Ok(())
 }
