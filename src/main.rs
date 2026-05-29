@@ -1,0 +1,85 @@
+//! redo-msh: a cross-platform, parallel, mshell-based implementation of DJB redo.
+//!
+//! Command dispatch follows redo's convention: the first argument is a verb
+//! (`root`, `ifchange`, `ifcreate`, `always`, `sources`, `targets`, `ood`); if
+//! it is not a known verb, every argument is treated as a target to build
+//! (`redo-msh <targets...>`). This replaces the multi-binary symlink trick,
+//! which does not port to Windows.
+
+mod db;
+mod fsguard;
+mod paths;
+mod root;
+
+use anyhow::Result;
+use root::Root;
+use std::path::Path;
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = match run(&args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("redo-msh: {e:#}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+fn run(args: &[String]) -> Result<()> {
+    let (verb, rest) = match args.split_first() {
+        Some((v, r)) => (v.as_str(), r),
+        None => {
+            print_usage();
+            return Ok(());
+        }
+    };
+
+    match verb {
+        "root" => cmd_root(rest),
+        "ifchange" | "ifcreate" | "always" | "sources" | "targets" | "ood" => {
+            // Implemented in later milestones (M2/M3/M7).
+            anyhow::bail!("`{verb}` is not implemented yet (coming in a later milestone)")
+        }
+        "-h" | "--help" | "help" => {
+            print_usage();
+            Ok(())
+        }
+        "--version" => {
+            println!("redo-msh {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        // No recognized verb: treat all args as targets to build (M2).
+        _ => anyhow::bail!("building targets is not implemented yet (coming in M2)"),
+    }
+}
+
+/// `redo-msh root [dir]` — initialize a project root.
+fn cmd_root(args: &[String]) -> Result<()> {
+    let dir = args.first().map(Path::new).unwrap_or_else(|| Path::new("."));
+    let root = Root::init(dir)?;
+    println!(
+        "redo-msh: initialized project root at {}",
+        root.dir.display()
+    );
+    println!("  database: {}", root.db_path().display());
+    Ok(())
+}
+
+fn print_usage() {
+    eprintln!(
+        "redo-msh {} — DJB redo, cross-platform, mshell do-files
+
+USAGE:
+    redo-msh <targets...>        build targets (force)
+    redo-msh ifchange <deps...>  declare + build dependencies   [M2]
+    redo-msh ifcreate <paths...> declare non-existence deps     [M2]
+    redo-msh always              declare an always-build dep    [M2]
+    redo-msh root [dir]          initialize a project root
+    redo-msh sources|targets|ood introspection                  [M7]
+
+Only `root` is implemented so far.",
+        env!("CARGO_PKG_VERSION")
+    );
+}

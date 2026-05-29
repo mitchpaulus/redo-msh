@@ -1,0 +1,20 @@
+[package]
+name = "redo-msh"
+version = "0.1.0"
+edition = "2021"
+description = "A cross-platform, parallel, mshell-based implementation of DJB redo"
+license = "MIT"
+
+[[bin]]
+name = "redo-msh"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
