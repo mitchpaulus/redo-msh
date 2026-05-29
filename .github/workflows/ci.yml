@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Installs `msh`/`mshell` on PATH (Linux + Windows) and sets up the
+      # versioned std.msh/init.msh so do-files run. The do-files in tests/ use
+      # only mshell built-ins, so the end-to-end suite runs identically on both.
+      - name: Install mshell
+        uses: mitchpaulus/mshell@main
+
+      - name: Show tool versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          msh --version
+
+      - name: Build
+        run: cargo build --verbose --locked
+
+      - name: Test (unit + end-to-end)
+        run: cargo test --verbose --locked
