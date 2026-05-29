@@ -12,6 +12,7 @@ mod dofile;
 mod fsguard;
 mod jobserver;
 mod lock;
+mod logs;
 mod paths;
 mod root;
 mod stamp;

@@ -60,6 +60,7 @@ impl Ctx {
     /// start a fresh session, and initialize the jobserver for `j` parallel
     /// jobs.
     pub fn top_level(j: usize) -> Result<Ctx> {
+        crate::logs::init_top();
         let cwd = std::env::current_dir()?;
         let root = Root::discover(&cwd)?;
         let conn = root.open_db()?;
@@ -129,9 +130,6 @@ impl Ctx {
         })
     }
 
-    fn log(&self, msg: &str) {
-        eprintln!("redo-msh: {}{}", "  ".repeat(self.depth), msg);
-    }
 }
 
 /// Normalize a command-line path (relative to cwd) to a root-relative key.
@@ -401,7 +399,6 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         Some(d) => d,
         None => bail!("no .do file found to build target {target_rel:?}"),
     };
-    ctx.log(&format!("redo {target_rel}"));
 
     // Reset dependency edges; the do-file re-declares them as it runs.
     clear_deps(&ctx.conn, target_rel)?;
@@ -425,17 +422,21 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     let tmp3_rel = format!("{}.redo-tmp.{}", df.arg_target, pid);
     let tmp3_abs = df.dodir_abs.join(&tmp3_rel);
 
-    // Separate capture file for the do-file's stdout.
+    // Separate capture files for the do-file's stdout (output detection) and
+    // stderr (diagnostics, emitted as one contiguous log block at completion).
     let tmp_dir = ctx.root.redo_dir().join("tmp");
     fs::create_dir_all(&tmp_dir)?;
     let capture_path = tmp_dir.join(format!("stdout.{}.{}", pid, sanitize(target_rel)));
+    let errlog_path = tmp_dir.join(format!("stderr.{}.{}", pid, sanitize(target_rel)));
 
-    // Both temps are removed on every exit path (return, `?`, panic).
+    // All temps are removed on every exit path (return, `?`, panic).
     let _guard = TempGuard {
-        paths: vec![tmp3_abs.clone(), capture_path.clone()],
+        paths: vec![tmp3_abs.clone(), capture_path.clone(), errlog_path.clone()],
     };
     let capture_file = fs::File::create(&capture_path)
         .with_context(|| format!("creating stdout capture {}", capture_path.display()))?;
+    let errlog_file = fs::File::create(&errlog_path)
+        .with_context(|| format!("creating stderr capture {}", errlog_path.display()))?;
 
     // Child environment.
     let mut child_chain = ctx.chain.clone();
@@ -447,6 +448,7 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         .arg(&tmp3_rel)
         .current_dir(&df.dodir_abs)
         .stdout(capture_file)
+        .stderr(errlog_file)
         .env(E_ROOT, &ctx.root.dir)
         .env(E_TARGET, target_rel)
         .env(E_SESSION, ctx.session.to_string())
@@ -454,6 +456,16 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         .env(E_CHAIN, child_chain.join("\n"))
         .status()
         .with_context(|| format!("running do-file {}", df.dofile_abs.display()))?;
+
+    // Emit this target's log block (header + captured stderr) as one
+    // non-interleaved unit, streamed in completion order and indented by depth.
+    let header = format!(
+        "{}redo  {}{}",
+        "  ".repeat(ctx.depth),
+        target_rel,
+        if status.success() { "" } else { "  (failed)" }
+    );
+    crate::logs::emit_block(&ctx.root.redo_dir(), &header, &errlog_path);
 
     let after_t = fs::metadata(&target_abs).ok();
     let cap_size = fs::metadata(&capture_path).map(|m| m.len()).unwrap_or(0);
