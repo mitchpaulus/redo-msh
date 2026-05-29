@@ -80,6 +80,9 @@ fn extract_jobs(args: &[String]) -> Result<(usize, Vec<String>)> {
             jobs = v.parse().with_context(|| format!("invalid job count {v:?}"))?;
         } else if let Some(v) = a.strip_prefix("-j") {
             jobs = v.parse().with_context(|| format!("invalid job count {v:?}"))?;
+        } else if a == "--yes" || a == "-y" {
+            // Auto-overwrite hand-edited targets; inherited by child processes.
+            std::env::set_var("REDO_YES", "1");
         } else {
             rest.push(a.clone());
         }

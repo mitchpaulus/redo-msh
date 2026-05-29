@@ -22,6 +22,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc};
@@ -231,13 +232,140 @@ fn fsync_dir(dir: &Path) {
 #[cfg(not(unix))]
 fn fsync_dir(_dir: &Path) {}
 
+/// Number of rename attempts. On Windows a virus scanner or indexer can hold a
+/// transient handle on the freshly written temp file, causing a sharing
+/// violation; we retry with backoff. Unix rename(2) is atomic and never needs
+/// retrying.
+const RENAME_RETRIES: usize = if cfg!(windows) { 10 } else { 1 };
+
+fn is_transient_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AlreadyExists
+    )
+}
+
 /// Atomically replace `dst` with `src` (same volume by construction).
+/// std::fs::rename replaces an existing destination on both Unix (rename(2))
+/// and Windows (MoveFileEx). Retries transient Windows sharing violations.
 fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
-    // std::fs::rename replaces an existing destination on both Unix (rename(2))
-    // and Windows (MoveFileEx). Windows-specific hardening lands in M6.
-    fs::rename(src, dst).with_context(|| {
-        format!("renaming {} -> {}", src.display(), dst.display())
-    })
+    let mut delay = std::time::Duration::from_millis(2);
+    for attempt in 0..RENAME_RETRIES {
+        match fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt + 1 < RENAME_RETRIES && is_transient_io(&e) => {
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("renaming {} -> {}", src.display(), dst.display())));
+            }
+        }
+    }
+    unreachable!("rename loop always returns")
+}
+
+/// Removes a set of temp files on drop, on every control-flow path (early
+/// return, `?`, or panic). Crash-only design: a SIGKILL won't run this, but the
+/// startup temp GC sweeps anything left behind.
+struct TempGuard {
+    paths: Vec<PathBuf>,
+}
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+/// Remove leftover `<target>.redo-tmp.*` files (e.g. from a previously crashed
+/// build of this target) in the directory where the temp would be created.
+fn clean_target_temps(dodir: &Path, arg_target: &str) {
+    let tmp_path = Path::new(arg_target);
+    let dir = match tmp_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => dodir.join(p),
+        _ => dodir.to_path_buf(),
+    };
+    let base = match tmp_path.file_name().and_then(|s| s.to_str()) {
+        Some(b) => b,
+        None => return,
+    };
+    let prefix = format!("{base}.redo-tmp.");
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if name.starts_with(&prefix) {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+}
+
+/// Sweep stale stdout-capture temp files left by crashed builds.
+fn gc_temps(root: &Root) {
+    let tmp = root.redo_dir().join("tmp");
+    if let Ok(entries) = fs::read_dir(&tmp) {
+        for e in entries.flatten() {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Refuse to silently overwrite a target whose on-disk content differs from
+/// what we recorded after building it (i.e. it was edited by hand). With
+/// `--yes` (env `REDO_YES=1`) we overwrite; on a tty we ask; otherwise we fail.
+fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Result<()> {
+    if !target_abs.exists() {
+        return Ok(());
+    }
+    // Only generated files (a row with a recorded content hash) can be "edited
+    // since built"; sources and phony targets are exempt.
+    let recorded = match files_row(&ctx.conn, target_rel)? {
+        Some(Some(c)) => c,
+        _ => return Ok(()),
+    };
+    let current = stamp::hash_file(target_abs)?;
+    if current == recorded {
+        return Ok(());
+    }
+    // Hand-edited.
+    if std::env::var("REDO_YES").as_deref() == Ok("1") {
+        eprintln!("redo-msh: {target_rel} was modified by hand; overwriting (--yes)");
+        return Ok(());
+    }
+    if std::io::stderr().is_terminal() && prompt_overwrite(target_rel)? {
+        return Ok(());
+    }
+    bail!(
+        "{target_rel} was modified by hand since it was last built; refusing to overwrite. \
+         Pass --yes to overwrite, or move your changes out of the way."
+    )
+}
+
+/// Ask on the controlling terminal whether to overwrite a hand-edited target.
+fn prompt_overwrite(target_rel: &str) -> Result<bool> {
+    use std::io::{BufRead, Write};
+    #[cfg(unix)]
+    let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+    #[cfg(not(unix))]
+    let tty: std::io::Result<fs::File> = Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "no controlling tty",
+    ));
+    let mut tty = match tty {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    write!(tty, "redo-msh: {target_rel} was modified by hand. Overwrite? [y/N] ")?;
+    tty.flush()?;
+    let mut reader = std::io::BufReader::new(tty);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let ans = line.trim().to_ascii_lowercase();
+    Ok(ans == "y" || ans == "yes")
 }
 
 // ---- the build operation ----------------------------------------------------
@@ -286,16 +414,26 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     let target_abs = ctx.root.dir.join(target_rel);
     let before_t = fs::metadata(&target_abs).ok();
 
-    // Temp output ($3), beside the target for same-volume atomic rename.
+    // Refuse to silently clobber a target that was modified by hand since we
+    // last built it.
+    check_not_hand_edited(ctx, target_rel, &target_abs)?;
+
+    // Temp output ($3), beside the target for same-volume atomic rename. Sweep
+    // any stale temps for this target from a previously crashed build.
+    clean_target_temps(&df.dodir_abs, &df.arg_target);
     let pid = std::process::id();
     let tmp3_rel = format!("{}.redo-tmp.{}", df.arg_target, pid);
     let tmp3_abs = df.dodir_abs.join(&tmp3_rel);
-    let _ = fs::remove_file(&tmp3_abs);
 
     // Separate capture file for the do-file's stdout.
     let tmp_dir = ctx.root.redo_dir().join("tmp");
     fs::create_dir_all(&tmp_dir)?;
     let capture_path = tmp_dir.join(format!("stdout.{}.{}", pid, sanitize(target_rel)));
+
+    // Both temps are removed on every exit path (return, `?`, panic).
+    let _guard = TempGuard {
+        paths: vec![tmp3_abs.clone(), capture_path.clone()],
+    };
     let capture_file = fs::File::create(&capture_path)
         .with_context(|| format!("creating stdout capture {}", capture_path.display()))?;
 
@@ -321,11 +459,6 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     let cap_size = fs::metadata(&capture_path).map(|m| m.len()).unwrap_or(0);
     let tmp3_exists = tmp3_abs.exists();
 
-    let cleanup = || {
-        let _ = fs::remove_file(&tmp3_abs);
-        let _ = fs::remove_file(&capture_path);
-    };
-
     // The do-file must not write the target ($1) directly.
     let modified_directly = match (&before_t, &after_t) {
         (_, None) => false,
@@ -333,18 +466,15 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         (Some(bt), Some(at)) => !at.is_dir() && bt.modified().ok() != at.modified().ok(),
     };
     if modified_directly {
-        cleanup();
         bail!("do-file for {target_rel} modified the target directly; write to $3 or stdout, not $1");
     }
     if !status.success() {
-        cleanup();
         bail!(
             "do-file for {target_rel} failed (exit {})",
             status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
         );
     }
     if tmp3_exists && cap_size > 0 {
-        cleanup();
         bail!("do-file for {target_rel} wrote to both stdout and $3; choose one (status messages go to stderr)");
     }
 
@@ -353,7 +483,6 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         fs::copy(&capture_path, &tmp3_abs)
             .with_context(|| format!("copying stdout to {}", tmp3_abs.display()))?;
     }
-    let _ = fs::remove_file(&capture_path);
 
     if tmp3_abs.exists() {
         fsync_file(&tmp3_abs)?;
@@ -701,6 +830,7 @@ pub fn always(ctx: &Ctx) -> Result<()> {
 /// `redo-msh <targets...>`: force-build each target with `j` parallel jobs.
 pub fn redo(targets: &[String], j: usize) -> Result<()> {
     let ctx = Ctx::top_level(j)?;
+    gc_temps(&ctx.root); // sweep temp files left by any crashed build
     // Force-build the requested targets in parallel under the jobserver. We
     // mark them verified-this-session via a forced build, so reuse the parallel
     // scheduler but bypass the up-to-date check by clearing their session mark.
