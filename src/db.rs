@@ -26,6 +26,18 @@ pub enum DepKind {
     DoFile = 3,
 }
 
+impl DepKind {
+    pub fn from_i64(v: i64) -> Option<DepKind> {
+        match v {
+            0 => Some(DepKind::IfChange),
+            1 => Some(DepKind::IfCreate),
+            2 => Some(DepKind::Always),
+            3 => Some(DepKind::DoFile),
+            _ => None,
+        }
+    }
+}
+
 /// Open (creating if needed) the database and apply pragmas + schema.
 pub fn open(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)

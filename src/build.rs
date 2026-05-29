@@ -18,6 +18,8 @@ use crate::root::Root;
 use crate::stamp::{self, Stamp};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,10 +34,13 @@ pub struct Ctx {
     pub session: i64,
     /// Indentation depth for logging.
     pub depth: usize,
-    /// Ancestor target chain (root-relative) for cycle detection.
+    /// Ancestor target chain (root-relative) for cross-process cycle detection.
     pub chain: Vec<String>,
     /// The target whose do-file we are currently inside (`REDO_TARGET`), if any.
     pub target: Option<String>,
+    /// Targets currently being ensured in *this* process, for in-process cycle
+    /// detection during out-of-date traversal.
+    pub active: RefCell<HashSet<String>>,
 }
 
 const E_ROOT: &str = "REDO_ROOT";
@@ -59,6 +64,7 @@ impl Ctx {
             depth: 0,
             chain: Vec::new(),
             target: None,
+            active: RefCell::new(HashSet::new()),
         })
     }
 
@@ -93,6 +99,7 @@ impl Ctx {
             depth,
             chain,
             target,
+            active: RefCell::new(HashSet::new()),
         })
     }
 
@@ -332,8 +339,9 @@ pub fn build(ctx: &Ctx, target_rel: &str) -> Result<()> {
     Ok(())
 }
 
-/// `redo-msh ifchange <deps...>`: ensure each dep is built (if it has a
-/// do-file) and record the dependency edge from the current `REDO_TARGET`.
+/// `redo-msh ifchange <deps...>`: bring each dependency up to date (build it if
+/// it is out of date and has a do-file) and record the dependency edge from the
+/// current `REDO_TARGET`.
 pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
     for input in inputs {
         let dep_rel = normalize_target(&ctx.root, input)?;
@@ -341,10 +349,7 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
         let (dofile_opt, _absent) = dofile::find(&ctx.root, &dep_rel);
 
         if dofile_opt.is_some() {
-            // Buildable target: build unless already built this session.
-            if file_runid(&ctx.conn, &dep_rel)? != Some(ctx.session) {
-                build(ctx, &dep_rel)?;
-            }
+            ensure(ctx, &dep_rel)?;
         } else {
             // Source file: must exist; record/refresh its stamp.
             if !dep_abs.exists() {
@@ -361,6 +366,191 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bring a buildable `target` up to date: build it if out of date, otherwise
+/// mark it verified for this session. Idempotent within a session.
+pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
+    // Already built or verified this session.
+    if file_runid(&ctx.conn, target)? == Some(ctx.session) {
+        return Ok(());
+    }
+    // In-process cycle guard for the out-of-date traversal (the cross-process
+    // chain guard lives in build()).
+    if !ctx.active.borrow_mut().insert(target.to_string()) {
+        bail!("dependency cycle detected involving {target}");
+    }
+    let result = (|| {
+        if is_ood(ctx, target)? {
+            build(ctx, target)
+        } else {
+            mark_verified(ctx, target)
+        }
+    })();
+    ctx.active.borrow_mut().remove(target);
+    result
+}
+
+/// Decide whether a buildable `target` is out of date.
+fn is_ood(ctx: &Ctx, target: &str) -> Result<bool> {
+    let target_abs = ctx.root.dir.join(target);
+    let row = files_row(&ctx.conn, target)?;
+    let built_csum = match row {
+        Some(c) => c,
+        None => return Ok(true), // never built
+    };
+    // A previously-produced file that is now gone must be rebuilt. (A phony
+    // target has no recorded csum, so its absence is expected.)
+    if built_csum.is_some() && !target_abs.exists() {
+        return Ok(true);
+    }
+
+    for (kind, dep, edge_csum) in read_deps(&ctx.conn, target)? {
+        match kind {
+            DepKind::Always => return Ok(true),
+            DepKind::DoFile => {
+                let dep = dep.expect("dofile dep has a path");
+                if current_csum(ctx, &dep)?.as_deref() != edge_csum.as_deref() {
+                    return Ok(true);
+                }
+            }
+            DepKind::IfCreate => {
+                let dep = dep.expect("ifcreate dep has a path");
+                if ctx.root.dir.join(&dep).exists() {
+                    return Ok(true);
+                }
+            }
+            DepKind::IfChange => {
+                let dep = dep.expect("ifchange dep has a path");
+                // Bring the dependency up to date first (it may be a target).
+                let (df, _) = dofile::find(&ctx.root, &dep);
+                if df.is_some() {
+                    ensure(ctx, &dep)?;
+                }
+                match current_csum(ctx, &dep)? {
+                    None => return Ok(true), // dependency disappeared
+                    Some(cur) => {
+                        if Some(cur.as_str()) != edge_csum.as_deref() {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Mark a target as verified-up-to-date this session and refresh its stamp
+/// cache, so later `ensure` calls in the same session short-circuit.
+fn mark_verified(ctx: &Ctx, target: &str) -> Result<()> {
+    let _ = current_csum(ctx, target)?; // refresh mtime/size/csum cache
+    ctx.conn.execute(
+        "UPDATE files SET runid = ?1 WHERE path = ?2",
+        params![ctx.session, target],
+    )?;
+    Ok(())
+}
+
+/// The current content hash of a file, using the **guarded fast path**:
+/// if `(mtime, size)` match the cached row and the mtime carries sub-second
+/// precision (proving a fine-resolution filesystem, so same-second collisions
+/// are nanosecond-width), reuse the cached hash without re-reading the file.
+/// Otherwise re-hash and refresh the cache. On a coarse filesystem (FAT: whole-
+/// second mtimes) the sub-second test fails, so we always hash — exactly the
+/// "always-hash on coarse FS" rule, derived from the data itself.
+///
+/// Returns `Ok(None)` if the file does not exist.
+fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
+    let abs = ctx.root.dir.join(path_rel);
+    let meta = match fs::metadata(&abs) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("stat {path_rel}"))),
+    };
+    let mtime = stamp::mtime_nanos(&meta);
+    let size = if meta.is_dir() { 0 } else { meta.len() as i64 };
+
+    if let Some((rm, rs, rc)) = files_stamp(&ctx.conn, path_rel)? {
+        if rm == mtime && rs == size && stat_is_trustworthy(mtime) {
+            return Ok(Some(rc));
+        }
+    }
+
+    let csum = if meta.is_dir() {
+        stamp::DIR_CSUM.to_string()
+    } else {
+        stamp::hash_file(&abs)?
+    };
+    // Refresh the cache for an existing row (do not invent rows here).
+    ctx.conn.execute(
+        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3 WHERE path = ?4",
+        params![mtime, size, csum, path_rel],
+    )?;
+    Ok(Some(csum))
+}
+
+/// Whether a `(mtime, size)` match may be trusted to mean "unchanged" without
+/// re-hashing: only when the mtime has sub-second precision.
+fn stat_is_trustworthy(mtime_nanos: i64) -> bool {
+    mtime_nanos % 1_000_000_000 != 0
+}
+
+/// Fetch `(mtime, size, csum)` for a file row, only if all are present.
+fn files_stamp(conn: &Connection, path: &str) -> Result<Option<(i64, i64, String)>> {
+    let row = conn
+        .query_row(
+            "SELECT mtime, size, csum FROM files WHERE path = ?1",
+            params![path],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(m), Some(s), Some(c))) => Some((m, s, c)),
+        _ => None,
+    })
+}
+
+/// Fetch a file row's recorded csum if the row exists. Returns
+/// `Some(None)` for a phony target (row exists, csum NULL).
+fn files_row(conn: &Connection, path: &str) -> Result<Option<Option<String>>> {
+    let row = conn
+        .query_row(
+            "SELECT csum FROM files WHERE path = ?1",
+            params![path],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// All dependency edges of a target as `(kind, dep, csum)`.
+fn read_deps(
+    conn: &Connection,
+    target: &str,
+) -> Result<Vec<(DepKind, Option<String>, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT kind, dep, csum FROM deps WHERE target = ?1")?;
+    let rows = stmt.query_map(params![target], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (k, dep, csum) = row?;
+        if let Some(kind) = DepKind::from_i64(k) {
+            out.push((kind, dep, csum));
+        }
+    }
+    Ok(out)
 }
 
 /// `redo-msh ifcreate <paths...>`: record that the target depends on these
@@ -405,4 +595,19 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coarse_mtime_is_never_trusted() {
+        // Whole-second mtimes (FAT-style coarse resolution) force a re-hash.
+        assert!(!stat_is_trustworthy(0));
+        assert!(!stat_is_trustworthy(1_700_000_000_000_000_000));
+        // Sub-second precision proves a fine-resolution FS; stat may be trusted.
+        assert!(stat_is_trustworthy(1_700_000_000_000_000_001));
+        assert!(stat_is_trustworthy(1_700_000_000_123_456_789));
+    }
 }
