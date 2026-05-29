@@ -109,14 +109,28 @@ fn print_usage() {
         "redo-msh {} — DJB redo, cross-platform, mshell do-files
 
 USAGE:
-    redo-msh <targets...>        build targets (force)
-    redo-msh ifchange <deps...>  declare + build dependencies   [M2]
-    redo-msh ifcreate <paths...> declare non-existence deps     [M2]
-    redo-msh always              declare an always-build dep    [M2]
-    redo-msh root [dir]          initialize a project root
-    redo-msh sources|targets|ood introspection                  [M7]
+    redo-msh [options] <targets...>   (re)build the given targets
 
-Only `root` is implemented so far.",
+COMMANDS:
+    redo-msh <targets...>         build targets (forced)
+    redo-msh ifchange <deps...>   build deps if out of date; record them as
+                                  dependencies of the current target (do-files)
+    redo-msh ifcreate <paths...>  record that the current target depends on
+                                  these paths NOT existing
+    redo-msh always               mark the current target as always out of date
+    redo-msh root [dir]           initialize a project root (.redo/) here or at dir
+    redo-msh sources              list known source files
+    redo-msh targets              list known generated targets
+    redo-msh ood                  list out-of-date targets (without building)
+
+OPTIONS:
+    -j N, --jobs N                build up to N targets in parallel (default 1)
+    -y, --yes                     overwrite hand-edited targets without asking
+    --version                     print version
+    -h, --help                    show this help
+
+Do-files are mshell scripts named <target>.do, default.<ext>.do, or default.do.
+They receive: $1 = target, $2 = target without extension, $3 = temp output path.",
         env!("CARGO_PKG_VERSION")
     );
 }
