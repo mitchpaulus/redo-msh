@@ -60,6 +60,7 @@ impl Ctx {
     /// start a fresh session, and initialize the jobserver for `j` parallel
     /// jobs.
     pub fn top_level(j: usize) -> Result<Ctx> {
+        crate::winjob::setup();
         crate::logs::init_top();
         let cwd = std::env::current_dir()?;
         let root = Root::discover(&cwd)?;
@@ -244,9 +245,19 @@ fn is_transient_io(e: &std::io::Error) -> bool {
 }
 
 /// Atomically replace `dst` with `src` (same volume by construction).
-/// std::fs::rename replaces an existing destination on both Unix (rename(2))
-/// and Windows (MoveFileEx). Retries transient Windows sharing violations.
+///
+/// On Windows we first try the native POSIX-semantics rename
+/// (`SetFileInformationByHandle` + `FileRenameInfoEx`), which is atomic and can
+/// replace a destination even if another process holds it open. If that fails
+/// (older Windows / non-NTFS) we fall back to `std::fs::rename` (`MoveFileEx`)
+/// with retry. On Unix, `rename(2)` is atomic and needs no retry.
 fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if win_posix_rename(src, dst).is_ok() {
+            return Ok(());
+        }
+    }
     let mut delay = std::time::Duration::from_millis(2);
     for attempt in 0..RENAME_RETRIES {
         match fs::rename(src, dst) {
@@ -262,6 +273,60 @@ fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     unreachable!("rename loop always returns")
+}
+
+/// Native Windows atomic replace using `SetFileInformationByHandle` with
+/// `FileRenameInfoEx` and POSIX semantics (Win10 1607+, NTFS/ReFS).
+#[cfg(windows)]
+fn win_posix_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use core::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_ALL: u32 = 0x0000_0007; // READ | WRITE | DELETE
+    const REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+    const POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+    // The handle needs DELETE access to be renamed.
+    let file = fs::OpenOptions::new()
+        .access_mode(DELETE | GENERIC_WRITE)
+        .share_mode(FILE_SHARE_ALL)
+        .open(src)?;
+
+    // FILE_RENAME_INFO is a header followed by the variable-length destination
+    // name; allocate a buffer big enough for both.
+    let name: Vec<u16> = dst.as_os_str().encode_wide().collect();
+    let name_bytes = name.len() * core::mem::size_of::<u16>();
+    let total = core::mem::size_of::<FILE_RENAME_INFO>() + name_bytes;
+    let mut buf = vec![0u8; total];
+
+    // SAFETY: `buf` is large enough for the header plus the name; we write only
+    // within it and pass its true length as the buffer size.
+    unsafe {
+        let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
+        (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS;
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = name_bytes as u32;
+        let name_dst = core::ptr::addr_of_mut!((*info).FileName) as *mut u16;
+        core::ptr::copy_nonoverlapping(name.as_ptr(), name_dst, name.len());
+
+        let ok = SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileRenameInfoEx,
+            info as *const c_void,
+            total as u32,
+        );
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Removes a set of temp files on drop, on every control-flow path (early

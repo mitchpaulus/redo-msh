@@ -16,6 +16,7 @@ mod logs;
 mod paths;
 mod root;
 mod stamp;
+mod winjob;
 
 use anyhow::{Context, Result};
 use build::Ctx;

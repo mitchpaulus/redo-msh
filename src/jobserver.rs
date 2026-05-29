@@ -33,6 +33,8 @@ pub enum TokenSrc {
 enum Inner {
     #[cfg(unix)]
     Pipe { rfd: i32, wfd: i32 },
+    #[cfg(windows)]
+    Sem { handle: isize },
     Local { extra: AtomicUsize },
 }
 
@@ -49,6 +51,12 @@ impl Jobserver {
                 return js;
             }
         }
+        #[cfg(windows)]
+        {
+            if let Some(js) = init_sem(j) {
+                return js;
+            }
+        }
         std::env::set_var(ENV, format!("local:{j}"));
         Jobserver(Inner::Local {
             extra: AtomicUsize::new(extra),
@@ -62,6 +70,12 @@ impl Jobserver {
                 #[cfg(unix)]
                 if let Some(js) = from_pipe_spec(&s) {
                     return js;
+                }
+                #[cfg(windows)]
+                if let Some(rest) = s.strip_prefix("winsem:") {
+                    if let Some(js) = open_sem(rest) {
+                        return js;
+                    }
                 }
                 if let Some(rest) = s.strip_prefix("local:") {
                     let j: usize = rest.parse().unwrap_or(1);
@@ -86,6 +100,8 @@ impl Jobserver {
         match &self.0 {
             #[cfg(unix)]
             Inner::Pipe { rfd, .. } => pipe_try_read(*rfd),
+            #[cfg(windows)]
+            Inner::Sem { handle } => sem_try_acquire(*handle),
             Inner::Local { extra } => {
                 let mut cur = extra.load(Ordering::Acquire);
                 loop {
@@ -111,6 +127,8 @@ impl Jobserver {
         match &self.0 {
             #[cfg(unix)]
             Inner::Pipe { wfd, .. } => pipe_write(*wfd),
+            #[cfg(windows)]
+            Inner::Sem { handle } => sem_release(*handle),
             Inner::Local { extra } => {
                 extra.fetch_add(1, Ordering::AcqRel);
             }
@@ -189,5 +207,65 @@ fn pipe_write(wfd: i32) {
             continue;
         }
         return;
+    }
+}
+
+// ---- Windows: a named semaphore shared across the whole process tree --------
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn init_sem(j: usize) -> Option<Jobserver> {
+    use windows_sys::Win32::System::Threading::CreateSemaphoreW;
+    let initial = j.saturating_sub(1) as i32; // extra pool tokens
+    let maximum = j.max(1) as i32;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!("Local\\redo-msh-js-{}-{}", std::process::id(), nanos);
+    let wname = wide(&name);
+    // SAFETY: standard CreateSemaphoreW call with a valid name pointer.
+    let h = unsafe { CreateSemaphoreW(std::ptr::null(), initial, maximum, wname.as_ptr()) };
+    if h.is_null() {
+        return None;
+    }
+    std::env::set_var(ENV, format!("winsem:{name}"));
+    Some(Jobserver(Inner::Sem { handle: h as isize }))
+}
+
+#[cfg(windows)]
+fn open_sem(name: &str) -> Option<Jobserver> {
+    use windows_sys::Win32::System::Threading::OpenSemaphoreW;
+    const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    let wname = wide(name);
+    // SAFETY: opening an existing named semaphore created by the top-level.
+    let h = unsafe { OpenSemaphoreW(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, 0, wname.as_ptr()) };
+    if h.is_null() {
+        return None;
+    }
+    Some(Jobserver(Inner::Sem { handle: h as isize }))
+}
+
+#[cfg(windows)]
+fn sem_try_acquire(handle: isize) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let h = handle as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: non-blocking wait (timeout 0) on a valid semaphore handle.
+    unsafe { WaitForSingleObject(h, 0) == WAIT_OBJECT_0 }
+}
+
+#[cfg(windows)]
+fn sem_release(handle: isize) {
+    use windows_sys::Win32::System::Threading::ReleaseSemaphore;
+    let h = handle as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: releasing one count on a valid semaphore handle.
+    unsafe {
+        ReleaseSemaphore(h, 1, std::ptr::null_mut());
     }
 }
