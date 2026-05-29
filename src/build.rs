@@ -14,6 +14,7 @@
 
 use crate::db::{self, DepKind};
 use crate::dofile;
+use crate::jobserver::{Jobserver, TokenSrc};
 use crate::root::Root;
 use crate::stamp::{self, Stamp};
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Per-process build context, derived from the environment (for child
@@ -41,6 +44,8 @@ pub struct Ctx {
     /// Targets currently being ensured in *this* process, for in-process cycle
     /// detection during out-of-date traversal.
     pub active: RefCell<HashSet<String>>,
+    /// Shared concurrency limiter for parallel builds.
+    pub jobs: Arc<Jobserver>,
 }
 
 const E_ROOT: &str = "REDO_ROOT";
@@ -50,9 +55,10 @@ const E_DEPTH: &str = "REDO_DEPTH";
 const E_CHAIN: &str = "REDO_CHAIN";
 
 impl Ctx {
-    /// Build a context for a top-level `redo` invocation: discover the root and
-    /// start a fresh session.
-    pub fn top_level() -> Result<Ctx> {
+    /// Build a context for a top-level `redo` invocation: discover the root,
+    /// start a fresh session, and initialize the jobserver for `j` parallel
+    /// jobs.
+    pub fn top_level(j: usize) -> Result<Ctx> {
         let cwd = std::env::current_dir()?;
         let root = Root::discover(&cwd)?;
         let conn = root.open_db()?;
@@ -65,6 +71,7 @@ impl Ctx {
             chain: Vec::new(),
             target: None,
             active: RefCell::new(HashSet::new()),
+            jobs: Arc::new(Jobserver::init_top(j.max(1))),
         })
     }
 
@@ -76,7 +83,7 @@ impl Ctx {
             Some(p) => Root {
                 dir: PathBuf::from(p),
             },
-            None => return Ctx::top_level(),
+            None => return Ctx::top_level(1),
         };
         let conn = root.open_db()?;
         let session = match std::env::var(E_SESSION).ok().and_then(|s| s.parse().ok()) {
@@ -100,6 +107,24 @@ impl Ctx {
             chain,
             target,
             active: RefCell::new(HashSet::new()),
+            jobs: Arc::new(Jobserver::from_env()),
+        })
+    }
+
+    /// A context for building one dependency on a worker thread: same
+    /// root/session/chain/target and shared jobserver, but its own SQLite
+    /// connection (rusqlite connections are not shareable across threads) and a
+    /// fresh in-process cycle set.
+    fn child_for_thread(&self) -> Result<Ctx> {
+        Ok(Ctx {
+            root: self.root.clone(),
+            conn: self.root.open_db()?,
+            session: self.session,
+            depth: self.depth,
+            chain: self.chain.clone(),
+            target: self.target.clone(),
+            active: RefCell::new(HashSet::new()),
+            jobs: self.jobs.clone(),
         })
     }
 
@@ -358,29 +383,107 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
 /// it is out of date and has a do-file) and record the dependency edge from the
 /// current `REDO_TARGET`.
 pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
+    // Classify all inputs first.
+    let mut items: Vec<(String, PathBuf, bool)> = Vec::with_capacity(inputs.len());
     for input in inputs {
         let dep_rel = normalize_target(&ctx.root, input)?;
         let dep_abs = ctx.root.dir.join(&dep_rel);
-        let (dofile_opt, _absent) = dofile::find(&ctx.root, &dep_rel);
-
-        if dofile_opt.is_some() {
-            ensure(ctx, &dep_rel)?;
-        } else {
-            // Source file: must exist; record/refresh its stamp.
-            if !dep_abs.exists() {
-                bail!("no .do file and no source file for dependency {dep_rel:?}");
-            }
-            let stamp = stamp::stamp_file(&dep_abs)?;
-            upsert_file(&ctx.conn, &dep_rel, None, None, stamp.as_ref(), ctx.session)?;
+        let buildable = dofile::find(&ctx.root, &dep_rel).0.is_some();
+        if !buildable && !dep_abs.exists() {
+            bail!("no .do file and no source file for dependency {dep_rel:?}");
         }
+        items.push((dep_rel, dep_abs, buildable));
+    }
 
-        // Record the edge from the parent target, if we are inside a build.
-        if let Some(parent) = &ctx.target {
-            let stamp = stamp::stamp_file(&dep_abs)?;
-            record_dep(&ctx.conn, parent, DepKind::IfChange, Some(&dep_rel), stamp.as_ref())?;
+    // Source files: stamp/refresh now (cheap, serial).
+    for (dep_rel, dep_abs, buildable) in &items {
+        if !buildable {
+            let stamp = stamp::stamp_file(dep_abs)?;
+            upsert_file(&ctx.conn, dep_rel, None, None, stamp.as_ref(), ctx.session)?;
+        }
+    }
+
+    // Buildable targets: bring up to date, in parallel under the jobserver.
+    let buildables: Vec<String> = items
+        .iter()
+        .filter(|(_, _, b)| *b)
+        .map(|(d, _, _)| d.clone())
+        .collect();
+    build_parallel(ctx, &buildables)?;
+
+    // Record the edges from the parent target (serial, on our connection).
+    if let Some(parent) = &ctx.target {
+        for (dep_rel, dep_abs, _) in &items {
+            let stamp = stamp::stamp_file(dep_abs)?;
+            record_dep(&ctx.conn, parent, DepKind::IfChange, Some(dep_rel), stamp.as_ref())?;
         }
     }
     Ok(())
+}
+
+/// Bring multiple buildable targets up to date, in parallel, bounded by the
+/// jobserver. Uses the process's own token for one job (guaranteeing progress)
+/// and try-acquires extra pool tokens for the rest; completions are awaited via
+/// a channel, and each pool token is returned as its job finishes.
+fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
+    if deps.len() <= 1 {
+        // No parallelism opportunity: run inline, consuming no extra tokens.
+        for d in deps {
+            ensure(ctx, d)?;
+        }
+        return Ok(());
+    }
+
+    let (tx, rx) = mpsc::channel::<(Result<()>, TokenSrc)>();
+    let n = deps.len();
+    let mut idx = 0;
+    let mut running = 0usize;
+    let mut own_in_use = false;
+    let mut first_err: Option<anyhow::Error> = None;
+
+    loop {
+        // Launch as many jobs as we have tokens for (stop launching on error).
+        while idx < n && first_err.is_none() {
+            let src = if !own_in_use {
+                own_in_use = true;
+                TokenSrc::Own
+            } else if ctx.jobs.try_acquire() {
+                TokenSrc::Pool
+            } else {
+                break;
+            };
+            let cctx = ctx.child_for_thread()?;
+            let dep = deps[idx].clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let r = ensure(&cctx, &dep);
+                let _ = tx.send((r, src));
+            });
+            idx += 1;
+            running += 1;
+        }
+
+        if running == 0 {
+            break;
+        }
+        // Wait for one job to finish and reclaim its token.
+        let (res, src) = rx.recv().expect("build worker channel closed");
+        running -= 1;
+        match src {
+            TokenSrc::Own => own_in_use = false,
+            TokenSrc::Pool => ctx.jobs.release(),
+        }
+        if let Err(e) = res {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Bring a buildable `target` up to date: build it if out of date, otherwise
@@ -595,14 +698,73 @@ pub fn always(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// `redo-msh <targets...>`: force-build each target.
-pub fn redo(targets: &[String]) -> Result<()> {
-    let ctx = Ctx::top_level()?;
-    for input in targets {
-        let target_rel = normalize_target(&ctx.root, input)?;
-        build(&ctx, &target_rel, true)?;
+/// `redo-msh <targets...>`: force-build each target with `j` parallel jobs.
+pub fn redo(targets: &[String], j: usize) -> Result<()> {
+    let ctx = Ctx::top_level(j)?;
+    // Force-build the requested targets in parallel under the jobserver. We
+    // mark them verified-this-session via a forced build, so reuse the parallel
+    // scheduler but bypass the up-to-date check by clearing their session mark.
+    if targets.len() <= 1 {
+        for input in targets {
+            let target_rel = normalize_target(&ctx.root, input)?;
+            build(&ctx, &target_rel, true)?;
+        }
+        return Ok(());
     }
+    // Parallel forced top-level builds.
+    let rels: Vec<String> = targets
+        .iter()
+        .map(|t| normalize_target(&ctx.root, t))
+        .collect::<Result<_>>()?;
+    build_parallel_forced(&ctx, &rels)?;
     Ok(())
+}
+
+/// Like `build_parallel` but forces each target (top-level `redo`).
+fn build_parallel_forced(ctx: &Ctx, targets: &[String]) -> Result<()> {
+    let (tx, rx) = mpsc::channel::<(Result<()>, TokenSrc)>();
+    let n = targets.len();
+    let (mut idx, mut running, mut own_in_use) = (0usize, 0usize, false);
+    let mut first_err: Option<anyhow::Error> = None;
+    loop {
+        while idx < n && first_err.is_none() {
+            let src = if !own_in_use {
+                own_in_use = true;
+                TokenSrc::Own
+            } else if ctx.jobs.try_acquire() {
+                TokenSrc::Pool
+            } else {
+                break;
+            };
+            let cctx = ctx.child_for_thread()?;
+            let target = targets[idx].clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let r = build(&cctx, &target, true);
+                let _ = tx.send((r, src));
+            });
+            idx += 1;
+            running += 1;
+        }
+        if running == 0 {
+            break;
+        }
+        let (res, src) = rx.recv().expect("build worker channel closed");
+        running -= 1;
+        match src {
+            TokenSrc::Own => own_in_use = false,
+            TokenSrc::Pool => ctx.jobs.release(),
+        }
+        if let Err(e) = res {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Make a path safe to embed in a temp filename.

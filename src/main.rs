@@ -10,12 +10,13 @@ mod build;
 mod db;
 mod dofile;
 mod fsguard;
+mod jobserver;
 mod lock;
 mod paths;
 mod root;
 mod stamp;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use build::Ctx;
 use root::Root;
 use std::path::Path;
@@ -32,9 +33,10 @@ fn main() {
     std::process::exit(code);
 }
 
-fn run(args: &[String]) -> Result<()> {
+fn run(raw_args: &[String]) -> Result<()> {
+    let (jobs, args) = extract_jobs(raw_args)?;
     let (verb, rest) = match args.split_first() {
-        Some((v, r)) => (v.as_str(), r),
+        Some((v, r)) => (v.as_str(), r.to_vec()),
         None => {
             print_usage();
             return Ok(());
@@ -42,9 +44,9 @@ fn run(args: &[String]) -> Result<()> {
     };
 
     match verb {
-        "root" => cmd_root(rest),
-        "ifchange" => build::ifchange(&Ctx::from_env()?, rest),
-        "ifcreate" => build::ifcreate(&Ctx::from_env()?, rest),
+        "root" => cmd_root(&rest),
+        "ifchange" => build::ifchange(&Ctx::from_env()?, &rest),
+        "ifcreate" => build::ifcreate(&Ctx::from_env()?, &rest),
         "always" => build::always(&Ctx::from_env()?),
         "sources" | "targets" | "ood" => {
             anyhow::bail!("`{verb}` is not implemented yet (coming in M7)")
@@ -58,8 +60,31 @@ fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         // No recognized verb: treat all args as targets to build.
-        _ => build::redo(args),
+        _ => build::redo(&args, jobs),
     }
+}
+
+/// Extract `-j N` / `-jN` / `--jobs N` / `--jobs=N` from the argument list,
+/// returning the parallelism (default 1) and the remaining args.
+fn extract_jobs(args: &[String]) -> Result<(usize, Vec<String>)> {
+    let mut jobs = 1usize;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-j" || a == "--jobs" {
+            let v = it
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{a} requires a number"))?;
+            jobs = v.parse().with_context(|| format!("invalid job count {v:?}"))?;
+        } else if let Some(v) = a.strip_prefix("--jobs=") {
+            jobs = v.parse().with_context(|| format!("invalid job count {v:?}"))?;
+        } else if let Some(v) = a.strip_prefix("-j") {
+            jobs = v.parse().with_context(|| format!("invalid job count {v:?}"))?;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((jobs.max(1), rest))
 }
 
 /// `redo-msh root [dir]` — initialize a project root.
