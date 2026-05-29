@@ -378,7 +378,7 @@ fn prompt_overwrite(target_rel: &str) -> Result<bool> {
 /// double-checked rebuild that makes concurrent builds safe. `force` (top-level
 /// `redo`) skips that check and always rebuilds.
 pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
-    if ctx.chain.iter().any(|t| t == target_rel) {
+    if ctx.chain.iter().any(|t| t.eq_ignore_ascii_case(target_rel)) {
         bail!(
             "dependency cycle detected: {} -> {}",
             ctx.chain.join(" -> "),
@@ -623,8 +623,9 @@ pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
         return Ok(());
     }
     // In-process cycle guard for the out-of-date traversal (the cross-process
-    // chain guard lives in build()).
-    if !ctx.active.borrow_mut().insert(target.to_string()) {
+    // chain guard lives in build()). Fold case to match NOCASE identity.
+    let active_key = target.to_ascii_lowercase();
+    if !ctx.active.borrow_mut().insert(active_key.clone()) {
         bail!("dependency cycle detected involving {target}");
     }
     let result = (|| {
@@ -634,7 +635,7 @@ pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
             mark_verified(ctx, target)
         }
     })();
-    ctx.active.borrow_mut().remove(target);
+    ctx.active.borrow_mut().remove(&active_key);
     result
 }
 

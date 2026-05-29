@@ -25,7 +25,9 @@ pub fn lock_target(root: &Root, target_rel: &str) -> Result<TargetLock> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("creating lock dir {}", dir.display()))?;
     // A filesystem-safe, collision-resistant name derived from the target path.
-    let hash = blake3::hash(target_rel.as_bytes()).to_hex();
+    // Fold case (ASCII, matching the DB's NOCASE collation) so two casings of
+    // the same target share one lock and can't be built concurrently.
+    let hash = blake3::hash(target_rel.to_ascii_lowercase().as_bytes()).to_hex();
     let path = dir.join(format!("{}.lock", &hash.as_str()[..32]));
     let file = OpenOptions::new()
         .create(true)

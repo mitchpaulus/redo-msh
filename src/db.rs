@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Dependency edge kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +67,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
             value INTEGER NOT NULL
         );
 
+        -- Path columns use COLLATE NOCASE so identity is case-insensitive,
+        -- matching NTFS semantics and keeping one row per file when a project
+        -- is shared between Windows and WSL. Original case is preserved in the
+        -- stored text (used for filesystem I/O); only comparison is folded.
         CREATE TABLE IF NOT EXISTS files (
-            path     TEXT PRIMARY KEY,   -- normalized root-relative path, '/' separators
+            path     TEXT PRIMARY KEY COLLATE NOCASE, -- root-relative, '/' separators
             dofile   TEXT,               -- .do file used (root-relative); NULL = source file
             built_at INTEGER,            -- unix nanos of last successful build (targets only)
             mtime    INTEGER,            -- last-observed mtime (unix nanos)
@@ -78,9 +82,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS deps (
-            target TEXT NOT NULL,        -- dependent target (root-relative)
+            target TEXT NOT NULL COLLATE NOCASE, -- dependent target (root-relative)
             kind   INTEGER NOT NULL,     -- DepKind: 0 ifchange, 1 ifcreate, 2 always, 3 dofile
-            dep    TEXT,                 -- dependency path (ifchange/ifcreate/dofile); NULL for always
+            dep    TEXT COLLATE NOCASE,  -- dependency path (ifchange/ifcreate/dofile); NULL for always
             csum   TEXT,                 -- dep content hash expected at build time (equality basis)
             mtime  INTEGER,              -- recorded mtime (fast-path accelerator)
             size   INTEGER,              -- recorded size (fast-path accelerator)
@@ -109,4 +113,45 @@ pub fn next_runid(conn: &Connection) -> Result<i64> {
     let runid: i64 =
         conn.query_row("SELECT value FROM meta WHERE key = 'runid'", [], |r| r.get(0))?;
     Ok(runid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_case_insensitive() {
+        let dir = std::env::temp_dir().join(format!("redo-msh-dbtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open(&dir.join("t.db")).unwrap();
+
+        conn.execute("INSERT INTO files(path) VALUES ('App.txt')", [])
+            .unwrap();
+        // A different-cased lookup matches (NOCASE collation).
+        let found: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE path = ?1",
+                ["app.txt"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1);
+
+        // A different-cased insert collapses onto the same primary key.
+        conn.execute("INSERT OR REPLACE INTO files(path) VALUES ('APP.TXT')", [])
+            .unwrap();
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "different casings must collapse to one row");
+
+        // Original case is preserved in storage (for filesystem I/O).
+        let stored: String = conn
+            .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(stored.chars().any(|c| c.is_ascii_uppercase()));
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
