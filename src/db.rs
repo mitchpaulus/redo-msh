@@ -47,14 +47,6 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Open an existing database read/write without (re)initializing schema.
-pub fn open_existing(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("opening database {}", db_path.display()))?;
-    apply_pragmas(&conn)?;
-    Ok(conn)
-}
-
 fn apply_pragmas(conn: &Connection) -> Result<()> {
     // WAL: many readers + one writer; required for the parallel peer model.
     // busy_timeout: writers wait rather than erroring with SQLITE_BUSY.

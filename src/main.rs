@@ -48,9 +48,9 @@ fn run(raw_args: &[String]) -> Result<()> {
         "ifchange" => build::ifchange(&Ctx::from_env()?, &rest),
         "ifcreate" => build::ifcreate(&Ctx::from_env()?, &rest),
         "always" => build::always(&Ctx::from_env()?),
-        "sources" | "targets" | "ood" => {
-            anyhow::bail!("`{verb}` is not implemented yet (coming in M7)")
-        }
+        "sources" => build::cmd_sources(),
+        "targets" => build::cmd_targets(),
+        "ood" => build::cmd_ood(),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())

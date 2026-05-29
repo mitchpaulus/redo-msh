@@ -897,6 +897,85 @@ fn build_parallel_forced(ctx: &Ctx, targets: &[String]) -> Result<()> {
     }
 }
 
+// ---- introspection commands -------------------------------------------------
+
+/// Open the database read-only-ish for an introspection command, without
+/// starting a new session (no runid bump).
+fn open_for_query() -> Result<(Root, Connection)> {
+    let cwd = std::env::current_dir()?;
+    let root = Root::discover(&cwd)?;
+    let conn = root.open_db()?;
+    Ok((root, conn))
+}
+
+/// `redo-msh sources`: list known source files (no do-file).
+pub fn cmd_sources() -> Result<()> {
+    let (_root, conn) = open_for_query()?;
+    let mut stmt = conn.prepare("SELECT path FROM files WHERE dofile IS NULL ORDER BY path")?;
+    for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        println!("{}", row?);
+    }
+    Ok(())
+}
+
+/// `redo-msh targets`: list known generated targets.
+pub fn cmd_targets() -> Result<()> {
+    let (_root, conn) = open_for_query()?;
+    let mut stmt = conn.prepare("SELECT path FROM files WHERE dofile IS NOT NULL ORDER BY path")?;
+    for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        println!("{}", row?);
+    }
+    Ok(())
+}
+
+/// `redo-msh ood`: list targets that are currently out of date (read-only; does
+/// not build anything).
+pub fn cmd_ood() -> Result<()> {
+    let (root, conn) = open_for_query()?;
+    let mut stmt = conn.prepare("SELECT path FROM files WHERE dofile IS NOT NULL ORDER BY path")?;
+    let targets: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for t in targets {
+        if is_ood_static(&root, &conn, &t)? {
+            println!("{t}");
+        }
+    }
+    Ok(())
+}
+
+/// Read-only out-of-date check: like `is_ood` but never builds dependencies
+/// (used by `redo-msh ood`). Compares recorded edge hashes to current on-disk
+/// content without bringing dependencies up to date first.
+fn is_ood_static(root: &Root, conn: &Connection, target: &str) -> Result<bool> {
+    let built_csum = match files_row(conn, target)? {
+        Some(c) => c,
+        None => return Ok(true),
+    };
+    let target_abs = root.dir.join(target);
+    if built_csum.is_some() && !target_abs.exists() {
+        return Ok(true);
+    }
+    for (kind, dep, edge_csum) in read_deps(conn, target)? {
+        match kind {
+            DepKind::Always => return Ok(true),
+            DepKind::IfCreate => {
+                if root.dir.join(dep.expect("ifcreate path")).exists() {
+                    return Ok(true);
+                }
+            }
+            DepKind::DoFile | DepKind::IfChange => {
+                let dep = dep.expect("dep path");
+                let cur = stamp::stamp_file(&root.dir.join(&dep))?.map(|s| s.csum);
+                if cur.as_deref() != edge_csum.as_deref() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Make a path safe to embed in a temp filename.
 fn sanitize(s: &str) -> String {
     s.chars()

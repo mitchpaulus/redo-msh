@@ -29,9 +29,6 @@ pub struct DoFile {
     pub arg_target: String,
     /// `$2`: `arg_target` with the matched extension removed.
     pub arg_base: String,
-    /// Root-relative paths of candidate do-files that did *not* exist and that
-    /// were tried before the match (become `ifcreate` deps).
-    pub absent: Vec<String>,
 }
 
 /// A single candidate considered during resolution.
@@ -119,7 +116,6 @@ pub fn find(root: &Root, target_rel: &str) -> (Option<DoFile>, Vec<String>) {
                     dodir_abs: root.dir.join(&c.dodir_rel),
                     arg_target: c.arg_target,
                     arg_base: c.arg_base,
-                    absent: absent.clone(),
                 }),
                 absent,
             );
