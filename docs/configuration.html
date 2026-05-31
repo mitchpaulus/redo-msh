@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>redo-msh · redo.toml configuration</title>
+<style>
+  :root {
+    --fg: #1c1e21;
+    --muted: #5c6370;
+    --bg: #ffffff;
+    --code-bg: #f5f6f8;
+    --border: #e2e5ea;
+    --accent: #b5651d;
+    --accent-bg: #fbf3ea;
+    --link: #1a5fb4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #d6d9df;
+      --muted: #9aa0ab;
+      --bg: #16181d;
+      --code-bg: #1f2229;
+      --border: #2c313a;
+      --accent: #e0985a;
+      --accent-bg: #241c12;
+      --link: #6ab0ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 5rem;
+  }
+  h1 { font-size: 2rem; margin: 0 0 .25rem; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 1.3rem;
+    margin: 2.75rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1.05rem; margin: 1.75rem 0 .5rem; }
+  .subtitle { color: var(--muted); font-size: 1.05rem; margin: 0 0 1.5rem; }
+  p, li { color: var(--fg); }
+  a { color: var(--link); }
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: .9em;
+    background: var(--code-bg);
+    padding: .1em .35em;
+    border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: .875rem; }
+  .note {
+    background: var(--accent-bg);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 6px 6px 0;
+    padding: .8rem 1rem;
+    margin: 1.25rem 0;
+  }
+  .note strong { color: var(--accent); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: .95rem;
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .7rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 600; }
+  ol.cascade { padding-left: 1.4rem; }
+  ol.cascade li { margin: .3rem 0; }
+  .kw { color: var(--accent); }
+  footer {
+    margin-top: 4rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: .85rem;
+  }
+  .pill {
+    display: inline-block;
+    font-size: .75rem;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: .1rem .6rem;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<main>
+
+  <h1><code>redo.toml</code> configuration</h1>
+  <p class="subtitle">Choosing the interpreter that runs each do-file in <strong>redo-msh</strong>.</p>
+
+  <p>
+    By default, redo-msh runs every do-file with <a href="https://github.com/Ohmannequin/mshell"><code>msh</code></a>
+    (mshell), the cross-platform shell language it was designed around. That keeps builds working
+    identically on Linux, macOS, and Windows without shebang handling.
+  </p>
+  <p>
+    To drop redo-msh onto an <em>existing</em> project whose do-files are written for another
+    interpreter — <code>sh&nbsp;-e</code>, <code>bash</code>, <code>python3</code>, … — commit a
+    <code>redo.toml</code> at the project root that maps do-files to the command used to run them.
+  </p>
+
+  <div class="note">
+    <strong>No shebangs.</strong> redo-msh never inspects a <code>#!</code> line. The interpreter
+    mapping is always explicit and lives in version control, so a checkout builds the same way for
+    everyone regardless of file permissions or platform quirks.
+  </div>
+
+  <h2>Where it lives</h2>
+  <p>
+    A single file named <code>redo.toml</code> at the <strong>project root</strong> — the same
+    directory that holds <code>.redo/</code>. Put it under version control.
+  </p>
+  <div class="note">
+    <strong>Not inside <code>.redo/</code>.</strong> That directory is git-ignored (it holds the
+    SQLite database and locks). Configuration that should be shared must sit at the root, beside it.
+  </div>
+  <p>If <code>redo.toml</code> is absent, every do-file runs with the built-in default, <code>["msh"]</code>.</p>
+
+  <h2>How a do-file is invoked</h2>
+  <p>
+    The resolved value is an <strong>argv prefix</strong>. redo-msh appends the do-file path and the
+    three standard redo arguments to it:
+  </p>
+  <pre><code>&lt;interpreter...&gt;  &lt;dofile&gt;  $1  $2  $3</code></pre>
+  <table>
+    <tr><th>Argument</th><th>Meaning</th></tr>
+    <tr><td><code>$1</code></td><td>the target being built</td></tr>
+    <tr><td><code>$2</code></td><td>the target with its matched extension removed (for <code>default.*.do</code>)</td></tr>
+    <tr><td><code>$3</code></td><td>a temporary output path; write here (or to stdout), never to <code>$1</code></td></tr>
+  </table>
+  <p>So <code>command = ["sh", "-e"]</code> runs <code>sh -e &lt;dofile&gt; $1 $2 $3</code>, and the
+    default <code>["msh"]</code> runs <code>msh &lt;dofile&gt; $1 $2 $3</code>.</p>
+
+  <h2>Schema</h2>
+  <p>Two kinds of tables, both optional:</p>
+  <ul>
+    <li><code>[interpreter]</code> — settings shared across all platforms.</li>
+    <li><code>[platform.&lt;name&gt;]</code> — overrides for one platform: <code>linux</code>,
+        <code>wsl</code>, <code>windows</code>, or <code>macos</code>.</li>
+  </ul>
+  <p>Each such table accepts the same two keys:</p>
+  <table>
+    <tr><th>Key</th><th>Type</th><th>Meaning</th></tr>
+    <tr>
+      <td><code>default</code></td>
+      <td>array of strings</td>
+      <td>The interpreter argv prefix used when no rule matches.</td>
+    </tr>
+    <tr>
+      <td><code>rule</code></td>
+      <td>array of tables</td>
+      <td>Ordered list of <code>{ match, command }</code> pairs; the first whose
+          <code>match</code> glob matches the do-file wins.</td>
+    </tr>
+  </table>
+  <p>A rule is written as a TOML array-of-tables, <code>[[interpreter.rule]]</code> or
+     <code>[[platform.&lt;name&gt;.rule]]</code>, with:</p>
+  <table>
+    <tr><th>Key</th><th>Type</th><th>Meaning</th></tr>
+    <tr><td><code>match</code></td><td>string</td><td>A glob tested against the do-file (see below).</td></tr>
+    <tr><td><code>command</code></td><td>array of strings</td><td>The interpreter argv prefix for matching do-files.</td></tr>
+  </table>
+
+  <h2>Resolution order</h2>
+  <p>For a do-file at root-relative path <em>P</em> on the current platform, redo-msh takes the
+     <strong>first</strong> of these that produces a command:</p>
+  <ol class="cascade">
+    <li>a matching <code>rule</code> in the platform table,</li>
+    <li>the platform table's <code>default</code>,</li>
+    <li>a matching <code>rule</code> in the shared <code>[interpreter]</code> table,</li>
+    <li>the shared <code>[interpreter].default</code>,</li>
+    <li>the built-in <code>["msh"]</code>.</li>
+  </ol>
+  <div class="note">
+    <strong>WSL.</strong> Under WSL, redo-msh uses <code>[platform.wsl]</code> if present; otherwise
+    it falls back to <code>[platform.linux]</code> (WSL is Linux) before dropping to the shared and
+    built-in layers. WSL is detected via the <code>WSL_DISTRO_NAME</code> / <code>WSL_INTEROP</code>
+    environment variables or a <code>microsoft</code>/<code>wsl</code> marker in the kernel release.
+  </div>
+
+  <h2>Glob matching</h2>
+  <table>
+    <tr><th>Pattern</th><th>Behavior</th></tr>
+    <tr><td>no <code>/</code></td><td>matched against the do-file's <strong>basename</strong>, so it matches anywhere in the tree.</td></tr>
+    <tr><td>contains <code>/</code></td><td>matched against the full <strong>root-relative path</strong>.</td></tr>
+    <tr><td><code>*</code></td><td>matches any run of characters except <code>/</code>.</td></tr>
+    <tr><td><code>?</code></td><td>matches exactly one character except <code>/</code>.</td></tr>
+  </table>
+  <p>Patterns are anchored: the whole text must match. Neither <code>*</code> nor <code>?</code>
+     crosses a directory separator.</p>
+  <table>
+    <tr><th>Pattern</th><th>Matches</th><th>Does not match</th></tr>
+    <tr><td><code>*.do</code></td><td><code>app.do</code>, <code>sub/a.b.do</code></td><td><code>app.dof</code></td></tr>
+    <tr><td><code>*.py.do</code></td><td><code>build.py.do</code></td><td><code>build.do</code></td></tr>
+    <tr><td><code>deploy/*.do</code></td><td><code>deploy/ship.do</code></td><td><code>deploy/nested/ship.do</code></td></tr>
+  </table>
+  <div class="note">
+    <strong>The match is on the do-file, not the target.</strong> A target <code>main.o</code> built
+    by <code>default.o.do</code> is matched by patterns against <code>default.o.do</code>.
+  </div>
+
+  <h2>Examples</h2>
+
+  <h3>A whole project ported to POSIX <code>sh</code></h3>
+  <pre><code>[platform.linux]
+default = ["sh", "-e"]
+
+[platform.macos]
+default = ["sh", "-e"]
+
+[platform.wsl]
+default = ["sh", "-e"]
+
+[platform.windows]
+default = ["msh"]          # no sh on native Windows; keep mshell there</code></pre>
+
+  <h3>Mostly <code>sh</code>, with a few Python recipes</h3>
+  <pre><code>[interpreter]
+default = ["sh", "-e"]
+
+[[interpreter.rule]]
+match   = "*.py.do"        # any do-file ending in .py.do, anywhere
+command = ["python3"]</code></pre>
+
+  <h3>A directory that builds with <code>bash</code></h3>
+  <pre><code>[interpreter]
+default = ["msh"]
+
+[[interpreter.rule]]
+match   = "deploy/*.do"    # only do-files directly under deploy/
+command = ["bash", "-euo", "pipefail"]</code></pre>
+
+  <div class="note">
+    <strong>Empty command.</strong> A <code>command = []</code> (or empty <code>default</code>) is
+    treated as unset and falls back to the built-in <code>["msh"]</code> rather than producing an
+    un-runnable interpreter.
+  </div>
+
+  <h2>The redo command family</h2>
+  <p>
+    redo-msh ships the standard commands — <code>redo</code>, <code>redo-ifchange</code>,
+    <code>redo-ifcreate</code>, <code>redo-always</code>, <code>redo-stamp</code> — as individual
+    executables beside the <code>redo-msh</code> binary, and prepends its own directory to each
+    do-file's <code>PATH</code>. Existing do-files that call <code>redo-ifchange</code> directly work
+    unchanged, with no system-wide install required.
+  </p>
+  <p>
+    <code>redo-stamp</code> is a compatibility no-op: it drains its standard input and exits.
+    redo-msh content-hashes every committed output by default, so the change-suppression a stamp
+    provides is already the baseline behavior.
+  </p>
+
+  <footer>
+    <span class="pill">redo-msh</span>
+    Reference: <code>src/config.rs</code>. Do-files with no targets build <code>all</code> (i.e. <code>all.do</code>).
+  </footer>
+
+</main>
+</body>
+</html>
