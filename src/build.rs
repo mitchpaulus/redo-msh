@@ -47,6 +47,8 @@ pub struct Ctx {
     pub active: RefCell<HashSet<String>>,
     /// Shared concurrency limiter for parallel builds.
     pub jobs: Arc<Jobserver>,
+    /// Per-project interpreter configuration (`redo.toml`).
+    pub config: crate::config::Config,
 }
 
 const E_ROOT: &str = "REDO_ROOT";
@@ -66,6 +68,7 @@ impl Ctx {
         let root = Root::discover(&cwd)?;
         let conn = root.open_db()?;
         let session = db::next_runid(&conn)?;
+        let config = crate::config::Config::load(&root.dir)?;
         Ok(Ctx {
             root,
             conn,
@@ -75,6 +78,7 @@ impl Ctx {
             target: None,
             active: RefCell::new(HashSet::new()),
             jobs: Arc::new(Jobserver::init_top(j.max(1))),
+            config,
         })
     }
 
@@ -102,6 +106,7 @@ impl Ctx {
             .map(|s| s.split('\n').filter(|x| !x.is_empty()).map(String::from).collect())
             .unwrap_or_default();
         let target = std::env::var(E_TARGET).ok().filter(|s| !s.is_empty());
+        let config = crate::config::Config::load(&root.dir)?;
         Ok(Ctx {
             root,
             conn,
@@ -111,6 +116,7 @@ impl Ctx {
             target,
             active: RefCell::new(HashSet::new()),
             jobs: Arc::new(Jobserver::from_env()),
+            config,
         })
     }
 
@@ -128,6 +134,7 @@ impl Ctx {
             target: self.target.clone(),
             active: RefCell::new(HashSet::new()),
             jobs: self.jobs.clone(),
+            config: self.config.clone(),
         })
     }
 
@@ -506,7 +513,15 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     // Child environment.
     let mut child_chain = ctx.chain.clone();
     child_chain.push(target_rel.to_string());
-    let status = Command::new("msh")
+
+    // Resolve the interpreter for this do-file (built-in `msh` unless redo.toml
+    // says otherwise) and build `<interp...> <dofile> $1 $2 $3`. The config
+    // guarantees a non-empty command.
+    let interp = ctx.config.interpreter(&df.dofile_rel);
+    let (interp0, interp_rest) = interp.split_first().expect("interpreter is non-empty");
+    let mut command = Command::new(interp0);
+    command
+        .args(interp_rest)
         .arg(&df.dofile_abs)
         .arg(&df.arg_target)
         .arg(&df.arg_base)
@@ -518,7 +533,16 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         .env(E_TARGET, target_rel)
         .env(E_SESSION, ctx.session.to_string())
         .env(E_DEPTH, (ctx.depth + 1).to_string())
-        .env(E_CHAIN, child_chain.join("\n"))
+        .env(E_CHAIN, child_chain.join("\n"));
+
+    // Make the redo command family resolvable from inside the do-file by
+    // prepending our own directory (where `redo`, `redo-ifchange`, ... ship
+    // alongside `redo-msh`) to the child's PATH.
+    if let Some(path) = child_path() {
+        command.env("PATH", path);
+    }
+
+    let status = command
         .status()
         .with_context(|| format!("running do-file {}", df.dofile_abs.display()))?;
 
@@ -1052,6 +1076,35 @@ fn is_ood_static(root: &Root, conn: &Connection, target: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// The child do-file's `PATH` with the running executable's own directory
+/// prepended, so bare `redo`/`redo-ifchange`/... (which ship beside `redo-msh`)
+/// resolve without a system-wide install. Returns `None` if we can't locate
+/// our own exe, in which case the child inherits the unmodified `PATH`.
+fn child_path() -> Option<std::ffi::OsString> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    let mut paths = vec![dir];
+    if let Some(p) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&p));
+    }
+    std::env::join_paths(paths).ok()
+}
+
+/// `redo-stamp`: drain stdin and exit successfully.
+///
+/// In apenwarr redo, `redo-stamp` opts a target into content-based change
+/// detection by hashing the bytes piped to it. redo-msh already content-hashes
+/// every committed output by default, so that behavior is the baseline and this
+/// is effectively a no-op. We still consume stdin to EOF so the upstream
+/// writer (`... | redo-stamp`) never takes a broken pipe. (Targets with
+/// nondeterministic output that relied on a stable stamp will simply rebuild
+/// their dependents — correct, just not optimized.)
+pub fn stamp() -> Result<()> {
+    let mut sink = std::io::sink();
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut sink);
+    Ok(())
 }
 
 /// Make a path safe to embed in a temp filename.

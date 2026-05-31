@@ -681,3 +681,87 @@ fn cross_dir_relative_dependency() {
         "leaf must rebuild when its ../ dependency changes"
     );
 }
+
+// ---- drop-in compatibility: foreign interpreter + named forwarders ----------
+
+/// Whether `sh` is available; the drop-in tests no-op when it is not (e.g. on a
+/// Windows runner without a POSIX shell).
+fn sh_available() -> bool {
+    let exe = if cfg!(windows) { "sh.exe" } else { "sh" };
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(exe).exists()))
+        .unwrap_or(false)
+}
+
+/// Run an arbitrary command in the project with the redo-msh bin dir prepended
+/// to PATH (so the `redo`/`redo-ifchange`/... forwarders resolve).
+fn run_in(dir: &Path, program: &str, args: &[&str]) -> Output {
+    let bin_dir = Path::new(BIN).parent().unwrap();
+    let mut paths = vec![bin_dir.to_path_buf()];
+    if let Some(p) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&p));
+    }
+    let path = std::env::join_paths(paths).expect("join PATH");
+    Command::new(bin_dir.join(program))
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", path)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {program}: {e}"))
+}
+
+/// A project whose do-files are plain `sh` scripts selected via `redo.toml`,
+/// invoking the bare `redo-ifchange` forwarder, built via the bare `redo`
+/// command with no arguments (the `all` default). Exercises the entire drop-in
+/// path: interpreter config, PATH injection, named forwarders, `all` default.
+#[test]
+fn sh_dofiles_via_config_and_forwarders() {
+    if !sh_available() {
+        eprintln!("SKIP: `sh` not found on PATH");
+        return;
+    }
+    let p = Project::new();
+    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n");
+    // No shebangs anywhere; the interpreter comes entirely from redo.toml.
+    p.write("all.do", "redo-ifchange greeting.txt\n");
+    p.write(
+        "greeting.txt.do",
+        "redo-ifchange name.txt\necho \"hello, $(cat name.txt)\"\n",
+    );
+    p.write("name.txt", "world\n");
+
+    // Bare `redo` with no targets builds `all`, which builds greeting.txt.
+    let out = run_in(&p.dir, "redo", &[]);
+    assert!(out.status.success(), "redo (all) failed: {}", stderr(&out));
+    assert_eq!(p.read("greeting.txt"), "hello, world\n");
+
+    // Incremental: nothing changed -> greeting.txt is up to date.
+    assert!(p.stdout_of(&["ood"]).trim().is_empty(), "nothing should be ood");
+
+    // Edit the source -> rebuild propagates through the sh do-files.
+    p.write("name.txt", "redo\n");
+    let out = run_in(&p.dir, "redo-ifchange", &["greeting.txt"]);
+    assert!(out.status.success(), "redo-ifchange failed: {}", stderr(&out));
+    assert_eq!(p.read("greeting.txt"), "hello, redo\n");
+}
+
+/// A failing `redo-ifchange` (here, a missing dependency with no do-file) must
+/// propagate failure through `sh -e` and fail the parent build.
+#[test]
+fn sh_dofile_failure_propagates() {
+    if !sh_available() {
+        eprintln!("SKIP: `sh` not found on PATH");
+        return;
+    }
+    let p = Project::new();
+    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n");
+    // out.txt depends on a nonexistent source with no do-file -> ifchange fails,
+    // and `sh -e` must abort the do-file rather than continuing to write output.
+    p.write(
+        "out.txt.do",
+        "redo-ifchange missing-source\necho should-not-happen\n",
+    );
+    let out = run_in(&p.dir, "redo", &["out.txt"]);
+    assert!(!out.status.success(), "build should fail on missing dep");
+    assert!(!p.exists("out.txt"), "no output on failed build");
+}
