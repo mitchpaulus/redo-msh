@@ -765,3 +765,42 @@ fn sh_dofile_failure_propagates() {
     assert!(!out.status.success(), "build should fail on missing dep");
     assert!(!p.exists("out.txt"), "no output on failed build");
 }
+
+/// Every shipped executable must respond to `-h`/`--help`/`--version` without
+/// trying to build anything. Needs no interpreter, so it runs everywhere.
+#[test]
+fn all_commands_have_help_and_version() {
+    let bin_dir = Path::new(BIN).parent().unwrap();
+    let tmp = std::env::temp_dir();
+    let cmds = [
+        ("redo", "build targets"),
+        ("redo-ifchange", "build dependencies"),
+        ("redo-ifcreate", "NOT existing"),
+        ("redo-always", "always out of date"),
+        ("redo-stamp", "drain standard input"),
+        ("redo-msh", "cross-platform"),
+    ];
+    for (prog, needle) in cmds {
+        for flag in ["-h", "--help"] {
+            let out = Command::new(bin_dir.join(prog))
+                .arg(flag)
+                .current_dir(&tmp)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{prog} {flag} should exit 0");
+            let s = String::from_utf8_lossy(&out.stdout);
+            assert!(s.contains(needle), "{prog} {flag} help missing {needle:?}:\n{s}");
+            assert!(s.contains("-h, --help"), "{prog} {flag} should document --help");
+        }
+        let v = Command::new(bin_dir.join(prog))
+            .arg("--version")
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        assert!(v.status.success(), "{prog} --version should exit 0");
+        assert!(
+            String::from_utf8_lossy(&v.stdout).contains(prog),
+            "{prog} --version should name itself"
+        );
+    }
+}

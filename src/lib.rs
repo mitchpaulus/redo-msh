@@ -28,6 +28,16 @@ use std::path::Path;
 /// (`root`, `ifchange`, `ifcreate`, `always`, `sources`, `targets`, `ood`); if
 /// it is not a known verb, every argument is treated as a target to build.
 pub fn run(raw_args: &[String]) -> Result<()> {
+    // Help and version are recognized in any position, before other parsing.
+    // (A target literally named `-h` must be given as a path, e.g. `./-h`.)
+    if raw_args.iter().any(|a| a == "-h" || a == "--help") {
+        print_usage();
+        return Ok(());
+    }
+    if raw_args.iter().any(|a| a == "--version") {
+        println!("redo-msh {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let (jobs, args) = extract_jobs(raw_args)?;
     let (verb, rest) = match args.split_first() {
         Some((v, r)) => (v.as_str(), r.to_vec()),
@@ -44,12 +54,8 @@ pub fn run(raw_args: &[String]) -> Result<()> {
         "sources" => build::cmd_sources(),
         "targets" => build::cmd_targets(),
         "ood" => build::cmd_ood(),
-        "-h" | "--help" | "help" => {
+        "help" => {
             print_usage();
-            Ok(())
-        }
-        "--version" => {
-            println!("redo-msh {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         // No recognized verb: treat all args as targets to build.
@@ -63,7 +69,20 @@ pub fn run(raw_args: &[String]) -> Result<()> {
 /// arguments. Handles its own error reporting and process exit.
 pub fn forward(verb: Option<&str>) -> ! {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let prog = verb.map(|v| format!("redo-{v}")).unwrap_or_else(|| "redo".into());
+    let prog = prog_name(verb);
+
+    // Help and version are recognized by every command, in any position, before
+    // any other parsing. (A target/dep literally named `-h` must be given as a
+    // path, e.g. `./-h`.)
+    if raw.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", forward_usage(verb));
+        std::process::exit(0);
+    }
+    if raw.iter().any(|a| a == "--version") {
+        println!("{prog} {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     let code = match run_forward(verb, &raw) {
         Ok(()) => 0,
         Err(e) => {
@@ -72,6 +91,85 @@ pub fn forward(verb: Option<&str>) -> ! {
         }
     };
     std::process::exit(code);
+}
+
+/// The program name for diagnostics/usage: `redo` for the top-level build,
+/// `redo-<verb>` otherwise.
+fn prog_name(verb: Option<&str>) -> String {
+    verb.map(|v| format!("redo-{v}")).unwrap_or_else(|| "redo".into())
+}
+
+/// Per-command help text for the named forwarder binaries.
+fn forward_usage(verb: Option<&str>) -> String {
+    let ver = env!("CARGO_PKG_VERSION");
+    // Shared trailer for commands that take target/dependency names.
+    let dash_note = "\nTo name a target/dependency beginning with '-', give it a path,\n\
+                     e.g. `./--my-file`.\n";
+    match verb {
+        None => format!(
+            "redo {ver} — build targets (forced); with no targets, builds `all`.
+
+USAGE:
+    redo [options] [targets...]
+
+OPTIONS:
+    -j N, --jobs N   build up to N targets in parallel (default 1)
+    -y, --yes        overwrite hand-edited targets without asking
+    -h, --help       show this help
+    --version        print version
+{dash_note}"
+        ),
+        Some("ifchange") => format!(
+            "redo-ifchange {ver} — build dependencies if out of date and record them as
+dependencies of the current target. Call from within a do-file.
+
+USAGE:
+    redo-ifchange <deps...>
+
+OPTIONS:
+    -h, --help   show this help
+    --version    print version
+{dash_note}"
+        ),
+        Some("ifcreate") => format!(
+            "redo-ifcreate {ver} — record that the current target depends on the given
+paths NOT existing. Call from within a do-file.
+
+USAGE:
+    redo-ifcreate <paths...>
+
+OPTIONS:
+    -h, --help   show this help
+    --version    print version
+{dash_note}"
+        ),
+        Some("always") => format!(
+            "redo-always {ver} — mark the current target as always out of date. Call from
+within a do-file.
+
+USAGE:
+    redo-always
+
+OPTIONS:
+    -h, --help   show this help
+    --version    print version
+"
+        ),
+        Some("stamp") => format!(
+            "redo-stamp {ver} — drain standard input and exit. Compatibility no-op:
+redo-msh content-hashes every committed output by default, so an explicit
+stamp is unnecessary.
+
+USAGE:
+    <command> | redo-stamp
+
+OPTIONS:
+    -h, --help   show this help
+    --version    print version
+"
+        ),
+        Some(other) => format!("redo-{other}: no help available\n"),
+    }
 }
 
 fn run_forward(verb: Option<&str>, raw: &[String]) -> Result<()> {
@@ -137,7 +235,7 @@ pub fn cmd_root(args: &[String]) -> Result<()> {
 }
 
 pub fn print_usage() {
-    eprintln!(
+    println!(
         "redo-msh {} — DJB redo, cross-platform, mshell do-files
 
 USAGE:
@@ -169,7 +267,9 @@ OPTIONS:
 
 Do-files are run with `msh <dofile> $1 $2 $3` by default; a project may commit
 a `redo.toml` to run some or all do-files with another interpreter (e.g.
-`sh -e`). $1 = target, $2 = target without extension, $3 = temp output path.",
+`sh -e`). $1 = target, $2 = target without extension, $3 = temp output path.
+
+To name a target beginning with '-', give it a path, e.g. `./--my-file`.",
         env!("CARGO_PKG_VERSION")
     );
 }
