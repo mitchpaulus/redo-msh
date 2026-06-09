@@ -15,7 +15,10 @@
 //! with `!`/`;`/`?`. A bare token in a list can collide with an mshell builtin
 //! or keyword (e.g. `mkdir`, or `maybe` — the Optional/`maybe` stack op), so we
 //! quote *every* item: `['redo-msh' 'ifchange' 'a.txt']!`. This is the safe
-//! form and lets target/dep names be anything. To create a target's parent
+//! form and lets target/dep names be anything. The same collision applies to
+//! *variable* names: `o` is mshell's stdout-redirect operator, so binding it
+//! (`args :2: o!`) fails on the pinned mshell with "Cannot set stdout behavior";
+//! bind a longer name like `out` instead. To create a target's parent
 //! directory (redo, like apenwarr, does not do this for you) a do-file uses the
 //! `mkdirp` builtin (`"sub/deep" mkdirp`).
 
@@ -418,7 +421,7 @@ fn zero_byte_vs_no_output() {
         return;
     }
     let p = Project::new();
-    p.write("empty.txt.do", "args :2: o!\n\"\" @o writeFile\n");
+    p.write("empty.txt.do", "args :2: out!\n\"\" @out writeFile\n");
     assert!(p.redo(&["empty.txt"]).status.success());
     assert!(p.exists("empty.txt"), "an explicit zero-byte $3 must create the file");
     assert_eq!(p.read("empty.txt"), "");
@@ -437,7 +440,7 @@ fn rebuild_when_target_deleted() {
     let p = Project::new();
     p.write(
         "out.txt.do",
-        "args :2: o!\n\"r\\n\" \"out.log\" appendFile\n\"hi\\n\" @o writeFile\n",
+        "args :2: out!\n\"r\\n\" \"out.log\" appendFile\n\"hi\\n\" @out writeFile\n",
     );
     assert!(p.redo(&["ifchange", "out.txt"]).status.success());
     assert_eq!(p.lines("out.log"), 1);
@@ -456,7 +459,7 @@ fn unicode_paths() {
         return;
     }
     let p = Project::new();
-    p.write("café.txt.do", "args :2: o!\n\"é\\n\" @o writeFile\n");
+    p.write("café.txt.do", "args :2: out!\n\"é\\n\" @out writeFile\n");
     let out = p.redo(&["café.txt"]);
     assert!(out.status.success(), "unicode path build failed: {}", stderr(&out));
     assert_eq!(p.read("café.txt"), "é\n");
@@ -469,7 +472,7 @@ fn spaces_in_paths() {
         return;
     }
     let p = Project::new();
-    p.write("space dir/out.txt.do", "args :2: o!\n\"x\\n\" @o writeFile\n");
+    p.write("space dir/out.txt.do", "args :2: out!\n\"x\\n\" @out writeFile\n");
     let out = p.redo(&["space dir/out.txt"]);
     assert!(out.status.success(), "spaced path build failed: {}", stderr(&out));
     assert_eq!(p.read("space dir/out.txt"), "x\n");
@@ -483,8 +486,8 @@ fn default_extension_precedence() {
         return;
     }
     let p = Project::new();
-    p.write("default.c.do", "args :2: o!\n\"c-rule\\n\" @o writeFile\n");
-    p.write("default.do", "args :2: o!\n\"any-rule\\n\" @o writeFile\n");
+    p.write("default.c.do", "args :2: out!\n\"c-rule\\n\" @out writeFile\n");
+    p.write("default.do", "args :2: out!\n\"any-rule\\n\" @out writeFile\n");
     assert!(p.redo(&["x.c"]).status.success());
     assert_eq!(p.read("x.c"), "c-rule\n", "x.c should use default.c.do");
     assert!(p.redo(&["y.q"]).status.success());
@@ -499,8 +502,8 @@ fn nested_default_resolution() {
         return;
     }
     let p = Project::new();
-    p.write("a/default.z.do", "args :2: o!\n\"az\\n\" @o writeFile\n");
-    p.write("default.do", "args :0: t!\nargs :2: o!\n@t @o writeFile\n");
+    p.write("a/default.z.do", "args :2: out!\n\"az\\n\" @out writeFile\n");
+    p.write("default.do", "args :0: t!\nargs :2: out!\n@t @out writeFile\n");
 
     assert!(p.redo(&["a/file.z"]).status.success());
     assert_eq!(p.read("a/file.z"), "az\n", "a/file.z should use a/default.z.do");
@@ -517,7 +520,7 @@ fn default_does_not_cross_dirs() {
         return;
     }
     let p = Project::new();
-    p.write("inner/default.do", "args :2: o!\n\"in\\n\" @o writeFile\n");
+    p.write("inner/default.do", "args :2: out!\n\"in\\n\" @out writeFile\n");
     // inner/foo builds via inner/default.do.
     assert!(p.redo(&["inner/foo"]).status.success());
     assert_eq!(p.read("inner/foo"), "in\n");
@@ -607,7 +610,7 @@ fn dofile_creates_target_subdir() {
     let p = Project::new();
     p.write(
         "default.txt.do",
-        "args :2: o!\n\"sub/deep\" mkdirp\n\"hi\\n\" @o writeFile\n",
+        "args :2: out!\n\"sub/deep\" mkdirp\n\"hi\\n\" @out writeFile\n",
     );
     let out = p.redo(&["sub/deep/x.txt"]);
     assert!(
@@ -630,7 +633,7 @@ fn shared_static_dep_rebuilds_all() {
     for n in [1, 2] {
         p.write(
             &format!("s{n}.txt.do"),
-            "args :2: o!\n['redo-msh' 'ifchange' 'static.in']!\n\"s\\n\" \"s.log\" appendFile\n\"static.in\" readFile @o writeFile\n",
+            "args :2: out!\n['redo-msh' 'ifchange' 'static.in']!\n\"s\\n\" \"s.log\" appendFile\n\"static.in\" readFile @out writeFile\n",
         );
     }
     assert!(p.redo(&["ifchange", "s1.txt", "s2.txt"]).status.success());
@@ -651,7 +654,7 @@ fn cross_dir_relative_dependency() {
     let p = Project::new();
     p.write(
         "top.txt.do",
-        "args :2: o!\n\"t\\n\" \"top.log\" appendFile\n\"top\\n\" @o writeFile\n",
+        "args :2: out!\n\"t\\n\" \"top.log\" appendFile\n\"top\\n\" @out writeFile\n",
     );
     p.write(
         "sub/leaf.do",
@@ -671,7 +674,7 @@ fn cross_dir_relative_dependency() {
     // rebuilds too.
     p.write(
         "top.txt.do",
-        "args :2: o!\n\"t\\n\" \"top.log\" appendFile\n\"TOP\\n\" @o writeFile\n",
+        "args :2: out!\n\"t\\n\" \"top.log\" appendFile\n\"TOP\\n\" @out writeFile\n",
     );
     assert!(p.redo(&["ifchange", "sub/leaf"]).status.success());
     assert_eq!(p.lines("top.log"), 2, "top rebuilt after recipe change");
@@ -721,7 +724,11 @@ fn sh_dofiles_via_config_and_forwarders() {
         return;
     }
     let p = Project::new();
-    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n");
+    // Map every platform the suite runs on, including Windows (Git Bash `sh` is
+    // present on the runners). Without a `[platform.windows]` entry the do-files
+    // would fall back to the built-in `msh` interpreter on Windows and the sh
+    // recipes would not run.
+    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n\n[platform.windows]\ndefault = [\"sh\", \"-e\"]\n");
     // No shebangs anywhere; the interpreter comes entirely from redo.toml.
     p.write("all.do", "redo-ifchange greeting.txt\n");
     p.write(
@@ -754,7 +761,11 @@ fn sh_dofile_failure_propagates() {
         return;
     }
     let p = Project::new();
-    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n");
+    // Map every platform the suite runs on, including Windows (Git Bash `sh` is
+    // present on the runners). Without a `[platform.windows]` entry the do-files
+    // would fall back to the built-in `msh` interpreter on Windows and the sh
+    // recipes would not run.
+    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n\n[platform.windows]\ndefault = [\"sh\", \"-e\"]\n");
     // out.txt depends on a nonexistent source with no do-file -> ifchange fails,
     // and `sh -e` must abort the do-file rather than continuing to write output.
     p.write(
