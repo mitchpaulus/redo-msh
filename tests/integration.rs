@@ -724,7 +724,11 @@ fn sh_dofiles_via_config_and_forwarders() {
         return;
     }
     let p = Project::new();
-    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n");
+    // Map every platform the suite runs on, including Windows (Git Bash `sh` is
+    // present on the runners). Without a `[platform.windows]` entry the do-files
+    // would fall back to the built-in `msh` interpreter on Windows and the sh
+    // recipes would not run.
+    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n\n[platform.windows]\ndefault = [\"sh\", \"-e\"]\n");
     // No shebangs anywhere; the interpreter comes entirely from redo.toml.
     p.write("all.do", "redo-ifchange greeting.txt\n");
     p.write(
@@ -757,7 +761,11 @@ fn sh_dofile_failure_propagates() {
         return;
     }
     let p = Project::new();
-    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n");
+    // Map every platform the suite runs on, including Windows (Git Bash `sh` is
+    // present on the runners). Without a `[platform.windows]` entry the do-files
+    // would fall back to the built-in `msh` interpreter on Windows and the sh
+    // recipes would not run.
+    p.write("redo.toml", "[platform.linux]\ndefault = [\"sh\", \"-e\"]\n\n[platform.macos]\ndefault = [\"sh\", \"-e\"]\n\n[platform.wsl]\ndefault = [\"sh\", \"-e\"]\n\n[platform.windows]\ndefault = [\"sh\", \"-e\"]\n");
     // out.txt depends on a nonexistent source with no do-file -> ifchange fails,
     // and `sh -e` must abort the do-file rather than continuing to write output.
     p.write(
