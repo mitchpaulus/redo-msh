@@ -13,7 +13,7 @@ Requirements and what will be different:
 
 - It will be written in Rust
 - It will handle manually updated files with more interaction if run from tty. It will ask the user if it should be overwritten by build.
-- It can use SQLite as the data store. `.redo/redo-msh.db` in the "project root".
+- It can use SQLite as the data store. `.redom/redo-msh.db` in the "project root".
 
 - Support both stdout and `$3` output styles. Error if both received.
 - `$1` target, `$2` base from default, and `$3` temporary output path are passed to `mshell` via arguments.
@@ -23,7 +23,7 @@ Requirements and what will be different:
 
 ## Project Root
 
-The project root will be the `.git` root, or somewhere that has the `.redo/redo-msh.db` manually set up.
+The project root will be the `.git` root, or somewhere that has the `.redom/redo-msh.db` manually set up.
 Can be set up using `redo-msh root` command in the directory of choice.
 
 Searching for default do files stops at project root.

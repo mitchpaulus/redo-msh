@@ -6,7 +6,7 @@
 //! do-files to the command used to run them. We deliberately do **not** parse
 //! shebangs; the mapping is always explicit and lives in version control.
 //!
-//! The file lives at the project root (not under `.redo/`, which is gitignored).
+//! The file lives at the project root (not under `.redom/`, which is gitignored).
 //!
 //! ## Schema
 //!

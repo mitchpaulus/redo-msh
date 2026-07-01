@@ -250,7 +250,7 @@ COMMANDS:
                                   these paths NOT existing
     redo-msh always               mark the current target as always out of date
     redo-msh stamp                drain stdin (compat no-op; outputs are hashed)
-    redo-msh root [dir]           initialize a project root (.redo/) here or at dir
+    redo-msh root [dir]           initialize a project root (.redom/) here or at dir
     redo-msh sources              list known source files
     redo-msh targets              list known generated targets
     redo-msh ood                  list out-of-date targets (without building)

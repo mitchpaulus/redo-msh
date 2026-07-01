@@ -1,15 +1,15 @@
 //! Project root discovery and initialization.
 //!
 //! The project root is the nearest ancestor directory (starting at the cwd)
-//! that either already has `.redo/redo-msh.db`, or is a `.git` root. An
-//! explicit `.redo/redo-msh.db` always wins when it is at least as close as a
+//! that either already has `.redom/redo-msh.db`, or is a `.git` root. An
+//! explicit `.redom/redo-msh.db` always wins when it is at least as close as a
 //! `.git` directory. `redo-msh root [dir]` initializes a root explicitly.
 
 use crate::{db, fsguard};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-pub const REDO_DIR: &str = ".redo";
+pub const REDO_DIR: &str = ".redom";
 pub const DB_NAME: &str = "redo-msh.db";
 
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ impl Root {
         )
     }
 
-    /// Initialize a project root at `dir`: create `.redo/`, enforce the
+    /// Initialize a project root at `dir`: create `.redom/`, enforce the
     /// local-filesystem requirement, and create the database + schema.
     pub fn init(dir: &Path) -> Result<Root> {
         let dir = crate::paths::lexical_clean(&abs(dir)?);

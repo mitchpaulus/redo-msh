@@ -10,7 +10,7 @@
 //! stderr was redirected into a capture file:
 //!   * Unix: the top-level dups its real stderr to an inherited fd and passes
 //!     the number in `REDO_LOG_FD`; every redo-msh process writes blocks there,
-//!     serialized across processes by an exclusive lock on `.redo/output.lock`.
+//!     serialized across processes by an exclusive lock on `.redom/output.lock`.
 //!     This respects redirection (`redo 2>log` sends blocks to the file).
 //!   * Other platforms: blocks go to the process's own stderr and bubble up
 //!     through the capture chain to the top level (correct and non-interleaved,

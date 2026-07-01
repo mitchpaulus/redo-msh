@@ -1,8 +1,8 @@
-//! Local-filesystem guard for the `.redo/` state directory.
+//! Local-filesystem guard for the `.redom/` state directory.
 //!
-//! Design decision (see DESIGN/plan): `.redo/` holds the SQLite database (WAL
+//! Design decision (see DESIGN/plan): `.redom/` holds the SQLite database (WAL
 //! mode) and the per-target advisory lock files. Neither SQLite WAL nor
-//! `flock`/`LockFileEx` behaves correctly across machines, so `.redo/` MUST
+//! `flock`/`LockFileEx` behaves correctly across machines, so `.redom/` MUST
 //! live on a local disk. The working tree may live anywhere.
 //!
 //! We classify the filesystem under a path into one of three buckets:
@@ -62,7 +62,7 @@ pub fn classify(_path: &Path) -> FsKind {
     FsKind::Unknown
 }
 
-/// Enforce the local-disk requirement for `.redo/`. Returns an error for a
+/// Enforce the local-disk requirement for `.redom/`. Returns an error for a
 /// detected network filesystem unless `REDO_ALLOW_NETWORK_FS=1` is set.
 pub fn enforce_local(redo_dir: &Path) -> anyhow::Result<()> {
     let override_set = std::env::var_os("REDO_ALLOW_NETWORK_FS")
@@ -81,7 +81,7 @@ pub fn enforce_local(redo_dir: &Path) -> anyhow::Result<()> {
                 Ok(())
             } else {
                 anyhow::bail!(
-                    "redo-msh: {} is on a network filesystem. The .redo/ state directory \
+                    "redo-msh: {} is on a network filesystem. The .redom/ state directory \
                      (SQLite WAL + advisory locks) must be on a local disk. Move the project, \
                      or set REDO_ALLOW_NETWORK_FS=1 to override at your own risk.",
                     redo_dir.display()
