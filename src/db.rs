@@ -27,6 +27,11 @@ pub enum DepKind {
     IfCreate = 1,
     Always = 2,
     DoFile = 3,
+    /// Marker recorded when a build starts and removed only after the target
+    /// commits successfully. If it is present outside a build, the last build
+    /// failed (or crashed) and the target is unconditionally out of date —
+    /// a leftover output file from an earlier success must not be trusted.
+    Uncommitted = 4,
 }
 
 impl DepKind {
@@ -36,6 +41,7 @@ impl DepKind {
             1 => Some(DepKind::IfCreate),
             2 => Some(DepKind::Always),
             3 => Some(DepKind::DoFile),
+            4 => Some(DepKind::Uncommitted),
             _ => None,
         }
     }
@@ -145,7 +151,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS deps (
             target TEXT NOT NULL COLLATE NOCASE, -- dependent target (root-relative)
-            kind   INTEGER NOT NULL,     -- DepKind: 0 ifchange, 1 ifcreate, 2 always, 3 dofile
+            kind   INTEGER NOT NULL,     -- DepKind: 0 ifchange, 1 ifcreate, 2 always, 3 dofile, 4 uncommitted
             dep    TEXT COLLATE NOCASE,  -- dependency path (ifchange/ifcreate/dofile); NULL for always
             csum   TEXT,                 -- dep content hash expected at build time (equality basis)
             mtime  INTEGER,              -- recorded mtime (fast-path accelerator)

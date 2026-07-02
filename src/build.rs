@@ -474,6 +474,12 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
 
     // Reset dependency edges; the do-file re-declares them as it runs.
     clear_deps(&ctx.conn, target_rel)?;
+    // Mark the build as in flight. The marker is removed only after a
+    // successful commit, so a failed (or crashed) build leaves the target
+    // unconditionally out of date — otherwise a later run would trust a
+    // leftover output file from an earlier success plus the fresh edges
+    // recorded below, and accept the target as up to date.
+    record_dep(&ctx.conn, target_rel, DepKind::Uncommitted, None, None)?;
     let df_stamp = stamp::stamp_file(&df.dofile_abs)?;
     record_dep(&ctx.conn, target_rel, DepKind::DoFile, Some(&df.dofile_rel), df_stamp.as_ref())?;
     for a in &absent {
@@ -605,6 +611,11 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         Some(now_nanos()),
         stamp.as_ref(),
         ctx.session,
+    )?;
+    // Successful commit: drop the in-flight marker recorded before the run.
+    ctx.conn.execute(
+        "DELETE FROM deps WHERE target = ?1 AND kind = ?2",
+        params![target_rel, DepKind::Uncommitted as i64],
     )?;
     Ok(())
 }
@@ -757,6 +768,8 @@ fn is_ood(ctx: &Ctx, target: &str) -> Result<bool> {
     for (kind, dep, edge_csum) in read_deps(&ctx.conn, target)? {
         match kind {
             DepKind::Always => return Ok(true),
+            // Last build never committed (failed or crashed).
+            DepKind::Uncommitted => return Ok(true),
             DepKind::DoFile => {
                 let dep = dep.expect("dofile dep has a path");
                 if current_csum(ctx, &dep)?.as_deref() != edge_csum.as_deref() {
@@ -1060,7 +1073,7 @@ fn is_ood_static(root: &Root, conn: &Connection, target: &str) -> Result<bool> {
     }
     for (kind, dep, edge_csum) in read_deps(conn, target)? {
         match kind {
-            DepKind::Always => return Ok(true),
+            DepKind::Always | DepKind::Uncommitted => return Ok(true),
             DepKind::IfCreate => {
                 if root.dir.join(dep.expect("ifcreate path")).exists() {
                     return Ok(true);
