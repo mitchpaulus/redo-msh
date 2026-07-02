@@ -568,6 +568,50 @@ fn failing_dofile_and_missing_dep() {
     assert!(p.redo(&["ic"]).status.success(), "ifcreate of a nonexistent path should succeed");
 }
 
+/// A dependency whose do-file fails must stay out of date: the next run must
+/// retry (and keep failing) rather than accept a leftover output file from an
+/// earlier successful build. (regression: A -> B, B fails, second `redo A`
+/// silently accepted the stale B)
+#[test]
+fn failed_dep_is_retried_not_accepted() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    // Build b.txt successfully once, so a leftover file and db row exist.
+    p.write("b.txt.do", "args :2: out!\n\"beta\\n\" @out writeFile\n");
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'b.txt']!\n\"b.txt\" readFile @out writeFile\n",
+    );
+    assert!(p.redo(&["a.txt"]).status.success());
+    assert_eq!(p.read("b.txt"), "beta\n");
+
+    // Break b's do-file (ifchange of a missing, unbuildable dep fails).
+    p.write("b.txt.do", "['redo-msh' 'ifchange' 'no-such-dep']!\n");
+    assert!(
+        !p.redo(&["a.txt"]).status.success(),
+        "a must fail while b's do-file fails"
+    );
+    // The stale leftover b.txt must not be accepted on the next run.
+    assert!(
+        !p.redo(&["a.txt"]).status.success(),
+        "second run must retry the failed dependency, not accept the stale b.txt"
+    );
+    let ood = p.stdout_of(&["ood"]);
+    assert!(
+        ood.lines().any(|l| l == "b.txt"),
+        "b.txt must be listed as out of date after a failed build: {ood:?}"
+    );
+
+    // Fix the do-file: everything builds again and b is committed fresh.
+    p.write("b.txt.do", "args :2: out!\n\"fixed\\n\" @out writeFile\n");
+    let out = p.redo(&["a.txt"]);
+    assert!(out.status.success(), "build after fixing b.do failed: {}", stderr(&out));
+    assert_eq!(p.read("b.txt"), "fixed\n");
+    assert_eq!(p.read("a.txt"), "fixed\n");
+}
+
 /// A path recorded via `ifcreate` makes the target out-of-date once it is
 /// created. (ports t/220-ifcreate)
 ///
