@@ -230,6 +230,44 @@ fn defaults_and_ifcreate() {
     assert_eq!(p.lines("dat.log"), 2);
 }
 
+/// An existing file that redo never generated is a source, even when a
+/// matching `default.*.do` exists (djb's static-file rule, apenwarr
+/// builder.py `_start_self`): the default rule must not run on it, must not
+/// overwrite it, and must not drag in the rule's dependencies. A *missing*
+/// file with the same extension still builds via the default rule.
+#[test]
+fn existing_source_ignores_default_rule() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("data.csv", "a,b\n1,2\n");
+    // If this rule ever ran on data.csv it would fail (missing-input has no
+    // rule and no file) and would log.
+    p.write(
+        "default.csv.do",
+        "\"d\\n\" \"csv.log\" appendFile\n['redo-msh' 'ifchange' 'missing-input']!\n\"generated\" wl\n",
+    );
+    p.write("driver.do", "['redo-msh' 'ifchange' 'data.csv']!\n");
+
+    let out = p.redo(&["ifchange", "driver"]);
+    assert!(out.status.success(), "driver failed: {}", stderr(&out));
+    assert_eq!(p.read("data.csv"), "a,b\n1,2\n", "source must not be overwritten");
+    assert!(!p.exists("csv.log"), "default.csv.do must not run on an existing source");
+
+    // Forced top-level redo of the source is also a no-op (static).
+    let out = p.redo(&["data.csv"]);
+    assert!(out.status.success(), "redo data.csv failed: {}", stderr(&out));
+    assert!(!p.exists("csv.log"), "default.csv.do must not run on an existing source");
+
+    // A missing .csv target still builds via the default rule.
+    p.write("missing-input", "x\n");
+    let out = p.redo(&["ifchange", "gen.csv"]);
+    assert!(out.status.success(), "gen.csv failed: {}", stderr(&out));
+    assert_eq!(p.read("gen.csv"), "generated\n");
+    assert_eq!(p.lines("csv.log"), 1);
+}
+
 /// `redo-msh always` rebuilds the target on every run. (ports t/640-always)
 #[test]
 fn always_rebuilds() {
