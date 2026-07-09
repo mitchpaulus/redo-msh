@@ -230,6 +230,78 @@ fn defaults_and_ifcreate() {
     assert_eq!(p.lines("dat.log"), 2);
 }
 
+/// An existing file that redo never generated is a source, even when a
+/// matching `default.*.do` exists (djb's static-file rule, apenwarr
+/// builder.py `_start_self`): the default rule must not run on it, must not
+/// overwrite it, and must not drag in the rule's dependencies. A *missing*
+/// file with the same extension still builds via the default rule.
+#[test]
+fn existing_source_ignores_default_rule() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("data.csv", "a,b\n1,2\n");
+    // If this rule ever ran on data.csv it would fail (missing-input has no
+    // rule and no file) and would log.
+    p.write(
+        "default.csv.do",
+        "\"d\\n\" \"csv.log\" appendFile\n['redo-msh' 'ifchange' 'missing-input']!\n\"generated\" wl\n",
+    );
+    p.write("driver.do", "['redo-msh' 'ifchange' 'data.csv']!\n");
+
+    let out = p.redo(&["ifchange", "driver"]);
+    assert!(out.status.success(), "driver failed: {}", stderr(&out));
+    assert_eq!(p.read("data.csv"), "a,b\n1,2\n", "source must not be overwritten");
+    assert!(!p.exists("csv.log"), "default.csv.do must not run on an existing source");
+
+    // Forced top-level redo of the source is also a no-op (static).
+    let out = p.redo(&["data.csv"]);
+    assert!(out.status.success(), "redo data.csv failed: {}", stderr(&out));
+    assert!(!p.exists("csv.log"), "default.csv.do must not run on an existing source");
+
+    // A missing .csv target still builds via the default rule.
+    p.write("missing-input", "x\n");
+    let out = p.redo(&["ifchange", "gen.csv"]);
+    assert!(out.status.success(), "gen.csv failed: {}", stderr(&out));
+    assert_eq!(p.read("gen.csv"), "generated\n");
+    assert_eq!(p.lines("csv.log"), 1);
+}
+
+/// An existing never-generated file with an *exact* `<target>.do` stays a
+/// target (deliberate deviation from apenwarr, which treats it as static):
+/// redo must not silently clobber the user's file — non-interactively it
+/// fails with an explanatory error; `--yes` overwrites and adopts it.
+#[test]
+fn existing_source_with_exact_dofile_refuses_then_adopts() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("report.txt", "user data\n");
+    p.write("report.txt.do", "\"built\" wl\n");
+
+    // Non-tty, no --yes: refuse, explain, preserve the file.
+    let out = p.redo(&["ifchange", "report.txt"]);
+    assert!(!out.status.success(), "must refuse to overwrite a user-created file");
+    assert!(
+        stderr(&out).contains("not created by redo"),
+        "error should explain the conflict: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("report.txt"), "user data\n");
+
+    // --yes overwrites and adopts it as a generated target.
+    let out = p.redo(&["--yes", "report.txt"]);
+    assert!(out.status.success(), "--yes build failed: {}", stderr(&out));
+    assert_eq!(p.read("report.txt"), "built\n");
+
+    // From here on it is a normal generated target: no prompt, no error.
+    let out = p.redo(&["ifchange", "report.txt"]);
+    assert!(out.status.success(), "rebuild failed: {}", stderr(&out));
+    assert_eq!(p.read("report.txt"), "built\n");
+}
+
 /// `redo-msh always` rebuilds the target on every run. (ports t/640-always)
 #[test]
 fn always_rebuilds() {
