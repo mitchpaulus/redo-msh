@@ -615,13 +615,14 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     // Make the redo command family resolvable from inside the do-file by
     // prepending our own directory (where `redo`, `redo-ifchange`, ... ship
     // alongside `redo-msh`) to the child's PATH.
-    if let Some(path) = child_path() {
+    let child_path = child_path();
+    if let Some(path) = &child_path {
         command.env("PATH", path);
     }
 
     let status = command
         .status()
-        .with_context(|| format!("running do-file {}", df.dofile_abs.display()))?;
+        .map_err(|e| interpreter_spawn_error(e, &interp, &df.dofile_abs, child_path.as_deref()))?;
 
     // Emit this target's log block (header + captured stderr) as one
     // non-interleaved unit, streamed in completion order and indented by depth.
@@ -1159,6 +1160,55 @@ fn is_ood_static(root: &Root, conn: &Connection, target: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Build a detailed error for a failed interpreter spawn. The bare OS error
+/// ("program not found") names neither the missing program nor where we
+/// looked, which reads as if the do-file itself were the problem. Spell out
+/// exactly what we tried to run and the PATH we used to find it.
+fn interpreter_spawn_error(
+    err: std::io::Error,
+    interp: &[String],
+    dofile_abs: &Path,
+    child_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Error {
+    let interp0 = &interp[0];
+    let mut msg = format!(
+        "cannot run do-file {}\n\n\
+         redo-msh does not execute do-files directly: every do-file is run by an\n\
+         interpreter ('msh' by default, or whatever redo.toml configures). Here that\n\
+         interpreter is '{}' (full command: {} {}), and spawning it failed:\n\n  {}\n",
+        dofile_abs.display(),
+        interp0,
+        interp.join(" "),
+        dofile_abs.display(),
+        err,
+    );
+    if err.kind() == std::io::ErrorKind::NotFound {
+        msg.push_str(&format!(
+            "\n'{}' was not found in any directory on PATH. PATH as used for this spawn:\n",
+            interp0
+        ));
+        // Prefer the PATH we actually set on the child (used for lookup on
+        // Windows); fall back to our own environment's PATH.
+        let path_os = child_path
+            .map(|p| p.to_os_string())
+            .or_else(|| std::env::var_os("PATH"));
+        match path_os {
+            Some(p) => {
+                for dir in std::env::split_paths(&p) {
+                    msg.push_str(&format!("  {}\n", dir.display()));
+                }
+            }
+            None => msg.push_str("  (PATH is not set)\n"),
+        }
+        msg.push_str(&format!(
+            "\nTo fix: install '{}' and make sure its directory is on PATH, or set a\n\
+             different interpreter in redo.toml at the project root.",
+            interp0
+        ));
+    }
+    anyhow::anyhow!(msg)
 }
 
 /// The child do-file's `PATH` with the running executable's own directory
