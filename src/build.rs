@@ -1097,12 +1097,19 @@ pub fn redo(targets: &[String], j: usize) -> Result<()> {
     let mut ctx = Ctx::top_level(j)?;
     gc_temps(&ctx.root); // sweep temp files left by any crashed build
 
+    // The liveness lock goes on a sentinel file that is never read or
+    // written, NOT on the run log: Windows kernel locks are mandatory, so a
+    // lock held on the log itself would block the follower's reads and every
+    // event append, silently emptying the live display and hanging the join.
     let run_log = crate::logs::run_log_path(&ctx.root, ctx.session);
+    let run_lock_path = crate::logs::run_lock_path(&ctx.root, ctx.session);
     fs::create_dir_all(crate::logs::logs_dir(&ctx.root))?;
-    let run_lock = fs::File::create(&run_log)
-        .with_context(|| format!("creating run log {}", run_log.display()))?;
+    let run_lock = fs::File::create(&run_lock_path)
+        .with_context(|| format!("creating run lock {}", run_lock_path.display()))?;
     fs2::FileExt::lock_exclusive(&run_lock)
-        .with_context(|| format!("locking run log {}", run_log.display()))?;
+        .with_context(|| format!("locking run lock {}", run_lock_path.display()))?;
+    fs::File::create(&run_log)
+        .with_context(|| format!("creating run log {}", run_log.display()))?;
     crate::logs::gc_logs(&ctx.root, ctx.session);
     ctx.log_sink = Some(run_log.clone());
     let follower = crate::logs::follow_start(ctx.root.clone(), ctx.session);
@@ -1119,6 +1126,8 @@ pub fn redo(targets: &[String], j: usize) -> Result<()> {
     });
     follower.join();
     drop(run_lock);
+    // The lock sentinel is bookkeeping, not a log: remove it regardless.
+    let _ = fs::remove_file(&run_lock_path);
     if !crate::logs::keep_logs() {
         let _ = fs::remove_file(&run_log);
     }

@@ -86,6 +86,15 @@ pub fn run_log_path(root: &Root, session: i64) -> PathBuf {
     logs_dir(root).join(format!("run.{session}.log"))
 }
 
+/// Liveness sentinel for a run: the top-level holds an exclusive kernel lock
+/// on this file (never on the run log itself!) for its whole lifetime, and
+/// the GC probes it. It must be a file nobody ever reads or writes: Windows
+/// `LockFileEx` is a *mandatory* lock, so locking the run log itself would
+/// block the follower's reads and every event append against it.
+pub fn run_lock_path(root: &Root, session: i64) -> PathBuf {
+    logs_dir(root).join(format!("run.{session}.lock"))
+}
+
 pub fn target_log_path(root: &Root, target_rel: &str) -> PathBuf {
     // Hash-derived name: shared with the lock file (same key), collision
     // resistant, and immune to path traversal by construction.
@@ -508,8 +517,9 @@ pub fn gc_logs(root: &Root, current_session: i64) {
     if keep_logs() {
         return;
     }
-    let own_run_log = format!("run.{current_session}.log");
-    let entries = match fs::read_dir(logs_dir(root)) {
+    let own_prefix = format!("run.{current_session}.");
+    let dir = logs_dir(root);
+    let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return, // No logs directory yet: nothing to sweep.
     };
@@ -519,13 +529,18 @@ pub fn gc_logs(root: &Root, current_session: i64) {
             Some(n) => n,
             None => continue,
         };
-        if name == own_run_log {
-            continue;
+        if name.starts_with(&own_prefix) {
+            continue; // Our own run log and lock sentinel.
         }
         let stale = if name.ends_with(".tmp") {
             true // Crashed between temp-create and rename.
-        } else if name.starts_with("run.") && name.ends_with(".log") {
-            run_log_is_stale(&entry.path())
+        } else if let Some(session) = name
+            .strip_prefix("run.")
+            .and_then(|n| n.strip_suffix(".log").or_else(|| n.strip_suffix(".lock")))
+        {
+            // A run's log and lock sentinel are stale together, iff no live
+            // top-level holds the sentinel's kernel lock.
+            lock_file_is_free(&dir.join(format!("run.{session}.lock")))
         } else if let Some(key) =
             name.strip_prefix("t.").and_then(|n| n.strip_suffix(".log"))
         {
@@ -539,13 +554,14 @@ pub fn gc_logs(root: &Root, current_session: i64) {
     }
 }
 
-/// A run log is live while its top-level process holds an exclusive flock on
-/// it (taken at startup, held for the whole run, released by the kernel even
-/// on a crash — the same robustness argument as the build locks).
-fn run_log_is_stale(path: &Path) -> bool {
-    let f = match File::open(path) {
+/// Whether nobody holds a kernel lock on `path` (a lock-only sentinel file; a
+/// missing file has no holder). Kernel locks are released on process death,
+/// so this is a true liveness probe, never an age heuristic.
+fn lock_file_is_free(path: &Path) -> bool {
+    let f = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(f) => f,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false, // Can't tell: claim held, the safe answer.
     };
     if f.try_lock_exclusive().is_ok() {
         let _ = FileExt::unlock(&f);
@@ -610,6 +626,41 @@ mod tests {
         let name = p.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("t.") && name.ends_with(".log"));
         assert_eq!(name.len(), "t.".len() + 32 + ".log".len());
+    }
+
+    /// The run liveness lock must never block the run log's readers or
+    /// writers. Trivially true on Unix (flock is advisory); on Windows,
+    /// kernel locks are MANDATORY, so this test fails if the lock is ever
+    /// moved back onto the run log itself (the bug: an empty run trace, no
+    /// live output at all, and a follower that never terminates).
+    #[test]
+    fn held_run_lock_does_not_block_run_log_io() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("redom-runlock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = Root { dir: dir.clone() };
+        let session = 42;
+        let run_log = run_log_path(&root, session);
+        let run_lock = run_lock_path(&root, session);
+        fs::create_dir_all(logs_dir(&root)).unwrap();
+        assert_ne!(run_log, run_lock);
+
+        let lock_file = File::create(&run_lock).unwrap();
+        lock_file.lock_exclusive().unwrap();
+        File::create(&run_log).unwrap();
+
+        // With the lock held: appends land and reads see them.
+        let ev = Event::Do { session, target: "a.txt".into() };
+        event_append(&run_log, &ev);
+        let mut contents = String::new();
+        File::open(&run_log).unwrap().read_to_string(&mut contents).unwrap();
+        assert_eq!(event_parse(contents.trim_end().as_bytes()), Some(ev));
+
+        // And the GC still proves the run live via the sentinel.
+        assert!(!super::lock_file_is_free(&run_lock));
+        FileExt::unlock(&lock_file).unwrap();
+        assert!(super::lock_file_is_free(&run_lock));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
