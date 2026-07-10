@@ -275,10 +275,20 @@ fn existing_source_ignores_default_rule() {
     assert_eq!(p.read("data.csv"), "a,b\n1,2\n", "source must not be overwritten");
     assert!(!p.exists("csv.log"), "default.csv.do must not run on an existing source");
 
-    // Forced top-level redo of the source is also a no-op (static).
+    // Naming the source explicitly at the command line states unambiguous
+    // intent to build it, so the static rule no longer silently no-ops (that
+    // hid "why didn't my target rebuild?" whenever the db forgot a target was
+    // generated). Instead the overwrite guard refuses, loudly, and leaves the
+    // file alone; --yes would rebuild and adopt it.
     let out = p.redo(&["data.csv"]);
-    assert!(out.status.success(), "redo data.csv failed: {}", stderr(&out));
-    assert!(!p.exists("csv.log"), "default.csv.do must not run on an existing source");
+    assert!(!out.status.success(), "explicit redo of a source must refuse, not no-op");
+    assert!(
+        stderr(&out).contains("not created by redo"),
+        "refusal must explain itself: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("data.csv"), "a,b\n1,2\n", "refusal must not touch the file");
+    assert!(!p.exists("csv.log"), "default.csv.do must not run without --yes");
 
     // A missing .csv target still builds via the default rule.
     p.write("missing-input", "x\n");
@@ -1162,4 +1172,42 @@ fn logs_deleted_by_default_kept_on_request() {
     // The next default run's GC sweeps what the kept run left behind.
     assert!(p.redo(&["ok.txt"]).status.success());
     assert_eq!(p.log_files(), Vec::<String>::new(), "GC must sweep kept logs: {:?}", p.log_files());
+}
+
+/// The lost-database scenario (observed in the field): a target built long
+/// ago exists on disk, but the current database has no record that redo
+/// generated it, and only a default.*.do matches. An explicit `redo <target>`
+/// must not silently no-op (it used to — indistinguishable from a display
+/// bug); it refuses loudly, `--yes` rebuilds, and the rebuild re-records the
+/// target as generated so future runs need no ceremony.
+#[test]
+fn explicit_redo_of_forgotten_target_refuses_then_heals_with_yes() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("default.txt.do", "args :2: out!\n\"sub\" mkdirp\n\"built\\n\" @out writeFile\n");
+    assert!(p.redo(&["sub/gen.txt"]).status.success());
+    assert_eq!(p.read("sub/gen.txt"), "built\n");
+
+    // Simulate database loss: the file remains, redo's memory of it doesn't.
+    std::fs::remove_dir_all(p.dir.join(".redom")).unwrap();
+    assert!(p.redo(&["root", "."]).status.success());
+
+    let out = p.redo(&["sub/gen.txt"]);
+    assert!(!out.status.success(), "must refuse, not silently no-op");
+    assert!(stderr(&out).contains("not created by redo"), "{}", stderr(&out));
+
+    let out = p.redo(&["--yes", "sub/gen.txt"]);
+    assert!(out.status.success(), "--yes must rebuild: {}", stderr(&out));
+    assert_eq!(p.read("sub/gen.txt"), "built\n");
+
+    // Healed: the target is recorded as generated again, so an explicit
+    // rebuild works without --yes...
+    let out = p.redo(&["sub/gen.txt"]);
+    assert!(out.status.success(), "healed target must rebuild freely: {}", stderr(&out));
+    // ...and dependency traversal treats it as a target, not a source.
+    p.write("use.txt.do", "args :2: out!\n['redo-msh' 'ifchange' 'sub/gen.txt']!\n\"sub/gen.txt\" readFile @out writeFile\n");
+    assert!(p.redo(&["use.txt"]).status.success());
+    assert_eq!(p.read("use.txt"), "built\n");
 }

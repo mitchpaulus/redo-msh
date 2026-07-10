@@ -444,7 +444,9 @@ fn handle_event(
                 print_user_line(top, raw);
                 return;
             }
-            if exit != 0 {
+            // The run trace's own sentinel gets no footer: a failed run
+            // already reports its error after the follower drains.
+            if exit != 0 && top.target != RUN_TARGET {
                 print_note(top.indent, &format!("redo  {}  (failed, exit {exit})", top.target));
             }
             let finished = stack.pop().expect("stack is non-empty");
