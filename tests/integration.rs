@@ -283,7 +283,7 @@ fn existing_source_ignores_default_rule() {
     let out = p.redo(&["data.csv"]);
     assert!(!out.status.success(), "explicit redo of a source must refuse, not no-op");
     assert!(
-        stderr(&out).contains("not created by redo"),
+        stderr(&out).contains("no record of ever building"),
         "refusal must explain itself: {}",
         stderr(&out)
     );
@@ -315,7 +315,7 @@ fn existing_source_with_exact_dofile_refuses_then_adopts() {
     let out = p.redo(&["ifchange", "report.txt"]);
     assert!(!out.status.success(), "must refuse to overwrite a user-created file");
     assert!(
-        stderr(&out).contains("not created by redo"),
+        stderr(&out).contains("no record of ever building"),
         "error should explain the conflict: {}",
         stderr(&out)
     );
@@ -1196,7 +1196,7 @@ fn explicit_redo_of_forgotten_target_refuses_then_heals_with_yes() {
 
     let out = p.redo(&["sub/gen.txt"]);
     assert!(!out.status.success(), "must refuse, not silently no-op");
-    assert!(stderr(&out).contains("not created by redo"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("no record of ever building"), "{}", stderr(&out));
 
     let out = p.redo(&["--yes", "sub/gen.txt"]);
     assert!(out.status.success(), "--yes must rebuild: {}", stderr(&out));
