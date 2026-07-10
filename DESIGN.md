@@ -27,3 +27,30 @@ The project root will be the `.git` root, or somewhere that has the `.redom/redo
 Can be set up using `redo-msh root` command in the directory of choice.
 
 Searching for default do files stops at project root.
+
+## Live Build Logs
+
+Do-file stderr streams to the terminal *while it runs* (a long EnergyPlus run
+shows its progress live), and parallel builds never interleave. The design is
+apenwarr redo's log linearizer, rebuilt fork-free and fd-free so it works
+identically on Windows; the full invariants (I1–I5) are documented at the top
+of `src/logs.rs`.
+
+Mechanism, in one paragraph: every target's do-file writes stderr into its own
+append-only log file (`.redom/logs/t.<key>.log`, where `<key>` is the same
+blake3 hash that names the target's build lock). The recursion trace is
+embedded in those same files as structured `@REDOM1:...@` event lines: a `do`
+event in the parent's log (appended only after the child's log exists) tells
+the follower to descend; a `done` event in the target's own log (appended
+before the build lock is released) terminates it. A single follower thread in
+the top-level process — the only writer to the terminal — walks the trace
+depth-first, replaying finished targets and live-tailing the one it is on.
+EOF plus a free build lock plus no `done` proves the builder died and is
+reported as `(crashed)`. Events travel by *path* (`REDO_LOG_PATH` in the
+do-file environment), never by inherited fd, so a do-file that redirects its
+own stderr can neither receive nor pollute trace events.
+
+Logs are consumed and deleted as the follower replays them; the run trace
+(`run.<session>.log`, flock-held for the run's lifetime) is removed at exit,
+and a lock-probing GC at startup sweeps anything a crashed run left behind.
+Set `REDO_KEEP_LOGS=1` to keep everything for post-mortem inspection.

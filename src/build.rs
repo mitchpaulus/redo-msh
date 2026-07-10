@@ -49,6 +49,11 @@ pub struct Ctx {
     pub jobs: Arc<Jobserver>,
     /// Per-project interpreter configuration (`redo.toml`).
     pub config: crate::config::Config,
+    /// Where this process's trace events (`do`/`waiting`) go: the enclosing
+    /// target's log (child processes, from `REDO_LOG_PATH`) or the run trace
+    /// (top-level `redo`). `None` (standalone `redo-ifchange` outside any
+    /// build) disables log capture entirely — do-files inherit stderr.
+    pub log_sink: Option<PathBuf>,
 }
 
 const E_ROOT: &str = "REDO_ROOT";
@@ -63,7 +68,6 @@ impl Ctx {
     /// jobs.
     pub fn top_level(j: usize) -> Result<Ctx> {
         crate::winjob::setup();
-        crate::logs::init_top();
         let cwd = std::env::current_dir()?;
         let root = Root::discover(&cwd)?;
         let conn = root.open_db()?;
@@ -79,6 +83,7 @@ impl Ctx {
             active: RefCell::new(HashSet::new()),
             jobs: Arc::new(Jobserver::init_top(j.max(1))),
             config,
+            log_sink: None, // `redo()` installs the run trace before building.
         })
     }
 
@@ -117,6 +122,7 @@ impl Ctx {
             active: RefCell::new(HashSet::new()),
             jobs: Arc::new(Jobserver::from_env()),
             config,
+            log_sink: std::env::var_os(crate::logs::ENV_LOG_PATH).map(PathBuf::from),
         })
     }
 
@@ -135,6 +141,7 @@ impl Ctx {
             active: RefCell::new(HashSet::new()),
             jobs: self.jobs.clone(),
             config: self.config.clone(),
+            log_sink: self.log_sink.clone(),
         })
     }
 
@@ -296,7 +303,7 @@ fn is_transient_io(e: &std::io::Error) -> bool {
 /// replace a destination even if another process holds it open. If that fails
 /// (older Windows / non-NTFS) we fall back to `std::fs::rename` (`MoveFileEx`)
 /// with retry. On Unix, `rename(2)` is atomic and needs no retry.
-fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         if win_posix_rename(src, dst).is_ok() {
@@ -501,7 +508,26 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
             target_rel
         );
     }
-    let _lock = crate::lock::lock_target(&ctx.root, target_rel)?;
+    // The same bound the log follower enforces on its trace stack: check it
+    // on both sides of the fence.
+    if ctx.chain.len() >= crate::logs::DEPTH_MAX {
+        bail!(
+            "dependency chain deeper than {} at {target_rel}",
+            crate::logs::DEPTH_MAX
+        );
+    }
+    // Try first so a contended lock can be announced in the live log (the
+    // user otherwise sees an unexplained stall) before we block on it.
+    let _lock = match crate::lock::try_lock_target(&ctx.root, target_rel)? {
+        Some(lock) => lock,
+        None => {
+            emit_event(ctx, &crate::logs::Event::Waiting {
+                session: ctx.session,
+                target: target_rel.to_string(),
+            });
+            crate::lock::lock_target(&ctx.root, target_rel)?
+        }
+    };
     if !force && file_runid(&ctx.conn, target_rel)? == Some(ctx.session) {
         // Built by another process while we waited for the lock.
         return Ok(());
@@ -571,21 +597,50 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     let tmp3_rel = format!("{}.redo-tmp.{}", df.arg_target, pid);
     let tmp3_abs = df.dodir_abs.join(&tmp3_rel);
 
-    // Separate capture files for the do-file's stdout (output detection) and
-    // stderr (diagnostics, emitted as one contiguous log block at completion).
+    // Capture file for the do-file's stdout (output detection). Its stderr
+    // goes to the target's log, streamed live by the top-level's follower.
     let tmp_dir = ctx.root.redo_dir().join("tmp");
     fs::create_dir_all(&tmp_dir)?;
     let capture_path = tmp_dir.join(format!("stdout.{}.{}", pid, sanitize(target_rel)));
-    let errlog_path = tmp_dir.join(format!("stderr.{}.{}", pid, sanitize(target_rel)));
 
     // All temps are removed on every exit path (return, `?`, panic).
     let _guard = TempGuard {
-        paths: vec![tmp3_abs.clone(), capture_path.clone(), errlog_path.clone()],
+        paths: vec![tmp3_abs.clone(), capture_path.clone()],
     };
     let capture_file = fs::File::create(&capture_path)
         .with_context(|| format!("creating stdout capture {}", capture_path.display()))?;
-    let errlog_file = fs::File::create(&errlog_path)
-        .with_context(|| format!("creating stderr capture {}", errlog_path.display()))?;
+
+    // Writer protocol for the live log (see logs.rs). Order is load-bearing:
+    // the build lock is already held (I2); the log file exists before the
+    // `do` event is appended (I3); the `done` terminator — guaranteed on
+    // every exit path by `DoneGuard` — is written before build() releases
+    // the lock (I4, drop order: the guard lives in this frame, the lock in
+    // build()'s). With no sink (standalone use outside any build) do-files
+    // simply inherit our stderr.
+    let (errlog, mut done_guard, log_path) = match &ctx.log_sink {
+        Some(sink) => {
+            let log_path = crate::logs::target_log_path(&ctx.root, target_rel);
+            crate::logs::create_log(&log_path)?;
+            crate::logs::event_append(sink, &crate::logs::Event::Do {
+                session: ctx.session,
+                target: target_rel.to_string(),
+            });
+            let guard = crate::logs::DoneGuard::new(
+                log_path.clone(),
+                ctx.session,
+                target_rel.to_string(),
+            );
+            // Append mode, so the do-file's writes interleave atomically with
+            // event lines appended by child `redo-ifchange` processes. A
+            // plain write handle at offset 0 would silently overwrite them.
+            let f = fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("opening log {}", log_path.display()))?;
+            (std::process::Stdio::from(f), Some(guard), Some(log_path))
+        }
+        None => (std::process::Stdio::inherit(), None, None),
+    };
 
     // Child environment.
     let mut child_chain = ctx.chain.clone();
@@ -605,12 +660,23 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         .arg(&tmp3_rel)
         .current_dir(&df.dodir_abs)
         .stdout(capture_file)
-        .stderr(errlog_file)
+        .stderr(errlog)
         .env(E_ROOT, &ctx.root.dir)
         .env(E_TARGET, target_rel)
         .env(E_SESSION, ctx.session.to_string())
         .env(E_DEPTH, (ctx.depth + 1).to_string())
         .env(E_CHAIN, child_chain.join("\n"));
+    // Child `redo-ifchange` processes append their trace events to this
+    // target's log by path (never by inherited fd — a do-file redirecting its
+    // own stderr must not receive event lines).
+    match &log_path {
+        Some(p) => {
+            command.env(crate::logs::ENV_LOG_PATH, p);
+        }
+        None => {
+            command.env_remove(crate::logs::ENV_LOG_PATH);
+        }
+    }
 
     // Make the redo command family resolvable from inside the do-file by
     // prepending our own directory (where `redo`, `redo-ifchange`, ... ship
@@ -623,16 +689,10 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
     let status = command
         .status()
         .map_err(|e| interpreter_spawn_error(e, &interp, &df.dofile_abs, child_path.as_deref()))?;
-
-    // Emit this target's log block (header + captured stderr) as one
-    // non-interleaved unit, streamed in completion order and indented by depth.
-    let header = format!(
-        "{}redo  {}{}",
-        "  ".repeat(ctx.depth),
-        target_rel,
-        if status.success() { "" } else { "  (failed)" }
-    );
-    crate::logs::emit_block(&ctx.root.redo_dir(), &header, &errlog_path);
+    if let Some(g) = done_guard.as_mut() {
+        // Signal death has no code; classify it as failed (exit 1).
+        g.record_exit(status.code().unwrap_or(1));
+    }
 
     let after_t = fs::metadata(&target_abs).ok();
     let cap_size = fs::metadata(&capture_path).map(|m| m.len()).unwrap_or(0);
@@ -689,7 +749,20 @@ fn build_inner(ctx: &Ctx, target_rel: &str) -> Result<()> {
         "DELETE FROM deps WHERE target = ?1 AND kind = ?2",
         params![target_rel, DepKind::Uncommitted as i64],
     )?;
+    // Terminate the log stream: `done` with exit 0. Every early return above
+    // writes it too, via the guard's Drop, with the failing exit code.
+    if let Some(g) = done_guard {
+        g.commit_success();
+    }
     Ok(())
+}
+
+/// Append a trace event to this process's sink, if it has one. Events are
+/// advisory display data; a missing sink (standalone use) is not an error.
+fn emit_event(ctx: &Ctx, event: &crate::logs::Event) {
+    if let Some(sink) = &ctx.log_sink {
+        crate::logs::event_append(sink, event);
+    }
 }
 
 /// `redo-msh ifchange <deps...>`: bring each dependency up to date (build it if
@@ -1014,26 +1087,70 @@ pub fn always(ctx: &Ctx) -> Result<()> {
 }
 
 /// `redo-msh <targets...>`: force-build each target with `j` parallel jobs.
+///
+/// The top-level owns the live-log plumbing: it creates the run trace (locked
+/// exclusively for our whole lifetime, so a concurrent run's GC can prove it
+/// live), sweeps logs from dead runs, and runs the follower thread — the sole
+/// writer to the terminal while we build (I1). Engine errors are returned to
+/// `main` and printed only after the follower has drained.
 pub fn redo(targets: &[String], j: usize) -> Result<()> {
-    let ctx = Ctx::top_level(j)?;
+    let mut ctx = Ctx::top_level(j)?;
     gc_temps(&ctx.root); // sweep temp files left by any crashed build
+
+    let run_log = crate::logs::run_log_path(&ctx.root, ctx.session);
+    fs::create_dir_all(crate::logs::logs_dir(&ctx.root))?;
+    let run_lock = fs::File::create(&run_log)
+        .with_context(|| format!("creating run log {}", run_log.display()))?;
+    fs2::FileExt::lock_exclusive(&run_lock)
+        .with_context(|| format!("locking run log {}", run_log.display()))?;
+    crate::logs::gc_logs(&ctx.root, ctx.session);
+    ctx.log_sink = Some(run_log.clone());
+    let follower = crate::logs::follow_start(ctx.root.clone(), ctx.session);
+
+    let result = redo_build(&ctx, targets);
+
+    // Terminate the run trace so the follower's root frame pops; join before
+    // anyone else may print (I1). The run log itself is ours to remove — the
+    // follower only deletes target logs.
+    crate::logs::event_append(&run_log, &crate::logs::Event::Done {
+        session: ctx.session,
+        exit: if result.is_ok() { 0 } else { 1 },
+        target: crate::logs::RUN_TARGET.to_string(),
+    });
+    follower.join();
+    drop(run_lock);
+    if !crate::logs::keep_logs() {
+        let _ = fs::remove_file(&run_log);
+    }
+    result
+}
+
+/// The build phase of a top-level `redo`, separated so `redo()` can run its
+/// log epilogue on every outcome.
+fn redo_build(ctx: &Ctx, targets: &[String]) -> Result<()> {
     // Force-build the requested targets in parallel under the jobserver. We
     // mark them verified-this-session via a forced build, so reuse the parallel
     // scheduler but bypass the up-to-date check by clearing their session mark.
     if targets.len() <= 1 {
         for input in targets {
             let target_rel = normalize_target(&ctx.root, input)?;
-            build(&ctx, &target_rel, true)?;
+            build(ctx, &target_rel, true)?;
         }
         return Ok(());
     }
-    // Parallel forced top-level builds.
-    let rels: Vec<String> = targets
-        .iter()
-        .map(|t| normalize_target(&ctx.root, t))
-        .collect::<Result<_>>()?;
-    build_parallel_forced(&ctx, &rels)?;
-    Ok(())
+    // Parallel forced top-level builds. Dedup (case-folded, first occurrence
+    // wins): forcing the same target twice in one session would rebuild it
+    // twice, and the follower could consume the first build's log while the
+    // second is live at the same path.
+    let mut seen = HashSet::new();
+    let mut rels: Vec<String> = Vec::with_capacity(targets.len());
+    for t in targets {
+        let rel = normalize_target(&ctx.root, t)?;
+        if seen.insert(rel.to_ascii_lowercase()) {
+            rels.push(rel);
+        }
+    }
+    build_parallel_forced(ctx, &rels)
 }
 
 /// Like `build_parallel` but forces each target (top-level `redo`).

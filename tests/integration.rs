@@ -90,18 +90,38 @@ impl Project {
     /// PATH (so do-files can invoke `redo-msh`). Uses the platform PATH
     /// separator via `join_paths`.
     fn redo(&self, args: &[&str]) -> Output {
+        self.redo_cmd(args).output().expect("failed to spawn redo-msh")
+    }
+
+    /// The configured-but-unspawned command, for tests that need extra env
+    /// vars or incremental stderr. Ambient log-related variables are cleared
+    /// so a developer's shell cannot change test behavior.
+    fn redo_cmd(&self, args: &[&str]) -> Command {
         let bin_dir = Path::new(BIN).parent().unwrap();
         let mut paths = vec![bin_dir.to_path_buf()];
         if let Some(p) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&p));
         }
         let path = std::env::join_paths(paths).expect("join PATH");
-        Command::new(BIN)
-            .args(args)
+        let mut cmd = Command::new(BIN);
+        cmd.args(args)
             .current_dir(&self.dir)
             .env("PATH", path)
-            .output()
-            .expect("failed to spawn redo-msh")
+            .env_remove("REDO_KEEP_LOGS")
+            .env_remove("REDO_LOG_PATH");
+        cmd
+    }
+
+    /// Names of files currently in `.redom/logs`.
+    fn log_files(&self) -> Vec<String> {
+        std::fs::read_dir(self.dir.join(".redom").join("logs"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn stdout_of(&self, args: &[&str]) -> String {
@@ -930,4 +950,216 @@ fn all_commands_have_help_and_version() {
             "{prog} --version should name itself"
         );
     }
+}
+
+// ---- live log streaming -------------------------------------------------
+
+/// The headline property of the live log: a long-running do-file's stderr
+/// reaches the user *while it runs*, not as a block after it exits.
+///
+/// Methodology: the do-file writes PROGRESS-1 to stderr, then spins until the
+/// test creates `go.txt` (bounded, so a regression fails rather than hangs),
+/// then writes PROGRESS-2. The test reads redo's stderr incrementally and
+/// only creates `go.txt` after observing PROGRESS-1 with the build still
+/// running — which is impossible unless stderr streamed live.
+#[test]
+fn stderr_streams_during_build() {
+    use std::io::Read;
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "slow.txt.do",
+        "args :2: out!\n\
+         \"PROGRESS-1\" wle\n\
+         0 i!\n\
+         (\n\
+         \t\"go.txt\" fileExists if break end\n\
+         \t@i 1 + i!\n\
+         \t@i 2000000 >= if break end\n\
+         ) loop\n\
+         \"PROGRESS-2\" wle\n\
+         \"done\\n\" @out writeFile\n",
+    );
+
+    let mut child = p
+        .redo_cmd(&["slow.txt"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn redo-msh");
+    let mut err = child.stderr.take().expect("stderr piped");
+
+    // Read stderr incrementally until PROGRESS-1 appears (or a bounded amount
+    // of time passes, in which case streaming is broken).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("PROGRESS-1") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PROGRESS-1 never streamed; stderr so far: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        let n = err.read(&mut buf).expect("read child stderr");
+        assert!(n > 0, "stderr closed before PROGRESS-1");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "build already finished when PROGRESS-1 arrived; that is replay, not streaming"
+    );
+
+    p.write("go.txt", "");
+    let mut rest = Vec::new();
+    err.read_to_end(&mut rest).expect("drain stderr");
+    seen.extend_from_slice(&rest);
+    let status = child.wait().expect("wait");
+    let all = String::from_utf8_lossy(&seen);
+    assert!(status.success(), "build failed: {all}");
+    assert!(all.contains("PROGRESS-2"), "missing tail of stream: {all}");
+    assert_eq!(p.read("slow.txt"), "done\n");
+}
+
+/// Parallel builds must not interleave: each target's stderr appears as one
+/// contiguous block, even with four noisy do-files running under -j4.
+#[test]
+fn parallel_stderr_is_not_interleaved() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    let mut all_do = String::from("['redo-msh' 'ifchange'");
+    for t in ["t1", "t2", "t3", "t4"] {
+        p.write(
+            &format!("{t}.txt.do"),
+            &format!(
+                "args :2: out!\n\
+                 0 i!\n\
+                 (\n\
+                 \t@i 30 >= if break end\n\
+                 \t\"LINE-{t}\" wle\n\
+                 \t@i 1 + i!\n\
+                 ) loop\n\
+                 \"x\\n\" @out writeFile\n"
+            ),
+        );
+        all_do.push_str(&format!(" '{t}.txt'"));
+    }
+    all_do.push_str("]!\n");
+    p.write("all.do", &all_do);
+
+    let out = p.redo(&["-j4", "all"]);
+    assert!(out.status.success(), "parallel build failed: {}", stderr(&out));
+    let err = stderr(&out);
+
+    // Collect the tag sequence of user lines; each tag must form exactly one
+    // contiguous run, i.e. 4 runs total across 120 lines.
+    let tags: Vec<&str> = err
+        .lines()
+        .filter_map(|l| l.strip_prefix("LINE-"))
+        .collect();
+    assert_eq!(tags.len(), 4 * 30, "every line must be shown exactly once:\n{err}");
+    let runs = 1 + tags.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(runs, 4, "output interleaved; tag sequence: {tags:?}");
+}
+
+/// Nested builds are indented by depth, and a parent whose output continues
+/// after a child block gets a `(resumed)` marker.
+#[test]
+fn nested_output_is_indented_and_resumed() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n\
+         \"A-BEFORE\" wle\n\
+         ['redo-msh' 'ifchange' 'b.txt']!\n\
+         \"A-AFTER\" wle\n\
+         \"a\\n\" @out writeFile\n",
+    );
+    p.write(
+        "b.txt.do",
+        "args :2: out!\n\"B-ERR\" wle\n\"b\\n\" @out writeFile\n",
+    );
+
+    let out = p.redo(&["a.txt"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    let err = stderr(&out);
+    let lines: Vec<&str> = err.lines().collect();
+    let pos = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| *l == needle)
+            .unwrap_or_else(|| panic!("missing line {needle:?} in:\n{err}"))
+    };
+    // Top-level target at indent 0, its dependency at indent 1, and the
+    // parent's stream resumes with a marker after the child block.
+    let header_a = pos("redo  a.txt");
+    let before = pos("A-BEFORE");
+    let header_b = pos("  redo  b.txt");
+    let b_err = pos("B-ERR");
+    let resumed = pos("redo  a.txt  (resumed)");
+    let after = pos("A-AFTER");
+    assert!(header_a < before, "{err}");
+    assert!(before < header_b, "{err}");
+    assert!(header_b < b_err, "{err}");
+    assert!(b_err < resumed, "{err}");
+    assert!(resumed < after, "{err}");
+}
+
+/// A failing do-file is annotated with its exit code in the stream.
+#[test]
+fn failed_build_is_annotated_in_stream() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("bad.txt.do", "\"BAD-OUTPUT\" wle\n['redo-msh' 'ifchange' 'no-such-dep']!\n");
+    let out = p.redo(&["bad.txt"]);
+    assert!(!out.status.success(), "build should fail");
+    let err = stderr(&out);
+    assert!(err.contains("BAD-OUTPUT"), "do-file stderr must stream: {err}");
+    assert!(err.contains("bad.txt  (failed, exit "), "missing failure annotation: {err}");
+}
+
+/// Logs are consumed and deleted by default — after any run, successful or
+/// failed, `.redom/logs` holds nothing. `REDO_KEEP_LOGS=1` keeps them.
+#[test]
+fn logs_deleted_by_default_kept_on_request() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("ok.txt.do", "args :2: out!\n\"noise\" wle\n\"ok\\n\" @out writeFile\n");
+    p.write("bad.txt.do", "['redo-msh' 'ifchange' 'no-such-dep']!\n");
+
+    assert!(p.redo(&["ok.txt"]).status.success());
+    assert_eq!(p.log_files(), Vec::<String>::new(), "logs must be deleted after success");
+
+    assert!(!p.redo(&["bad.txt"]).status.success());
+    assert_eq!(p.log_files(), Vec::<String>::new(), "logs must be deleted after failure");
+
+    // Opt out of deletion: both the run trace and the target log survive.
+    let out = p
+        .redo_cmd(&["ok.txt"])
+        .env("REDO_KEEP_LOGS", "1")
+        .output()
+        .expect("spawn redo-msh");
+    assert!(out.status.success(), "keep-logs build failed: {}", stderr(&out));
+    let kept = p.log_files();
+    assert!(
+        kept.iter().any(|n| n.starts_with("run.") && n.ends_with(".log")),
+        "run trace should be kept: {kept:?}"
+    );
+    assert!(
+        kept.iter().any(|n| n.starts_with("t.") && n.ends_with(".log")),
+        "target log should be kept: {kept:?}"
+    );
+
+    // The next default run's GC sweeps what the kept run left behind.
+    assert!(p.redo(&["ok.txt"]).status.success());
+    assert_eq!(p.log_files(), Vec::<String>::new(), "GC must sweep kept logs: {:?}", p.log_files());
 }
