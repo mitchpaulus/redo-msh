@@ -74,6 +74,29 @@ pub fn try_lock_target(root: &Root, target_rel: &str) -> Result<Option<TargetLoc
     }
 }
 
+/// Held interactive-prompt lock; releases on drop (or when the holder dies).
+pub struct PromptLock {
+    _file: File,
+}
+
+/// Serialize interactive terminal prompts across the whole build tree: one
+/// question owns the terminal at a time. Every caller opens its own handle,
+/// so the kernel lock excludes sibling worker threads as well as sibling
+/// `redo` processes, and a prompter that dies mid-question can never wedge
+/// the terminal for everyone else.
+pub fn lock_prompt(root: &Root) -> Result<PromptLock> {
+    let path = root.redo_dir().join("prompt.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening prompt lock {}", path.display()))?;
+    file.lock_exclusive().context("locking interactive prompt")?;
+    Ok(PromptLock { _file: file })
+}
+
 /// Whether no builder currently holds `target_rel`'s build lock. Read-only in
 /// effect: the probe lock is released immediately. Used by the log follower to
 /// classify a silent log (EOF, no `done`) as a crashed builder.
