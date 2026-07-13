@@ -962,6 +962,57 @@ fn all_commands_have_help_and_version() {
     }
 }
 
+/// `--verbose` explains every out-of-date decision: which dependency check
+/// passed or fired, with the recorded and current evidence. Without the flag,
+/// none of the trace appears.
+#[test]
+fn verbose_explains_decisions() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "alpha\n");
+    p.write(
+        "out.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'a.txt']!\n\"a.txt\" readFile @out writeFile\n",
+    );
+    assert!(p.redo(&["out.txt"]).status.success());
+
+    // Up to date: the trace says so and shows the passing dependency checks.
+    let out = p.redo(&["--verbose", "ifchange", "out.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("out.txt: UP TO DATE"), "missing verdict: {err}");
+    assert!(err.contains("dependency a.txt unchanged"), "missing evidence: {err}");
+    assert!(err.contains("do-file out.txt.do unchanged"), "missing do-file check: {err}");
+
+    // Change the source: the trace names exactly which dependency fired.
+    p.write("a.txt", "ALPHA\n");
+    let out = p.redo(&["--verbose", "ifchange", "out.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("OUT OF DATE: dependency a.txt changed"),
+        "missing firing reason: {err}"
+    );
+    assert!(err.contains("building with do-file out.txt.do"), "missing build line: {err}");
+
+    // The read-only `ood` command explains itself too (`-v` in any position).
+    p.write("a.txt", "beta\n");
+    let out = p.redo(&["-v", "ood"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("OUT OF DATE: dependency a.txt changed"),
+        "ood must explain: {}",
+        stderr(&out)
+    );
+
+    // Without the flag the trace is silent.
+    let out = p.redo(&["ifchange", "out.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("redo-msh -v:"), "trace leaked: {}", stderr(&out));
+}
+
 // ---- live log streaming -------------------------------------------------
 
 /// The headline property of the live log: a long-running do-file's stderr

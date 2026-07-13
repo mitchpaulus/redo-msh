@@ -1,0 +1,15 @@
+[
+    `redo`
+    `redo-ifchange`
+    `redo-always`
+    `redo-ifcreate`
+    `redo-stamp`
+]
+files!
+
+`target`  `release` / base!
+@files each.
+    f! @base @f / absPath target!
+    $"Linking {@target}" wle
+    ['ln' '-s' '-r' '-t' $LOCALBIN @target]!
+ end

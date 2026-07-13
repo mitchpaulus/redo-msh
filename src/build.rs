@@ -159,6 +159,44 @@ fn normalize_target(root: &Root, input: &str) -> Result<String> {
     })
 }
 
+// ---- verbose decision trace ---------------------------------------------------
+
+/// Whether the decision trace is on (`--verbose` / `REDO_VERBOSE=1`). Read
+/// once per process: the flag is set during argument parsing, before any
+/// build starts, and reaches child processes through the environment.
+fn verbose() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("REDO_VERBOSE").as_deref() == Ok("1"))
+}
+
+/// Emit one decision-trace line. Lines go to this process's log sink — each
+/// is a single atomic append, so the follower prints it inside the right
+/// target's block — or straight to stderr when standalone (no build running).
+/// `msg` is lazy so the non-verbose path pays nothing.
+fn vlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
+    if !verbose() {
+        return;
+    }
+    let line = format!("redo-msh -v: {}\n", msg());
+    match &ctx.log_sink {
+        Some(sink) => {
+            use std::io::Write;
+            if let Ok(mut f) = fs::OpenOptions::new().append(true).open(sink) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        None => eprint!("{line}"),
+    }
+}
+
+/// Short display form of an optional content hash, for trace lines.
+fn hash8(h: Option<&str>) -> String {
+    match h {
+        Some(h) => format!("{}…", &h[..h.len().min(8)]),
+        None => "(none)".to_string(),
+    }
+}
+
 fn now_nanos() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -252,9 +290,29 @@ fn is_target(ctx: &Ctx, path_rel: &str) -> Result<bool> {
     let abs = ctx.root.dir.join(path_rel);
     let exists_as_file = fs::metadata(&abs).map(|m| !m.is_dir()).unwrap_or(false);
     if exists_as_file && !is_generated(&ctx.conn, path_rel)? {
-        return Ok(exact_dofile_exists(&ctx.root, path_rel));
+        let exact = exact_dofile_exists(&ctx.root, path_rel);
+        vlog(ctx, || {
+            if exact {
+                format!(
+                    "{path_rel}: buildable target: it exists on disk and redo never \
+                     built it, but the exact do-file {path_rel}.do states it is a target"
+                )
+            } else {
+                format!(
+                    "{path_rel}: static source: it exists on disk, redo has no record \
+                     of building it, and only a default.*.do could match (djb's \
+                     static-file rule)"
+                )
+            }
+        });
+        return Ok(exact);
     }
-    Ok(dofile::find(&ctx.root, path_rel).0.is_some())
+    let found = dofile::find(&ctx.root, path_rel).0;
+    vlog(ctx, || match &found {
+        Some(df) => format!("{path_rel}: buildable target (do-file: {})", df.dofile_rel),
+        None => format!("{path_rel}: not buildable: no do-file matches"),
+    });
+    Ok(found.is_some())
 }
 
 fn file_runid(conn: &Connection, path: &str) -> Result<Option<i64>> {
@@ -687,6 +745,12 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     };
     if !force && file_runid(&ctx.conn, target_rel)? == Some(ctx.session) {
         // Built by another process while we waited for the lock.
+        vlog(ctx, || {
+            format!(
+                "{target_rel}: skipping: another process built it while we waited \
+                 for its lock"
+            )
+        });
         return Ok(());
     }
     build_inner(ctx, target_rel, force)
@@ -714,6 +778,12 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         && !is_generated(&ctx.conn, target_rel)?
         && !exact_dofile_exists(&ctx.root, target_rel)
     {
+        vlog(ctx, || {
+            format!(
+                "{target_rel}: NOT building: recording it as a static source (it \
+                 exists, redo never built it, and no exact {target_rel}.do exists)"
+            )
+        });
         let stamp = stamp::stamp_file(&target_abs)?;
         upsert_file(&ctx.conn, target_rel, None, None, stamp.as_ref(), ctx.session)?;
         return Ok(());
@@ -726,6 +796,12 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
             // No rule, but the file exists (e.g. a generated file whose
             // do-file was removed, or a directory): it becomes static.
             if exists {
+                vlog(ctx, || {
+                    format!(
+                        "{target_rel}: NOT building: no do-file matches any more, but \
+                         the file exists — re-recording it as a static source"
+                    )
+                });
                 let stamp = stamp::stamp_file(&target_abs)?;
                 upsert_file(&ctx.conn, target_rel, None, None, stamp.as_ref(), ctx.session)?;
                 return Ok(());
@@ -733,6 +809,14 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
             bail!("no .do file found to build target {target_rel:?}")
         }
     };
+
+    vlog(ctx, || {
+        format!(
+            "{target_rel}: building with do-file {}{}",
+            df.dofile_rel,
+            if force { " (forced: named at the command line)" } else { "" }
+        )
+    });
 
     // Refuse to silently clobber a target that was modified by hand since we
     // last built it (or that redo never generated at all). Checked before any
@@ -957,6 +1041,9 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
     // Source files: stamp/refresh now (cheap, serial).
     for (dep_rel, dep_abs, buildable) in &items {
         if !buildable {
+            vlog(ctx, || {
+                format!("{dep_rel}: source file (nothing builds it); refreshing its stamp")
+            });
             let stamp = stamp::stamp_file(dep_abs)?;
             upsert_file(&ctx.conn, dep_rel, None, None, stamp.as_ref(), ctx.session)?;
         }
@@ -974,8 +1061,20 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
     if let Some(parent) = &ctx.target {
         for (dep_rel, dep_abs, _) in &items {
             let stamp = stamp::stamp_file(dep_abs)?;
+            vlog(ctx, || {
+                format!(
+                    "{parent}: recorded dependency on {dep_rel} (hash {})",
+                    hash8(stamp.as_ref().map(|s| s.csum.as_str()))
+                )
+            });
             record_dep(&ctx.conn, parent, DepKind::IfChange, Some(dep_rel), stamp.as_ref())?;
         }
+    } else {
+        vlog(ctx, || {
+            "not inside a do-file (no REDO_TARGET): dependencies were brought up to \
+             date but no edges were recorded"
+                .to_string()
+        });
     }
     Ok(())
 }
@@ -1050,6 +1149,9 @@ fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
 pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
     // Already built or verified this session.
     if file_runid(&ctx.conn, target)? == Some(ctx.session) {
+        vlog(ctx, || {
+            format!("{target}: skipping: already built or verified earlier in this run")
+        });
         return Ok(());
     }
     // In-process cycle guard for the out-of-date traversal (the cross-process
@@ -1062,6 +1164,7 @@ pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
         if is_ood(ctx, target)? {
             build(ctx, target, false)
         } else {
+            vlog(ctx, || format!("{target}: up to date; marking it verified for this run"));
             mark_verified(ctx, target)
         }
     })();
@@ -1069,54 +1172,130 @@ pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
     result
 }
 
-/// Decide whether a buildable `target` is out of date.
+/// Decide whether a buildable `target` is out of date. With `--verbose`,
+/// every check — passing or failing — is traced with its evidence.
 fn is_ood(ctx: &Ctx, target: &str) -> Result<bool> {
     let target_abs = ctx.root.dir.join(target);
     let row = files_row(&ctx.conn, target)?;
     let built_csum = match row {
         Some(c) => c,
-        None => return Ok(true), // never built
+        None => {
+            vlog(ctx, || {
+                format!("{target}: OUT OF DATE: redo has no record of ever building it")
+            });
+            return Ok(true); // never built
+        }
     };
     // A previously-produced file that is now gone must be rebuilt. (A phony
     // target has no recorded csum, so its absence is expected.)
     if built_csum.is_some() && !target_abs.exists() {
+        vlog(ctx, || {
+            format!(
+                "{target}: OUT OF DATE: the previously built output (hash {}) is \
+                 missing from disk",
+                hash8(built_csum.as_deref())
+            )
+        });
         return Ok(true);
     }
 
+    let mut checked = 0usize;
     for (kind, dep, edge_csum) in read_deps(&ctx.conn, target)? {
+        checked += 1;
         match kind {
-            DepKind::Always => return Ok(true),
+            DepKind::Always => {
+                vlog(ctx, || {
+                    format!("{target}: OUT OF DATE: its do-file called redo-always")
+                });
+                return Ok(true);
+            }
             // Last build never committed (failed or crashed).
-            DepKind::Uncommitted => return Ok(true),
+            DepKind::Uncommitted => {
+                vlog(ctx, || {
+                    format!(
+                        "{target}: OUT OF DATE: the last build failed or crashed \
+                         before committing"
+                    )
+                });
+                return Ok(true);
+            }
             DepKind::DoFile => {
                 let dep = dep.expect("dofile dep has a path");
-                if current_csum(ctx, &dep)?.as_deref() != edge_csum.as_deref() {
+                let cur = current_csum(ctx, &dep)?;
+                if cur.as_deref() != edge_csum.as_deref() {
+                    vlog(ctx, || {
+                        format!(
+                            "{target}: OUT OF DATE: do-file {dep} changed (hash was {} \
+                             at last build, is now {})",
+                            hash8(edge_csum.as_deref()),
+                            hash8(cur.as_deref())
+                        )
+                    });
                     return Ok(true);
                 }
+                vlog(ctx, || {
+                    format!("{target}: do-file {dep} unchanged (hash {})", hash8(cur.as_deref()))
+                });
             }
             DepKind::IfCreate => {
                 let dep = dep.expect("ifcreate dep has a path");
                 if ctx.root.dir.join(&dep).exists() {
+                    vlog(ctx, || {
+                        format!(
+                            "{target}: OUT OF DATE: {dep} now exists (the target \
+                             depends on it NOT existing — at build time it was a \
+                             missing do-file candidate or an ifcreate path)"
+                        )
+                    });
                     return Ok(true);
                 }
+                vlog(ctx, || format!("{target}: ifcreate dependency {dep} is still absent"));
             }
             DepKind::IfChange => {
                 let dep = dep.expect("ifchange dep has a path");
                 // Bring the dependency up to date first (it may be a target).
                 if is_target(ctx, &dep)? {
+                    vlog(ctx, || {
+                        format!(
+                            "{target}: dependency {dep} is itself a buildable target; \
+                             bringing it up to date before comparing"
+                        )
+                    });
                     ensure(ctx, &dep)?;
                 }
                 match current_csum(ctx, &dep)? {
-                    None => return Ok(true), // dependency disappeared
+                    None => {
+                        vlog(ctx, || {
+                            format!("{target}: OUT OF DATE: dependency {dep} no longer exists")
+                        });
+                        return Ok(true); // dependency disappeared
+                    }
                     Some(cur) => {
                         if Some(cur.as_str()) != edge_csum.as_deref() {
+                            vlog(ctx, || {
+                                format!(
+                                    "{target}: OUT OF DATE: dependency {dep} changed \
+                                     (hash was {} at last build, is now {})",
+                                    hash8(edge_csum.as_deref()),
+                                    hash8(Some(&cur))
+                                )
+                            });
                             return Ok(true);
                         }
+                        vlog(ctx, || {
+                            format!(
+                                "{target}: dependency {dep} unchanged (hash {})",
+                                hash8(Some(&cur))
+                            )
+                        });
                     }
                 }
             }
         }
     }
+    vlog(ctx, || {
+        format!("{target}: UP TO DATE: all {checked} recorded dependencies are unchanged")
+    });
     Ok(false)
 }
 
@@ -1150,9 +1329,17 @@ fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
     let mtime = stamp::mtime_nanos(&meta);
     let size = if meta.is_dir() { 0 } else { meta.len() as i64 };
 
-    if let Some((rm, rs, rc)) = files_stamp(&ctx.conn, path_rel)? {
-        if rm == mtime && rs == size && stat_is_trustworthy(mtime) {
-            return Ok(Some(rc));
+    let cached = files_stamp(&ctx.conn, path_rel)?;
+    if let Some((rm, rs, rc)) = &cached {
+        if *rm == mtime && *rs == size && stat_is_trustworthy(mtime) {
+            vlog(ctx, || {
+                format!(
+                    "{path_rel}: mtime and size match the cache and the mtime has \
+                     sub-second precision; trusting cached hash {} without re-reading",
+                    hash8(Some(rc))
+                )
+            });
+            return Ok(Some(rc.clone()));
         }
     }
 
@@ -1161,6 +1348,15 @@ fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
     } else {
         stamp::hash_file(&abs)?
     };
+    vlog(ctx, || {
+        let why = match &cached {
+            None => "no cached stamp".to_string(),
+            Some((rm, _, _)) if *rm != mtime => "mtime changed".to_string(),
+            Some((_, rs, _)) if *rs != size => "size changed".to_string(),
+            Some(_) => "whole-second mtime cannot be trusted".to_string(),
+        };
+        format!("{path_rel}: hashed the file contents ({why}): {}", hash8(Some(&csum)))
+    });
     // Refresh the cache for an existing row (do not invent rows here).
     ctx.conn.execute(
         "UPDATE files SET mtime = ?1, size = ?2, csum = ?3 WHERE path = ?4",
@@ -1446,31 +1642,60 @@ pub fn cmd_ood() -> Result<()> {
 /// (used by `redo-msh ood`). Compares recorded edge hashes to current on-disk
 /// content without bringing dependencies up to date first.
 fn is_ood_static(root: &Root, conn: &Connection, target: &str) -> Result<bool> {
+    // This command runs standalone (no build, no follower), so verbose
+    // reasons go straight to stderr; the target list stays clean on stdout.
+    let why = |msg: &str| {
+        if verbose() {
+            eprintln!("redo-msh -v: {target}: {msg}");
+        }
+    };
     let built_csum = match files_row(conn, target)? {
         Some(c) => c,
-        None => return Ok(true),
+        None => {
+            why("OUT OF DATE: redo has no record of ever building it");
+            return Ok(true);
+        }
     };
     let target_abs = root.dir.join(target);
     if built_csum.is_some() && !target_abs.exists() {
+        why("OUT OF DATE: the previously built output is missing from disk");
         return Ok(true);
     }
     for (kind, dep, edge_csum) in read_deps(conn, target)? {
         match kind {
-            DepKind::Always | DepKind::Uncommitted => return Ok(true),
+            DepKind::Always => {
+                why("OUT OF DATE: its do-file called redo-always");
+                return Ok(true);
+            }
+            DepKind::Uncommitted => {
+                why("OUT OF DATE: the last build failed or crashed before committing");
+                return Ok(true);
+            }
             DepKind::IfCreate => {
-                if root.dir.join(dep.expect("ifcreate path")).exists() {
+                let dep = dep.expect("ifcreate path");
+                if root.dir.join(&dep).exists() {
+                    why(&format!("OUT OF DATE: {dep} now exists (ifcreate dependency)"));
                     return Ok(true);
                 }
+                why(&format!("ifcreate dependency {dep} is still absent"));
             }
             DepKind::DoFile | DepKind::IfChange => {
                 let dep = dep.expect("dep path");
                 let cur = stamp::stamp_file(&root.dir.join(&dep))?.map(|s| s.csum);
                 if cur.as_deref() != edge_csum.as_deref() {
+                    why(&format!(
+                        "OUT OF DATE: dependency {dep} changed (hash was {} at last \
+                         build, is now {})",
+                        hash8(edge_csum.as_deref()),
+                        hash8(cur.as_deref())
+                    ));
                     return Ok(true);
                 }
+                why(&format!("dependency {dep} unchanged (hash {})", hash8(cur.as_deref())));
             }
         }
     }
+    why("UP TO DATE: all recorded dependencies are unchanged");
     Ok(false)
 }
 

@@ -115,6 +115,7 @@ USAGE:
 OPTIONS:
     -j N, --jobs N   build up to N targets in parallel (default 1)
     -y, --yes        overwrite hand-edited targets without asking
+    -v, --verbose    explain every rebuild/up-to-date decision as it is made
     -h, --help       show this help
     --version        print version
 {dash_note}"
@@ -124,11 +125,12 @@ OPTIONS:
 dependencies of the current target. Call from within a do-file.
 
 USAGE:
-    redo-ifchange <deps...>
+    redo-ifchange [options] <deps...>
 
 OPTIONS:
-    -h, --help   show this help
-    --version    print version
+    -v, --verbose   explain every rebuild/up-to-date decision as it is made
+    -h, --help      show this help
+    --version       print version
 {dash_note}"
         ),
         Some("ifcreate") => format!(
@@ -179,7 +181,7 @@ fn run_forward(verb: Option<&str>, raw: &[String]) -> Result<()> {
             let (jobs, targets) = extract_jobs(raw)?;
             build_targets(&targets, jobs)
         }
-        Some("ifchange") => build::ifchange(&Ctx::from_env()?, raw),
+        Some("ifchange") => build::ifchange(&Ctx::from_env()?, &extract_verbose(raw)),
         Some("ifcreate") => build::ifcreate(&Ctx::from_env()?, raw),
         Some("always") => build::always(&Ctx::from_env()?),
         Some("stamp") => build::stamp(),
@@ -194,6 +196,21 @@ fn build_targets(targets: &[String], jobs: usize) -> Result<()> {
     } else {
         build::redo(targets, jobs)
     }
+}
+
+/// Extract `-v` / `--verbose` from an argument list, enabling the decision
+/// trace via `REDO_VERBOSE=1` (which child redo processes inherit through the
+/// do-file environment). Returns the remaining arguments.
+pub fn extract_verbose(args: &[String]) -> Vec<String> {
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "-v" || a == "--verbose" {
+            std::env::set_var("REDO_VERBOSE", "1");
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    rest
 }
 
 /// Extract `-j N` / `-jN` / `--jobs N` / `--jobs=N` from the argument list,
@@ -215,6 +232,9 @@ pub fn extract_jobs(args: &[String]) -> Result<(usize, Vec<String>)> {
         } else if a == "--yes" || a == "-y" {
             // Auto-overwrite hand-edited targets; inherited by child processes.
             std::env::set_var("REDO_YES", "1");
+        } else if a == "--verbose" || a == "-v" {
+            // Trace every out-of-date decision; inherited by child processes.
+            std::env::set_var("REDO_VERBOSE", "1");
         } else {
             rest.push(a.clone());
         }
@@ -262,6 +282,8 @@ which existing do-files call directly.
 OPTIONS:
     -j N, --jobs N                build up to N targets in parallel (default 1)
     -y, --yes                     overwrite hand-edited targets without asking
+    -v, --verbose                 explain every rebuild/up-to-date decision as
+                                  it is made (also: REDO_VERBOSE=1)
     --version                     print version
     -h, --help                    show this help
 
