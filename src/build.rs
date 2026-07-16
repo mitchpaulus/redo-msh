@@ -823,19 +823,25 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     // database mutation, so a refusal leaves no trace of an attempted build.
     check_not_hand_edited(ctx, target_rel, &target_abs)?;
 
-    // Reset dependency edges; the do-file re-declares them as it runs.
-    clear_deps(&ctx.conn, target_rel)?;
-    // Mark the build as in flight. The marker is removed only after a
-    // successful commit, so a failed (or crashed) build leaves the target
-    // unconditionally out of date — otherwise a later run would trust a
-    // leftover output file from an earlier success plus the fresh edges
-    // recorded below, and accept the target as up to date.
-    record_dep(&ctx.conn, target_rel, DepKind::Uncommitted, None, None)?;
+    // Reset dependency edges (the do-file re-declares them as it runs) and
+    // mark the build as in flight, atomically. The marker is removed only
+    // after a successful commit, so a failed (or crashed) build leaves the
+    // target unconditionally out of date — otherwise a later run would trust
+    // a leftover output file from an earlier success plus the fresh edges
+    // recorded below, and accept the target as up to date. One transaction so
+    // a crash can never land between the clear and the marker, which would
+    // leave the target looking never-attempted. (Stamp computed outside: no
+    // file hashing while holding the write lock.)
     let df_stamp = stamp::stamp_file(&df.dofile_abs)?;
-    record_dep(&ctx.conn, target_rel, DepKind::DoFile, Some(&df.dofile_rel), df_stamp.as_ref())?;
-    for a in &absent {
-        record_dep(&ctx.conn, target_rel, DepKind::IfCreate, Some(a), None)?;
-    }
+    db::write_txn(&ctx.conn, |conn| {
+        clear_deps(conn, target_rel)?;
+        record_dep(conn, target_rel, DepKind::Uncommitted, None, None)?;
+        record_dep(conn, target_rel, DepKind::DoFile, Some(&df.dofile_rel), df_stamp.as_ref())?;
+        for a in &absent {
+            record_dep(conn, target_rel, DepKind::IfCreate, Some(a), None)?;
+        }
+        Ok(())
+    })?;
 
     let before_t = fs::metadata(&target_abs).ok();
 
@@ -991,21 +997,25 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         let _ = fs::remove_file(&target_abs);
     }
 
-    // Record the post-build stamp; this is the "target is built" marker.
+    // Record the post-build stamp and drop the in-flight marker recorded
+    // before the run, atomically: together they are the "target is built"
+    // commit point.
     let stamp = stamp::stamp_file(&target_abs)?;
-    upsert_file(
-        &ctx.conn,
-        target_rel,
-        Some(&df.dofile_rel),
-        Some(now_nanos()),
-        stamp.as_ref(),
-        ctx.session,
-    )?;
-    // Successful commit: drop the in-flight marker recorded before the run.
-    ctx.conn.execute(
-        "DELETE FROM deps WHERE target = ?1 AND kind = ?2",
-        params![target_rel, DepKind::Uncommitted as i64],
-    )?;
+    db::write_txn(&ctx.conn, |conn| {
+        upsert_file(
+            conn,
+            target_rel,
+            Some(&df.dofile_rel),
+            Some(now_nanos()),
+            stamp.as_ref(),
+            ctx.session,
+        )?;
+        conn.execute(
+            "DELETE FROM deps WHERE target = ?1 AND kind = ?2",
+            params![target_rel, DepKind::Uncommitted as i64],
+        )?;
+        Ok(())
+    })?;
     // Terminate the log stream: `done` with exit 0. Every early return above
     // writes it too, via the guard's Drop, with the failing exit code.
     if let Some(g) = done_guard {
@@ -1058,7 +1068,10 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
     build_parallel(ctx, &buildables)?;
 
     // Record the edges from the parent target (serial, on our connection).
+    // Stamps (which may hash file contents) are computed before the
+    // transaction so the write lock is held only for the inserts.
     if let Some(parent) = &ctx.target {
+        let mut stamped = Vec::with_capacity(items.len());
         for (dep_rel, dep_abs, _) in &items {
             let stamp = stamp::stamp_file(dep_abs)?;
             vlog(ctx, || {
@@ -1067,8 +1080,14 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
                     hash8(stamp.as_ref().map(|s| s.csum.as_str()))
                 )
             });
-            record_dep(&ctx.conn, parent, DepKind::IfChange, Some(dep_rel), stamp.as_ref())?;
+            stamped.push((dep_rel, stamp));
         }
+        db::write_txn(&ctx.conn, |conn| {
+            for (dep_rel, stamp) in &stamped {
+                record_dep(conn, parent, DepKind::IfChange, Some(dep_rel), stamp.as_ref())?;
+            }
+            Ok(())
+        })?;
     } else {
         vlog(ctx, || {
             "not inside a do-file (no REDO_TARGET): dependencies were brought up to \

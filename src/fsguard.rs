@@ -5,12 +5,14 @@
 //! `flock`/`LockFileEx` behaves correctly across machines, so `.redom/` MUST
 //! live on a local disk. The working tree may live anywhere.
 //!
-//! We classify the filesystem under a path into one of three buckets:
-//!   * `Local`   — proceed.
-//!   * `Network` — a true cross-machine FS (NFS/SMB/CIFS); hard error.
-//!   * `Unknown` — couldn't determine, or a WSL-style passthrough (9p/drvfs/
-//!     fuse); warn but proceed (this is the common dev case under WSL where
-//!     repos live on `/mnt/c`).
+//! We classify the filesystem under a path into one of four buckets:
+//!   * `Local`      — proceed.
+//!   * `Network`    — a true cross-machine FS (NFS/SMB/CIFS); hard error.
+//!   * `MmapUnsafe` — a same-machine passthrough (WSL drvfs/9p, FUSE): file
+//!     I/O and single-instance locking work, but shared writable mmap does
+//!     not, so SQLite WAL mode fails in `xShmMap`. Proceed; the db layer
+//!     selects a rollback-journal mode instead of WAL (see `db.rs`).
+//!   * `Unknown`    — couldn't determine; proceed.
 //!
 //! `REDO_ALLOW_NETWORK_FS=1` downgrades the hard error to a warning.
 
@@ -20,6 +22,9 @@ use std::path::Path;
 pub enum FsKind {
     Local,
     Network,
+    /// Same-machine passthrough FS without shared-writable-mmap support
+    /// (WSL drvfs/9p, FUSE). SQLite WAL cannot run here; rollback journal can.
+    MmapUnsafe,
     Unknown,
 }
 
@@ -46,12 +51,14 @@ pub fn classify(path: &Path) -> FsKind {
     const SMB2_MAGIC: i64 = 0xFE53_4D42;
     const AFS_SUPER_MAGIC: i64 = 0x5346_414F;
     const NCP_SUPER_MAGIC: i64 = 0x564C;
+    const V9FS_MAGIC: i64 = 0x0102_1997; // 9p; WSL mounts /mnt/c (drvfs) as 9p
+    const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
 
     let t = buf.f_type as i64;
     match t {
         NFS_SUPER_MAGIC | SMB_SUPER_MAGIC | CIFS_MAGIC | SMB2_MAGIC | AFS_SUPER_MAGIC
         | NCP_SUPER_MAGIC => FsKind::Network,
-        // 9p / drvfs / fuse passthrough (WSL): treat as unknown, not a hard block.
+        V9FS_MAGIC | FUSE_SUPER_MAGIC => FsKind::MmapUnsafe,
         _ => FsKind::Local,
     }
 }
@@ -71,6 +78,9 @@ pub fn enforce_local(redo_dir: &Path) -> anyhow::Result<()> {
     match classify(redo_dir) {
         FsKind::Local => Ok(()),
         FsKind::Unknown => Ok(()),
+        // Single-instance locking works on a passthrough FS; only WAL's shared
+        // mmap does not, and db::open() selects a non-WAL journal mode there.
+        FsKind::MmapUnsafe => Ok(()),
         FsKind::Network => {
             if override_set {
                 eprintln!(
