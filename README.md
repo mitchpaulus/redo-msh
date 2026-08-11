@@ -12,3 +12,11 @@ Inspired by the great implementation by [`apenwarr`](https://github.com/apenwarr
 
 > [!WARNING]
 > This was built in large part with Claude/Codex. Feel free to draw your own conclusion with that information.
+
+## Use in GitHub Actions
+
+```yaml
+- uses: mitchpaulus/redo-msh@v0.1.0
+```
+
+Installs the release binaries matching the pinned tag (`redo`, `redo-ifchange`, `redo-always`, `redo-ifcreate`, `redo-stamp`) and adds them to `PATH`. Linux x86_64, macOS arm64, and Windows x86_64 runners are supported.

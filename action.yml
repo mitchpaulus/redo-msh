@@ -1,0 +1,107 @@
+name: Setup redo-msh
+description: >
+  Install the redo-msh build system binaries (redo, redo-ifchange, redo-always,
+  redo-ifcreate, redo-stamp) from a GitHub Release and add them to PATH.
+author: Mitchell Paulus
+
+branding:
+  icon: refresh-cw
+  color: green
+
+inputs:
+  version:
+    description: >
+      Release tag to install (e.g. v0.1.0). Defaults to the ref this action is
+      pinned at, so `uses: mitchpaulus/redo-msh@v0.1.0` installs the v0.1.0
+      binaries with no input needed. Only required when the action is pinned at
+      a non-release ref like @main or a commit SHA.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install redo-msh
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: mitchpaulus/redo-msh
+        VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+
+        # The action and the binaries share one repo and one set of tags, so
+        # the `uses:` ref doubles as the version — one pin, no drift.
+        if [ -z "$VERSION" ]; then
+          case "$ACTION_REF" in
+            v[0-9]*) VERSION="$ACTION_REF" ;;
+            *)
+              echo "This action is pinned at '$ACTION_REF', which is not a release tag." >&2
+              echo "Pin a release (uses: ${REPO}@vX.Y.Z) or pass an explicit 'version' input." >&2
+              exit 1
+              ;;
+          esac
+        fi
+
+        # Map runner OS/arch to a release target triple. The Linux build is
+        # musl (fully static), so it runs on any distro or container.
+        os="$(uname -s)"
+        arch="$(uname -m)"
+        case "$os" in
+          Linux)
+            case "$arch" in
+              x86_64) target="x86_64-unknown-linux-musl"; ext="tar.gz" ;;
+              *) echo "No redo-msh release for Linux/$arch" >&2; exit 1 ;;
+            esac
+            ;;
+          Darwin)
+            case "$arch" in
+              arm64) target="aarch64-apple-darwin"; ext="tar.gz" ;;
+              *) echo "No redo-msh release for macOS/$arch" >&2; exit 1 ;;
+            esac
+            ;;
+          MINGW*|MSYS*|CYGWIN*)
+            target="x86_64-pc-windows-msvc"; ext="zip"
+            ;;
+          *)
+            echo "Unsupported OS: $os" >&2; exit 1
+            ;;
+        esac
+
+        name="redo-msh-${VERSION}-${target}"
+        archive="${name}.${ext}"
+        bindir="${RUNNER_TOOL_CACHE}/redo-msh/${VERSION}/${target}"
+
+        # Tool cache hit (matters on self-hosted runners): nothing to do.
+        if [ ! -x "${bindir}/redo" ] && [ ! -f "${bindir}/redo.exe" ]; then
+          workdir="$(mktemp -d "${RUNNER_TEMP}/redo-msh.XXXXXX")"
+          cd "$workdir"
+
+          gh release download "$VERSION" \
+            --repo "$REPO" \
+            --pattern "${archive}" \
+            --pattern "${archive}.sha256" \
+            --clobber
+
+          sha256sum -c "${archive}.sha256" 2>/dev/null \
+            || shasum -a 256 -c "${archive}.sha256"
+
+          case "$ext" in
+            tar.gz) tar xzf "$archive" ;;
+            zip)    7z x -y "$archive" >/dev/null ;;
+          esac
+
+          mkdir -p "$(dirname "$bindir")"
+          rm -rf "$bindir"
+          mv "$name" "$bindir"
+        fi
+
+        # GITHUB_PATH needs a native path on Windows.
+        if command -v cygpath >/dev/null 2>&1; then
+          cygpath -w "$bindir" >> "$GITHUB_PATH"
+        else
+          echo "$bindir" >> "$GITHUB_PATH"
+        fi
+
+        echo "Installed redo-msh $VERSION ($target) to $bindir"
