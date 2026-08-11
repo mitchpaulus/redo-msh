@@ -1,0 +1,142 @@
+name: Release
+
+# Cut a GitHub Release with prebuilt binaries whenever a vX.X.X tag is pushed.
+#
+# Flow: create a draft release first, fan out per-target builds that upload
+# their archives to the draft, then flip the draft live only after every
+# build succeeds. This way a published release always has a complete set of
+# assets, and concurrent matrix jobs never race to create the release.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # A tag that doesn't match Cargo.toml is a mistake — fail loudly before
+      # building anything.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version" >&2
+            exit 1
+          fi
+
+      # Idempotent so a re-run of a partially failed workflow doesn't die here.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # Fully static Linux build (rusqlite is `bundled`, so SQLite links
+          # in); runs on any distro or minimal container.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runner images ship stable Rust via rustup; every matrix target
+      # except musl is the runner's host target, so only musl needs a
+      # `rustup target add` (plus musl-gcc for the C deps).
+      - name: Install musl target and tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Ships the five redo entry points plus the redo-msh main binary.
+      # tar.gz for Unix (preserves the executable bit), zip for Windows.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          name="redo-msh-${GITHUB_REF_NAME}-${target}"
+          bindir="target/${target}/release"
+          mkdir "$name"
+          for bin in redo redo-ifchange redo-always redo-ifcreate redo-stamp redo-msh; do
+            case "$target" in
+              *windows*) cp "${bindir}/${bin}.exe" "$name/" ;;
+              *)         cp "${bindir}/${bin}" "$name/" ;;
+            esac
+          done
+          cp README.md "$name/"
+          case "$target" in
+            *windows*)
+              archive="${name}.zip"
+              7z a "$archive" "$name"
+              ;;
+            *)
+              archive="${name}.tar.gz"
+              tar czf "$archive" "$name"
+              ;;
+          esac
+          # sha256sum on Linux/Windows (Git Bash), shasum on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      # --clobber makes re-runs of a failed workflow safe.
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            "$ARCHIVE" "${ARCHIVE}.sha256"
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark release as published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
