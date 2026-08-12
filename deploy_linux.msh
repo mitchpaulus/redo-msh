@@ -11,5 +11,5 @@ files!
 @files each.
     f! @base @f / absPath target!
     $"Linking {@target}" wle
-    ['ln' '-s' '-r' '-t' $LOCALBIN @target]!
+    ['ln' '-f' '-s' '-r' '-t' $LOCALBIN @target]!
  end
