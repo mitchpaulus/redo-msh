@@ -2,3 +2,8 @@
 .redo/
 .tmp-*
 .claude/
+
+# TLA+/TLC artifacts (run.sh keeps scratch in /tmp; direct TLC runs drop these)
+verification/states/
+verification/*.out
+verification/*.old
