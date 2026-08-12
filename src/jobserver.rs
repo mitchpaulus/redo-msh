@@ -122,6 +122,26 @@ impl Jobserver {
         }
     }
 
+    /// Human-readable description of the token-pool mechanism, for the
+    /// `--debug-jobs` banner. Notes explicitly when the pool is per-process
+    /// (the local fallback), since that changes the effective global limit.
+    pub fn describe(&self) -> String {
+        match &self.0 {
+            #[cfg(unix)]
+            Inner::Pipe { rfd, wfd } => {
+                format!("token pipe (fds {rfd},{wfd}), shared across the process tree")
+            }
+            #[cfg(windows)]
+            Inner::Sem { .. } => {
+                "named semaphore, shared across the process tree".to_string()
+            }
+            Inner::Local { extra } => format!(
+                "in-process counter ({} extra tokens, NOT shared with child redo processes)",
+                extra.load(Ordering::Acquire)
+            ),
+        }
+    }
+
     /// Return one token to the shared pool.
     pub fn release(&self) {
         match &self.0 {

@@ -25,8 +25,9 @@ use root::Root;
 use std::path::Path;
 
 /// Dispatch the `redo-msh` umbrella command line. The first argument is a verb
-/// (`root`, `ifchange`, `ifcreate`, `always`, `sources`, `targets`, `ood`); if
-/// it is not a known verb, every argument is treated as a target to build.
+/// (`root`, `ifchange`, `ifcreate`, `always`, `sources`, `targets`, `ood`,
+/// `tree`); if it is not a known verb, every argument is treated as a target
+/// to build.
 pub fn run(raw_args: &[String]) -> Result<()> {
     // Help and version are recognized in any position, before other parsing.
     // (A target literally named `-h` must be given as a path, e.g. `./-h`.)
@@ -54,6 +55,7 @@ pub fn run(raw_args: &[String]) -> Result<()> {
         "sources" => build::cmd_sources(),
         "targets" => build::cmd_targets(),
         "ood" => build::cmd_ood(),
+        "tree" => build::cmd_tree(&rest),
         "help" => {
             print_usage();
             Ok(())
@@ -116,6 +118,7 @@ OPTIONS:
     -j N, --jobs N   build up to N targets in parallel (default 1)
     -y, --yes        overwrite hand-edited targets without asking
     -v, --verbose    explain every rebuild/up-to-date decision as it is made
+    --debug-jobs     trace jobserver tokens and parallel target groups
     -h, --help       show this help
     --version        print version
 {dash_note}"
@@ -129,6 +132,7 @@ USAGE:
 
 OPTIONS:
     -v, --verbose   explain every rebuild/up-to-date decision as it is made
+    --debug-jobs    trace jobserver tokens and parallel target groups
     -h, --help      show this help
     --version       print version
 {dash_note}"
@@ -198,14 +202,17 @@ fn build_targets(targets: &[String], jobs: usize) -> Result<()> {
     }
 }
 
-/// Extract `-v` / `--verbose` from an argument list, enabling the decision
-/// trace via `REDO_VERBOSE=1` (which child redo processes inherit through the
-/// do-file environment). Returns the remaining arguments.
+/// Extract `-v` / `--verbose` and `--debug-jobs` from an argument list,
+/// enabling the decision trace (`REDO_VERBOSE=1`) and the jobserver trace
+/// (`REDO_DEBUG_JOBS=1`), which child redo processes inherit through the
+/// do-file environment. Returns the remaining arguments.
 pub fn extract_verbose(args: &[String]) -> Vec<String> {
     let mut rest = Vec::new();
     for a in args {
         if a == "-v" || a == "--verbose" {
             std::env::set_var("REDO_VERBOSE", "1");
+        } else if a == "--debug-jobs" {
+            std::env::set_var("REDO_DEBUG_JOBS", "1");
         } else {
             rest.push(a.clone());
         }
@@ -235,6 +242,9 @@ pub fn extract_jobs(args: &[String]) -> Result<(usize, Vec<String>)> {
         } else if a == "--verbose" || a == "-v" {
             // Trace every out-of-date decision; inherited by child processes.
             std::env::set_var("REDO_VERBOSE", "1");
+        } else if a == "--debug-jobs" {
+            // Trace jobserver tokens and parallel groups; inherited too.
+            std::env::set_var("REDO_DEBUG_JOBS", "1");
         } else {
             rest.push(a.clone());
         }
@@ -274,6 +284,8 @@ COMMANDS:
     redo-msh sources              list known source files
     redo-msh targets              list known generated targets
     redo-msh ood                  list out-of-date targets (without building)
+    redo-msh tree [targets...]    print the dependency tree recorded by the
+                                  last run, with per-node parallel width
 
 These are also available as the standalone commands `redo`, `redo-ifchange`,
 `redo-ifcreate`, `redo-always`, and `redo-stamp` (shipped alongside redo-msh),
@@ -284,6 +296,8 @@ OPTIONS:
     -y, --yes                     overwrite hand-edited targets without asking
     -v, --verbose                 explain every rebuild/up-to-date decision as
                                   it is made (also: REDO_VERBOSE=1)
+    --debug-jobs                  trace jobserver tokens and parallel target
+                                  groups (also: REDO_DEBUG_JOBS=1)
     --version                     print version
     -h, --help                    show this help
 

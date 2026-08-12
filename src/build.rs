@@ -74,7 +74,7 @@ impl Ctx {
         let conn = root.open_db()?;
         let session = db::next_runid(&conn)?;
         let config = crate::config::Config::load(&root.dir)?;
-        Ok(Ctx {
+        let ctx = Ctx {
             root,
             conn,
             session,
@@ -85,7 +85,15 @@ impl Ctx {
             jobs: Arc::new(Jobserver::init_top(j.max(1))),
             config,
             log_sink: None, // `redo()` installs the run trace before building.
-        })
+        };
+        jlog(&ctx, || {
+            format!(
+                "jobserver: created for -j{}: {}",
+                j.max(1),
+                ctx.jobs.describe()
+            )
+        });
+        Ok(ctx)
     }
 
     /// Build a context for a child process (`ifchange`/`ifcreate`/`always`),
@@ -113,7 +121,7 @@ impl Ctx {
             .unwrap_or_default();
         let target = std::env::var(E_TARGET).ok().filter(|s| !s.is_empty());
         let config = crate::config::Config::load(&root.dir)?;
-        Ok(Ctx {
+        let ctx = Ctx {
             root,
             conn,
             session,
@@ -124,7 +132,15 @@ impl Ctx {
             jobs: Arc::new(Jobserver::from_env()),
             config,
             log_sink: std::env::var_os(crate::logs::ENV_LOG_PATH).map(PathBuf::from),
-        })
+        };
+        jlog(&ctx, || match std::env::var(crate::jobserver::ENV) {
+            Ok(spec) => format!(
+                "jobserver: inherited (REDO_JOBSERVER={spec}): {}",
+                ctx.jobs.describe()
+            ),
+            Err(_) => "jobserver: none in environment: serial (own token only)".to_string(),
+        });
+        Ok(ctx)
     }
 
     /// A context for building one dependency on a worker thread: same
@@ -169,15 +185,37 @@ fn verbose() -> bool {
     *V.get_or_init(|| std::env::var("REDO_VERBOSE").as_deref() == Ok("1"))
 }
 
-/// Emit one decision-trace line. Lines go to this process's log sink — each
-/// is a single atomic append, so the follower prints it inside the right
-/// target's block — or straight to stderr when standalone (no build running).
-/// `msg` is lazy so the non-verbose path pays nothing.
+/// Whether jobserver/parallel-scheduler tracing is on (`--debug-jobs` /
+/// `REDO_DEBUG_JOBS=1`). Read once per process, like `verbose`: the flag is
+/// set during argument parsing and reaches child processes through the
+/// environment.
+fn debug_jobs() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("REDO_DEBUG_JOBS").as_deref() == Ok("1"))
+}
+
+/// Emit one decision-trace line (`--verbose`). `msg` is lazy so the
+/// non-verbose path pays nothing.
 fn vlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
     if !verbose() {
         return;
     }
-    let line = format!("redo-msh -v: {}\n", msg());
+    trace_line(ctx, &format!("redo-msh -v: {}\n", msg()));
+}
+
+/// Emit one jobserver-trace line (`--debug-jobs`): token acquisition,
+/// parallel-group launches, and completions.
+fn jlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
+    if !debug_jobs() {
+        return;
+    }
+    trace_line(ctx, &format!("redo-msh jobs: {}\n", msg()));
+}
+
+/// Write one trace line to this process's log sink — each is a single atomic
+/// append, so the follower prints it inside the right target's block — or
+/// straight to stderr when standalone (no build running).
+fn trace_line(ctx: &Ctx, line: &str) {
     match &ctx.log_sink {
         Some(sink) => {
             use std::io::Write;
@@ -1099,20 +1137,37 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
 }
 
 /// Bring multiple buildable targets up to date, in parallel, bounded by the
-/// jobserver. Uses the process's own token for one job (guaranteeing progress)
-/// and try-acquires extra pool tokens for the rest; completions are awaited via
-/// a channel, and each pool token is returned as its job finishes.
+/// jobserver.
 fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
     if deps.len() <= 1 {
         // No parallelism opportunity: run inline, consuming no extra tokens.
         for d in deps {
+            jlog(ctx, || {
+                format!("{d}: only buildable target of this ifchange: running inline")
+            });
             ensure(ctx, d)?;
         }
         return Ok(());
     }
+    run_parallel(ctx, deps, false)
+}
 
-    let (tx, rx) = mpsc::channel::<(Result<()>, TokenSrc)>();
-    let n = deps.len();
+/// The parallel scheduler shared by `ifchange` and top-level `redo`. Uses the
+/// process's own token for one job (guaranteeing progress) and try-acquires
+/// extra pool tokens for the rest; completions are awaited via a channel, and
+/// each pool token is returned as its job finishes. `force` distinguishes
+/// top-level `redo` (always rebuild) from `ifchange` (build only if out of
+/// date).
+fn run_parallel(ctx: &Ctx, targets: &[String], force: bool) -> Result<()> {
+    jlog(ctx, || {
+        format!(
+            "parallel group of {}: {}",
+            targets.len(),
+            targets.join(", ")
+        )
+    });
+    let (tx, rx) = mpsc::channel::<(Result<()>, TokenSrc, String)>();
+    let n = targets.len();
     let mut idx = 0;
     let mut running = 0usize;
     let mut own_in_use = false;
@@ -1127,14 +1182,36 @@ fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
             } else if ctx.jobs.try_acquire() {
                 TokenSrc::Pool
             } else {
+                jlog(ctx, || {
+                    format!(
+                        "token pool empty: {} of {} queued ({}); waiting on {} running job(s)",
+                        n - idx,
+                        n,
+                        targets[idx..].join(", "),
+                        running
+                    )
+                });
                 break;
             };
+            let target = targets[idx].clone();
+            jlog(ctx, || {
+                format!(
+                    "{target}: spawned ({})",
+                    match src {
+                        TokenSrc::Own => "own token",
+                        TokenSrc::Pool => "pool token",
+                    }
+                )
+            });
             let cctx = ctx.child_for_thread()?;
-            let dep = deps[idx].clone();
             let tx = tx.clone();
             thread::spawn(move || {
-                let r = ensure(&cctx, &dep);
-                let _ = tx.send((r, src));
+                let r = if force {
+                    build(&cctx, &target, true)
+                } else {
+                    ensure(&cctx, &target)
+                };
+                let _ = tx.send((r, src, target));
             });
             idx += 1;
             running += 1;
@@ -1144,14 +1221,27 @@ fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
             break;
         }
         // Wait for one job to finish and reclaim its token.
-        let (res, src) = rx.recv().expect("build worker channel closed");
+        let (res, src, target) = rx.recv().expect("build worker channel closed");
         running -= 1;
         match src {
             TokenSrc::Own => own_in_use = false,
             TokenSrc::Pool => ctx.jobs.release(),
         }
+        jlog(ctx, || {
+            format!(
+                "{target}: {} ({})",
+                if res.is_ok() { "finished" } else { "FAILED" },
+                match src {
+                    TokenSrc::Own => "own token freed",
+                    TokenSrc::Pool => "pool token returned",
+                }
+            )
+        });
         if let Err(e) = res {
             if first_err.is_none() {
+                jlog(ctx, || {
+                    format!("{target}: failed: not launching further targets from this group")
+                });
                 first_err = Some(e);
             }
         }
@@ -1565,49 +1655,7 @@ fn redo_build(ctx: &Ctx, targets: &[String]) -> Result<()> {
 
 /// Like `build_parallel` but forces each target (top-level `redo`).
 fn build_parallel_forced(ctx: &Ctx, targets: &[String]) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<(Result<()>, TokenSrc)>();
-    let n = targets.len();
-    let (mut idx, mut running, mut own_in_use) = (0usize, 0usize, false);
-    let mut first_err: Option<anyhow::Error> = None;
-    loop {
-        while idx < n && first_err.is_none() {
-            let src = if !own_in_use {
-                own_in_use = true;
-                TokenSrc::Own
-            } else if ctx.jobs.try_acquire() {
-                TokenSrc::Pool
-            } else {
-                break;
-            };
-            let cctx = ctx.child_for_thread()?;
-            let target = targets[idx].clone();
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let r = build(&cctx, &target, true);
-                let _ = tx.send((r, src));
-            });
-            idx += 1;
-            running += 1;
-        }
-        if running == 0 {
-            break;
-        }
-        let (res, src) = rx.recv().expect("build worker channel closed");
-        running -= 1;
-        match src {
-            TokenSrc::Own => own_in_use = false,
-            TokenSrc::Pool => ctx.jobs.release(),
-        }
-        if let Err(e) = res {
-            if first_err.is_none() {
-                first_err = Some(e);
-            }
-        }
-    }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    run_parallel(ctx, targets, true)
 }
 
 // ---- introspection commands -------------------------------------------------
@@ -1652,6 +1700,137 @@ pub fn cmd_ood() -> Result<()> {
     for t in targets {
         if is_ood_static(&root, &conn, &t)? {
             println!("{t}");
+        }
+    }
+    Ok(())
+}
+
+/// `redo-msh tree [targets...]`: print the dependency tree recorded by the
+/// last run. With no arguments, prints every root (a generated target no other
+/// target depends on).
+///
+/// Two honest limits, both consequences of redo's design: dependencies are
+/// discovered *while do-files run*, so the tree reflects the previous build,
+/// not a plan for the next one; and the database does not record how deps
+/// were grouped into `redo-ifchange` calls, so a node's fan-out is an upper
+/// bound on the parallel width `-j` can achieve there (a do-file that calls
+/// `redo-ifchange` once per dep gets no parallelism at all).
+pub fn cmd_tree(args: &[String]) -> Result<()> {
+    let (root, conn) = open_for_query()?;
+    let roots: Vec<String> = if args.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT path FROM files WHERE dofile IS NOT NULL
+             AND path NOT IN (SELECT dep FROM deps WHERE dep IS NOT NULL)
+             ORDER BY path",
+        )?;
+        let roots = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        roots
+    } else {
+        args.iter()
+            .map(|a| normalize_target(&root, a))
+            .collect::<Result<_>>()?
+    };
+    if roots.is_empty() {
+        eprintln!("redo-msh: no recorded targets; run a build first");
+        return Ok(());
+    }
+    // Case-folded to match the database's NOCASE identity; a target expands
+    // once, later occurrences reference it instead of repeating its subtree
+    // (this also terminates on any stale cyclic edges).
+    let mut expanded: HashSet<String> = HashSet::new();
+    for (i, t) in roots.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        if files_row(&conn, t)?.is_none() && read_deps(&conn, t)?.is_empty() {
+            println!("{t} (nothing recorded: never built by redo)");
+            continue;
+        }
+        expanded.insert(t.to_ascii_lowercase());
+        println!("{}", tree_node_line(&conn, t)?);
+        print_tree(&conn, t, "", &mut expanded)?;
+    }
+    Ok(())
+}
+
+/// One node's display line: the target, its recorded do-file, and its
+/// ifchange fan-out (the upper bound on parallel width at this node).
+fn tree_node_line(conn: &Connection, target: &str) -> Result<String> {
+    let dofile: Option<String> = conn
+        .query_row(
+            "SELECT dofile FROM files WHERE path = ?1",
+            params![target],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let width: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM deps WHERE target = ?1 AND kind = ?2",
+        params![target, DepKind::IfChange as i64],
+        |r| r.get(0),
+    )?;
+    let mut s = target.to_string();
+    if let Some(df) = dofile {
+        s.push_str(&format!(" [{df}]"));
+    }
+    if width > 1 {
+        s.push_str(&format!(" ({width} deps: parallel width up to {width})"));
+    }
+    Ok(s)
+}
+
+/// Recursively print `target`'s recorded dependency edges beneath `prefix`.
+fn print_tree(
+    conn: &Connection,
+    target: &str,
+    prefix: &str,
+    expanded: &mut HashSet<String>,
+) -> Result<()> {
+    // (display label, Some(dep) if the child is a generated target to recurse
+    // into). The do-file edge is shown on the node line, not as a child.
+    let mut children: Vec<(String, Option<String>)> = Vec::new();
+    for (kind, dep, _csum) in read_deps(conn, target)? {
+        match kind {
+            DepKind::DoFile => {}
+            DepKind::Always => {
+                children.push(("(always: rebuilt every run)".to_string(), None));
+            }
+            DepKind::Uncommitted => {
+                children.push((
+                    "(last build failed or crashed before committing)".to_string(),
+                    None,
+                ));
+            }
+            DepKind::IfCreate => {
+                let d = dep.expect("ifcreate dep has a path");
+                children.push((format!("{d} (must stay absent)"), None));
+            }
+            DepKind::IfChange => {
+                let d = dep.expect("ifchange dep has a path");
+                if is_generated(conn, &d)? {
+                    children.push((d.clone(), Some(d)));
+                } else {
+                    children.push((format!("{d} (source)"), None));
+                }
+            }
+        }
+    }
+    let last = children.len().saturating_sub(1);
+    for (i, (label, recurse)) in children.into_iter().enumerate() {
+        let (branch, cont) = if i == last {
+            ("└── ", "    ")
+        } else {
+            ("├── ", "│   ")
+        };
+        match recurse {
+            Some(dep) if expanded.insert(dep.to_ascii_lowercase()) => {
+                println!("{prefix}{branch}{}", tree_node_line(conn, &dep)?);
+                print_tree(conn, &dep, &format!("{prefix}{cont}"), expanded)?;
+            }
+            Some(_) => println!("{prefix}{branch}{label} (shown above)"),
+            None => println!("{prefix}{branch}{label}"),
         }
     }
     Ok(())
