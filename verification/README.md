@@ -246,12 +246,16 @@ fixing this would make the hang easy to hit.
 - Static lock ordering is **not** available: redo discovers dependencies
   during execution, so no global order exists up front.
 
-**Status: fix chosen and verified.** `ParallelEnsure.tla` specifies the
-waits-for-graph design and `ParallelEnsure_Cycle` proves it turns this exact
-scenario into a clean error on every interleaving.
-`CycleLock_CycleParallel` is kept as-is, deliberately: it documents the
-behavior of the *shipping* chain-based design and should keep finding the
-deadlock until the implementation switches over.
+**Status: fix chosen, verified, and implemented.** `ParallelEnsure.tla`
+specifies the waits-for-graph design and `ParallelEnsure_Cycle` proves it
+turns this exact scenario into a clean error on every interleaving. The
+implementation lives in `src/waits.rs` (the shared graph: atomic
+check-and-insert in one SQLite write transaction, owner-liveness GC) and
+`src/parallel.rs` (the speculative parallel traversal; soft/hard failure
+severity per Speculation.tla). The chain check remains only as a fast path
+for path-local cycles (it produces the readable `a -> b -> a` message);
+`CycleLock_CycleParallel` is kept as-is, deliberately: it documents why the
+chain mechanism alone is insufficient and must keep finding the deadlock.
 
 ## Abstractions and assumptions
 
@@ -289,10 +293,11 @@ deadlock until the implementation switches over.
   GC, a new session starting) is stated but not model-checked. Worth a spec
   if the implementation's GC turns out subtler than "same liveness rule as
   locks".
-- The under-utilization behavior of `run_parallel` (tokens freed elsewhere
-  in the tree are not observed until one of this process's own jobs
-  completes) violates the eager-scheduling obligation in the implementation
-  contract above and should be fixed as part of implementing the design.
+- ~~The under-utilization behavior of `run_parallel`~~ — fixed: the old
+  wait-only-on-own-children scheduler is gone; `src/parallel.rs` acquires
+  tokens with a try-acquire retry loop, so a token freed anywhere in the
+  process tree is observed within one poll interval (the eager-scheduling
+  obligation, contract item 7).
 - The overwrite prompt's release/spin-reacquire path in `prompt_overwrite`
   (a token-conservation risk worth adding to TokenPool).
 - Rust-level concurrency (atomics orderings, channel lifetimes) is out of

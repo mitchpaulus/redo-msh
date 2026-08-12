@@ -368,6 +368,65 @@ fn cycle_errors_without_hang() {
     );
 }
 
+/// A dependency cycle entered concurrently from two sides must error, not
+/// deadlock. This is the exact scenario `CycleLock_CycleParallel` proves
+/// deadlocks under path-local (chain) cycle detection, and
+/// `ParallelEnsure_Cycle` proves errors out cleanly on every interleaving
+/// under the shared waits-for graph: two parallel branches (`x`, `y`) reach
+/// the cycle `a <-> b` from different entry points, so neither branch's own
+/// chain ever contains the whole loop.
+#[test]
+fn parallel_cycle_from_two_sides_errors_not_deadlocks() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.do", "['redo-msh' 'ifchange' 'b']!\n");
+    p.write("b.do", "['redo-msh' 'ifchange' 'a']!\n");
+    p.write("x.do", "['redo-msh' 'ifchange' 'a']!\n");
+    p.write("y.do", "['redo-msh' 'ifchange' 'b']!\n");
+    p.write("all.do", "['redo-msh' 'ifchange' 'x' 'y']!\n");
+    let out = p.redo(&["-j4", "all"]);
+    assert!(!out.status.success(), "two-sided cycle must fail");
+    assert!(
+        stderr(&out).contains("cycle"),
+        "expected a cycle error, got: {}",
+        stderr(&out)
+    );
+}
+
+/// A stale recorded dependency (the database says `app` needs `dropped`,
+/// the do-file no longer does) may cost speculative work but must never
+/// invent an error — even when the stale dep can no longer be built. This
+/// is Speculation.tla's soft-failure rule: speculative failures only force
+/// the rebuild path, and the do-file is the ground truth.
+#[test]
+fn stale_recorded_dep_failure_is_soft() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("dropped.txt.do", "args :2: out!\n\"d\\n\" @out writeFile\n");
+    p.write(
+        "app.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'dropped.txt']!\n\"v1\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["ifchange", "app.txt"]).status.success());
+
+    // The do-file drops the dep; the dep's own do-file starts failing. The
+    // recorded edge app -> dropped is now stale AND its speculative build
+    // fails — the rebuild must still succeed.
+    p.write("dropped.txt.do", "['redo-msh' 'ifchange' 'no-such-dep']!\n");
+    p.write("app.txt.do", "args :2: out!\n\"v2\\n\" @out writeFile\n");
+    let out = p.redo(&["ifchange", "app.txt"]);
+    assert!(
+        out.status.success(),
+        "stale failing dep must not fail the parent: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("app.txt"), "v2\n");
+}
+
 /// A phony target (no $3 and no stdout) produces no file but succeeds.
 #[test]
 fn phony_target() {
