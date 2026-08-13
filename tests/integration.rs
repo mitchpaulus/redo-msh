@@ -427,6 +427,113 @@ fn stale_recorded_dep_failure_is_soft() {
     assert_eq!(p.read("app.txt"), "v2\n");
 }
 
+/// The cross-branch stale-speculation shape that deadlocked the first
+/// parallel implementation 10/10 (and that `SpeculationMP_CrossStale`
+/// proves the corrected machine survives): the database records d1 -> T2
+/// and d2 -> T1 from earlier runs, the do-files are rewired so the REAL
+/// graph is the acyclic T1 -> d1, T2 -> d2, and both tops build in
+/// parallel. Each branch's checker speculatively activates the OTHER
+/// branch's mid-build top; under the old design those speculative tasks
+/// blocked on kernel locks invisible to the waits graph while both
+/// ifchange drains waited on them. The creation-edge rule must dissolve
+/// this on every interleaving: no hang, no error, correct outputs.
+#[test]
+fn crossed_stale_deps_neither_hang_nor_error() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    // Phase 1: record the soon-to-be-stale cross edges d1 -> T2, d2 -> T1.
+    p.write("T2.do", "args :2: out!\n\"t2\\n\" @out writeFile\n");
+    p.write(
+        "d1.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'T2']!\n\"d1\\n\" @out writeFile\n",
+    );
+    p.write("T1.do", "args :2: out!\n\"t1\\n\" @out writeFile\n");
+    p.write(
+        "d2.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'T1']!\n\"d2\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["d1"]).status.success());
+    assert!(p.redo(&["d2"]).status.success());
+
+    // Phase 2: the deps drop their demands; the tops now demand the deps.
+    p.write("d1.do", "args :2: out!\n\"d1v2\\n\" @out writeFile\n");
+    p.write("d2.do", "args :2: out!\n\"d2v2\\n\" @out writeFile\n");
+    p.write(
+        "T1.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'd1']!\n\"t1v2\\n\" @out writeFile\n",
+    );
+    p.write(
+        "T2.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'd2']!\n\"t2v2\\n\" @out writeFile\n",
+    );
+    let out = p.redo(&["-j4", "T1", "T2"]);
+    assert!(
+        out.status.success(),
+        "acyclic project must converge (stale edges may never hang or error): {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("T1"), "t1v2\n");
+    assert_eq!(p.read("T2"), "t2v2\n");
+}
+
+/// A speculative build whose REAL dependency is the mid-build ancestor
+/// that (transitively) spawned it must abort quarantined — never fabricate
+/// a "dependency cycle" error, never fail the run — and must be re-run
+/// cleanly by the next real demand (`SpeculationMP_SpecAbort`, rules
+/// R3/R4). Under the old design this fabricated `X -> g -> X` from the
+/// inherited REDO_CHAIN and silently poisoned g.
+#[test]
+fn speculative_build_of_ancestor_dependent_aborts_quarantined() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    // g really depends on X (and stays that way); d's dep on g goes stale.
+    p.write("X.do", "args :2: out!\n\"x1\\n\" @out writeFile\n");
+    p.write(
+        "g.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'X']!\n\"g1\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["g"]).status.success());
+    p.write(
+        "d.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'g']!\n\"d1\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["d"]).status.success());
+
+    // Now: X -> d, g -> X (acyclic); the recorded d -> g edge is stale and
+    // drags g into speculation while X is mid-build above it.
+    p.write("d.do", "args :2: out!\n\"d2\\n\" @out writeFile\n");
+    p.write(
+        "X.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'd']!\n\"x2\\n\" @out writeFile\n",
+    );
+    let out = p.redo(&["X"]);
+    assert!(
+        out.status.success(),
+        "speculation must never fail the run: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("dependency cycle"),
+        "no fabricated cycle error, got: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("X"), "x2\n");
+
+    // The quarantined attempt leaves g pending; a real demand re-runs it
+    // successfully (reclaim, rule R4).
+    let out = p.redo(&["ifchange", "g"]);
+    assert!(
+        out.status.success(),
+        "reclaimed build of g must succeed: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("g"), "g1\n");
+}
+
 /// A phony target (no $3 and no stdout) produces no file but succeeds.
 #[test]
 fn phony_target() {

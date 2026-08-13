@@ -56,6 +56,13 @@ pub struct Ctx {
     /// (top-level `redo`). `None` (standalone `redo-ifchange` outside any
     /// build) disables log capture entirely — do-files inherit stderr.
     pub log_sink: Option<PathBuf>,
+    /// The creation edges guarding this SPECULATIVE lineage (SpeculationMP
+    /// rule R3): if any of them disappears from the waits graph, a real
+    /// dependency demand has superseded this speculation and every blocking
+    /// primitive here must abort (quarantined, retryable — rule R4). Empty
+    /// for demanded work. Inherited by child redo processes through
+    /// `REDO_SPEC_WATCH`; task threads append their own creation edge.
+    pub spec_watch: Vec<crate::waits::EdgeRef>,
 }
 
 const E_ROOT: &str = "REDO_ROOT";
@@ -86,6 +93,7 @@ impl Ctx {
             jobs: Arc::new(Jobserver::init_top(j.max(1))),
             config,
             log_sink: None, // `redo()` installs the run trace before building.
+            spec_watch: Vec::new(),
         };
         jlog(&ctx, || {
             format!(
@@ -133,6 +141,9 @@ impl Ctx {
             jobs: Arc::new(Jobserver::from_env()),
             config,
             log_sink: std::env::var_os(crate::logs::ENV_LOG_PATH).map(PathBuf::from),
+            spec_watch: std::env::var(crate::waits::ENV_SPEC_WATCH)
+                .map(|s| crate::waits::watch_from_env(&s))
+                .unwrap_or_default(),
         };
         jlog(&ctx, || match std::env::var(crate::jobserver::ENV) {
             Ok(spec) => format!(
@@ -159,6 +170,7 @@ impl Ctx {
             jobs: self.jobs.clone(),
             config: self.config.clone(),
             log_sink: self.log_sink.clone(),
+            spec_watch: self.spec_watch.clone(),
         })
     }
 
@@ -774,6 +786,10 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     }
     // Try first so a contended lock can be announced in the live log (the
     // user otherwise sees an unexplained stall) before we block on it.
+    // Kernel-lock waits carry no wait-graph edge (SpeculationMP proves the
+    // by-name edges bridge them), so a demanded build may block outright —
+    // but a SPECULATIVE lineage must stay interruptible: it polls the lock
+    // and its abort watch, so an eviction reaches it even here.
     let _lock = match crate::lock::try_lock_target(&ctx.root, target_rel)? {
         Some(lock) => lock,
         None => {
@@ -781,7 +797,17 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
                 session: ctx.session,
                 target: target_rel.to_string(),
             });
-            crate::lock::lock_target(&ctx.root, target_rel)?
+            if ctx.spec_watch.is_empty() {
+                crate::lock::lock_target(&ctx.root, target_rel)?
+            } else {
+                loop {
+                    crate::parallel::abort_check(ctx)?;
+                    if let Some(lock) = crate::lock::try_lock_target(&ctx.root, target_rel)? {
+                        break lock;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
         }
     };
     if !force && file_runid(&ctx.conn, target_rel)? == Some(ctx.session) {
@@ -962,6 +988,17 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         .env(E_SESSION, ctx.session.to_string())
         .env(E_DEPTH, (ctx.depth + 1).to_string())
         .env(E_CHAIN, child_chain.join("\n"));
+    // A speculative lineage's abort watch travels to child redo processes:
+    // every blocking primitive below this do-file polls it (SpeculationMP
+    // rule R3's eviction has to reach the whole subtree).
+    if ctx.spec_watch.is_empty() {
+        command.env_remove(crate::waits::ENV_SPEC_WATCH);
+    } else {
+        command.env(
+            crate::waits::ENV_SPEC_WATCH,
+            crate::waits::watch_to_env(&ctx.spec_watch),
+        );
+    }
     // Carry a session-wide interactive decision ('a'/'q' at a prompt) into
     // child redo processes this do-file spawns; --yes already travels in the
     // inherited environment.
@@ -1141,11 +1178,14 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
 
 /// Bring multiple buildable targets up to date, in parallel, through the
 /// task registry (`parallel.rs`). This is the mid-build (`redo-ifchange`)
-/// entry point, so before waiting on any dep the parent's wait edges enter
-/// the shared waits-for graph with the atomic cycle check — and a cycle
-/// here is HARD: a running do-file demanding a target that transitively
-/// waits on it is a real dependency cycle, reported as an error on every
-/// interleaving instead of deadlocking (Speculation_TrueCycle).
+/// entry point: before waiting on any dep, the parent's HARD demand edges
+/// enter the shared waits-for graph via the atomic check-and-insert of
+/// SpeculationMP rule R3 — an all-hard cycle is a real dependency cycle
+/// (error on every interleaving, never a deadlock); a cycle riding a soft
+/// edge makes the SPECULATION yield (`try_demand` evicts it) and the
+/// demand retries. The demand insert also supersedes this process's own
+/// creation edge for the dep, upgrading a speculative task in flight to a
+/// demanded one.
 fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
     if deps.is_empty() {
         return Ok(());
@@ -1155,26 +1195,69 @@ fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
     });
     if let Some(parent) = &ctx.target {
         for d in deps {
-            let outcome = crate::waits::try_wait(&ctx.root, &ctx.conn, ctx.session, parent, d)?;
-            if outcome == crate::waits::WaitOutcome::Cycle {
-                let _ = crate::waits::clear_waiter(&ctx.conn, parent);
-                let path = if ctx.chain.is_empty() {
-                    parent.clone()
-                } else {
-                    ctx.chain.join(" -> ")
-                };
-                bail!("dependency cycle detected: {path} -> {d}");
-            }
+            demand_edge(ctx, parent, d)?;
         }
     }
     let result = crate::parallel::ensure_all(ctx, deps, false);
     // Wait for speculative work this process started before returning to the
-    // do-file; then this ifchange no longer blocks on anything.
+    // do-file; then this ifchange no longer blocks on anything. Safe: every
+    // in-flight task is edge-covered (demand or creation edge), so a
+    // cross-branch cycle is resolved by eviction, never by hanging here.
     crate::parallel::drain(ctx);
     if let Some(parent) = &ctx.target {
         let _ = crate::waits::clear_waiter(&ctx.conn, parent);
     }
     result
+}
+
+/// Insert the hard demand edge `parent -> dep`, looping over evictions
+/// (rule R3). A `RealCycle` is trusted only after dead-owner GC and — if we
+/// just aborted a speculative lineage — after a brief stabilization window:
+/// the aborted lineage's residual hard edges dissolve as its processes
+/// notice the abort and unwind, and the model's atomic abort corresponds to
+/// that whole unwind.
+fn demand_edge(ctx: &Ctx, parent: &str, dep: &str) -> Result<()> {
+    use crate::waits::DemandOutcome;
+    let mut gc_done = false;
+    let mut aborted_lineage = false;
+    let mut stabilize = 0u32;
+    loop {
+        crate::parallel::abort_check(ctx)?;
+        match crate::waits::try_demand(&ctx.root, &ctx.conn, parent, dep)? {
+            DemandOutcome::Inserted => return Ok(()),
+            DemandOutcome::Evicted { aborted_lineage: a } => {
+                jlog(ctx, || {
+                    format!(
+                        "{parent}: demand on {dep} evicted a speculative {} to \
+                         avoid a wait cycle; retrying",
+                        if a { "build (aborted)" } else { "checker wait" }
+                    )
+                });
+                if a {
+                    aborted_lineage = true;
+                }
+            }
+            DemandOutcome::RealCycle => {
+                if !gc_done {
+                    gc_done = true;
+                    crate::waits::gc_dead_edges(&ctx.root, &ctx.conn)?;
+                    continue;
+                }
+                if aborted_lineage && stabilize < 400 {
+                    stabilize += 1;
+                    thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                let _ = crate::waits::clear_waiter(&ctx.conn, parent);
+                let path = if ctx.chain.is_empty() {
+                    parent.to_string()
+                } else {
+                    ctx.chain.join(" -> ")
+                };
+                bail!("dependency cycle detected: {path} -> {dep}");
+            }
+        }
+    }
 }
 
 /// Bring a buildable `target` up to date: build it if out of date, otherwise

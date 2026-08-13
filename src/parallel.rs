@@ -1,57 +1,64 @@
-//! The aggressive parallel ensure engine, implementing the design verified
-//! in `verification/Speculation.tla` (see `verification/README.md` for the
-//! full implementation contract).
+//! The aggressive parallel ensure engine, implementing the machine verified
+//! in `verification/SpeculationMP.tla` (see `verification/README.md` for
+//! the full rules R1–R4).
 //!
 //! The recorded dependency edges in the database are treated as a
-//! parallelization plan: ensuring a target fans out over **all** of its
-//! recorded deps at once, activating each dep's own check speculatively and
-//! in parallel. Checking is unbounded (a thread per active target);
-//! do-file runs are bounded by the jobserver token budget.
+//! parallelization plan: ensuring a target fans out over its recorded deps,
+//! activating each dep's own check speculatively and in parallel. Checking
+//! is unbounded (a thread per active target); do-file runs are bounded by
+//! the jobserver token budget.
 //!
 //! Per-process, per-session, each target is claimed exactly once by a task
-//! in the [`Registry`] (implementation contract item 4 — the cross-process
-//! half of the claim is the per-target kernel lock plus the double-checked
-//! runid re-read in `build::build`). A task's lifecycle mirrors the spec:
+//! in the [`Registry`]; the cross-process half of the claim is the
+//! per-target kernel lock plus the double-checked runid re-read in
+//! `build::build`. A task carries a **grade** (rule R4): *demanded* (a real
+//! `redo-ifchange` or top-level `redo` asked for it) or *speculative*
+//! (spawned from recorded edges on spec). The grade decides how failure is
+//! reported:
 //!
-//! ```text
-//! claimed -> checking -> verified              (up to date)
-//!                     -> building -> built     (do-file ran, committed)
-//!                     -> failed
-//! ```
+//! * a demanded task's failure is a real error (propagated to the caller);
+//! * a speculative task's failure — including an abort — settles as
+//!   [`State::SpecFailed`]: quarantined, reported to no one, and RECLAIMED
+//!   (re-run) if a real demand arrives later.
 //!
-//! Failure severity (the design rule Speculation.tla pins down):
+//! Every wait a task performs is edge-guarded in the shared waits-for graph
+//! (rule R1, `waits.rs`):
 //!
-//! * **Speculative failures are SOFT.** A recorded dep that fails, or a
-//!   cycle among speculative wait edges, only disqualifies the verify path:
-//!   the parent proceeds to run its do-file, whose `redo-ifchange` calls are
-//!   the ground truth. A stale recorded cycle therefore self-heals.
-//! * **Actual failures are HARD.** A dep demanded by a *running* do-file
-//!   failing, or a cycle closed by a mid-build wait edge, fails the target;
-//!   the error propagates up the wait edges (each waiter's `redo-ifchange`
-//!   exits nonzero), releasing tokens on the way.
+//! * spawning a speculative task inserts a **creation edge** `ctx -> dep`
+//!   (ctx = this process's `REDO_TARGET`), atomically refused if it would
+//!   close a cycle — speculation that could deadlock never starts, and the
+//!   refusal just forces the checker onto the rebuild path;
+//! * a checker waiting on a dep task first inserts a **checker edge**;
+//! * both edge kinds are SOFT and may be *evicted* by a hard demand whose
+//!   cycle rides them (rule R3). Waits are therefore interruptible: they
+//!   poll their own edge and, for speculative lineages, the watch list
+//!   (`Ctx::spec_watch`) — a vanished edge means "yield: stop waiting
+//!   (checker) or abort this speculative build (creation)".
 //!
-//! Tokens: a task holds a token (the process's own token, or one from the
-//! shared pool) only while `build::build` runs. A do-file blocked in
-//! `redo-ifchange` still holds its parent's token, but the child redo
-//! process brings a fresh own token — TokenPool.tla's verified `Bound`
-//! shows the compensation is exact, so executing do-file bodies never
-//! exceed J. Token acquisition is a try-acquire retry loop, which satisfies
-//! the eager-scheduling obligation (contract item 7): a ready target plus a
-//! token freed *anywhere* in the process tree eventually launches.
+//! Tokens: a task holds a token only while `build::build` runs. A do-file
+//! blocked in `redo-ifchange` still holds its parent's token, but the child
+//! redo process brings a fresh own token — TokenPool.tla's verified `Bound`
+//! shows the compensation is exact. Token acquisition is a try-acquire
+//! retry loop (eager scheduling: a token freed anywhere in the tree is
+//! observed within one interval).
 
 use crate::build::{self, Ctx};
 use crate::jobserver::TokenSrc;
-use crate::waits::{self, WaitOutcome};
-use anyhow::{anyhow, Result};
+use crate::waits::{self, EdgeRef, SoftOutcome};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// How often blocked waits re-check their edge / watch for eviction.
+const POLL: Duration = Duration::from_millis(50);
+
 /// One claim per target per session, process-wide. Shared by every task
 /// thread through `Ctx` (an `Arc`); settled tasks stay in the map as the
-/// session's "already done" record for this process.
+/// session's "already done" record for this process (a quarantined
+/// speculative failure is replaced on reclaim).
 pub struct Registry {
     tasks: Mutex<HashMap<String, Arc<Task>>>,
     /// Whether the process's implicit own jobserver token is in use.
@@ -74,9 +81,12 @@ impl Default for Registry {
 }
 
 /// A target's claim and settled outcome. Waiters block on the condvar; the
-/// outcome is stable for the rest of the session once set.
+/// outcome is stable once set (a `SpecFailed` entry may be superseded by a
+/// fresh task in the registry on reclaim, but the old task never changes).
 struct Task {
     target: String,
+    /// Grade (rule R4): true once any real demand asked for this target.
+    demanded: AtomicBool,
     state: Mutex<State>,
     cv: Condvar,
 }
@@ -84,28 +94,61 @@ struct Task {
 enum State {
     Running,
     Done,
+    /// A demanded build failed: a real, reported error.
     Failed(String),
+    /// A speculative build failed or was aborted: quarantined (never
+    /// reported), reclaimable by a later real demand.
+    SpecFailed(String),
+}
+
+/// A settled task outcome, as observed by a waiter.
+enum Outcome {
+    Done,
+    Failed(String),
+    SpecFailed(String),
 }
 
 /// Bring one target up to date (build if out of date, else verify).
 /// Blocks until the target settles; idempotent within a session.
 pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
-    let handles = activate(ctx, &[target.to_string()], false)?;
-    wait_task(&handles[0]).map_err(|m| anyhow!(m))
+    ensure_all(ctx, &[target.to_string()], false)
 }
 
-/// Bring a group of targets up to date in parallel, waiting for all of them
-/// (even after a failure, so the process never returns while its builds are
-/// still mutating the tree). `force` is the top-level `redo` semantic:
-/// rebuild unconditionally. Returns the first failure.
+/// Bring a group of demanded targets up to date in parallel, waiting for
+/// all of them (even after a failure, so the process never returns while
+/// its builds are still mutating the tree). `force` is the top-level
+/// `redo` semantic: rebuild unconditionally. Returns the first failure.
+/// A target whose speculative attempt was quarantined is reclaimed and
+/// re-run — a real demand never adopts a speculative failure (rule R4).
 pub fn ensure_all(ctx: &Ctx, targets: &[String], force: bool) -> Result<()> {
-    let handles = activate(ctx, targets, force)?;
+    let handles = activate_demanded(ctx, targets, force)?;
     let mut first_err: Option<String> = None;
-    for h in &handles {
-        if let Err(m) = wait_task(h) {
+    for (i, mut h) in handles.into_iter().enumerate() {
+        let mut reclaims = 0;
+        let res = loop {
+            match wait_task(&h) {
+                Outcome::Done => break Ok(()),
+                Outcome::Failed(m) => break Err(m),
+                Outcome::SpecFailed(m) => {
+                    reclaims += 1;
+                    if reclaims > 2 {
+                        break Err(m);
+                    }
+                    build::jlog(ctx, || {
+                        format!(
+                            "{}: speculative attempt was quarantined ({m}); \
+                             re-running it as a demanded build",
+                            targets[i]
+                        )
+                    });
+                    h = reclaim(ctx, &targets[i], force)?;
+                }
+            }
+        };
+        if let Err(m) = res {
             if first_err.is_none() {
                 build::jlog(ctx, || {
-                    format!("{}: failed; waiting for the rest of the group", h.target)
+                    format!("{}: failed; waiting for the rest of the group", targets[i])
                 });
                 first_err = Some(m);
             }
@@ -117,53 +160,160 @@ pub fn ensure_all(ctx: &Ctx, targets: &[String], force: bool) -> Result<()> {
     }
 }
 
-/// Claim (and start, for new claims) a task per target. All claims are
-/// inserted under one registry lock *before* any thread starts, so a caller
-/// activating several targets — e.g. top-level `redo a b` — can never lose
-/// a claim race against speculation running on behalf of its own first
-/// target.
-fn activate(ctx: &Ctx, targets: &[String], force: bool) -> Result<Vec<Arc<Task>>> {
+/// Claim (and start, for new claims) a DEMANDED task per target. All
+/// claims are inserted under one registry lock *before* any thread starts,
+/// so a caller activating several targets — e.g. top-level `redo a b` —
+/// can never lose a claim race against speculation running on behalf of
+/// its own first target. An existing speculative claim is upgraded in
+/// place (its DB creation edge was already superseded by the caller's
+/// demand edge); an existing quarantined failure is reclaimed.
+fn activate_demanded(ctx: &Ctx, targets: &[String], force: bool) -> Result<Vec<Arc<Task>>> {
     let mut out = Vec::with_capacity(targets.len());
     let mut fresh: Vec<Arc<Task>> = Vec::new();
     {
         let mut map = ctx.tasks.tasks.lock().unwrap();
         for t in targets {
             let key = t.to_ascii_lowercase();
-            if let Some(h) = map.get(&key) {
-                out.push(h.clone());
-            } else {
-                let h = Arc::new(Task {
-                    target: t.clone(),
-                    state: Mutex::new(State::Running),
-                    cv: Condvar::new(),
-                });
-                map.insert(key, h.clone());
-                fresh.push(h.clone());
-                out.push(h);
+            let reuse = match map.get(&key) {
+                Some(h) if matches!(*h.state.lock().unwrap(), State::SpecFailed(_)) => None,
+                Some(h) => {
+                    h.demanded.store(true, Ordering::Release);
+                    Some(h.clone())
+                }
+                None => None,
+            };
+            match reuse {
+                Some(h) => out.push(h),
+                None => {
+                    let h = new_task(t, true);
+                    map.insert(key, h.clone());
+                    fresh.push(h.clone());
+                    out.push(h);
+                }
             }
         }
     }
     for task in fresh {
-        match ctx.child_for_thread() {
-            Ok(cctx) => {
-                let t = task.clone();
-                let spawned = thread::Builder::new()
-                    .name(format!("redo:{}", task.target))
-                    .spawn(move || run_task(cctx, t, force));
-                if let Err(e) = spawned {
-                    settle(&task, Err(anyhow!("could not spawn build thread: {e}")));
-                }
-            }
-            Err(e) => settle(&task, Err(e)),
-        }
+        spawn_task(ctx, task, force, true);
     }
     Ok(out)
 }
 
+/// Reclaim a quarantined speculative failure under a real demand: replace
+/// the settled task with a fresh demanded one (unless another demander
+/// already did).
+fn reclaim(ctx: &Ctx, target: &str, force: bool) -> Result<Arc<Task>> {
+    let (h, fresh) = {
+        let mut map = ctx.tasks.tasks.lock().unwrap();
+        let key = target.to_ascii_lowercase();
+        match map.get(&key) {
+            Some(h) if !matches!(*h.state.lock().unwrap(), State::SpecFailed(_)) => {
+                (h.clone(), false)
+            }
+            _ => {
+                let h = new_task(target, true);
+                map.insert(key, h.clone());
+                (h, true)
+            }
+        }
+    };
+    if fresh {
+        spawn_task(ctx, h.clone(), force, true);
+    }
+    Ok(h)
+}
+
+/// Claim (and start) SPECULATIVE tasks for recorded deps. Each fresh spawn
+/// is guarded by the atomic creation-edge check-and-insert (rules R1/R3):
+/// `None` means the spawn was refused because waiting for it could close a
+/// cycle — the caller treats that as a soft failure (rebuild path). An
+/// already-claimed target is shared as-is (whoever claimed it holds the
+/// covering edge).
+fn activate_spec(ctx: &Ctx, deps: &[String]) -> Result<Vec<Option<Arc<Task>>>> {
+    let mut out: Vec<Option<Arc<Task>>> = Vec::with_capacity(deps.len());
+    let mut fresh: Vec<Arc<Task>> = Vec::new();
+    {
+        let mut map = ctx.tasks.tasks.lock().unwrap();
+        for d in deps {
+            let key = d.to_ascii_lowercase();
+            if let Some(h) = map.get(&key) {
+                out.push(Some(h.clone()));
+                continue;
+            }
+            if let Some(ctxname) = &ctx.target {
+                match waits::try_soft(&ctx.root, &ctx.conn, ctxname, d, waits::EdgeKind::Creation)?
+                {
+                    SoftOutcome::Cycle => {
+                        build::vlog(ctx, || {
+                            format!(
+                                "{d}: NOT speculating: waiting for it here could close \
+                                 a dependency cycle (creation edge refused)"
+                            )
+                        });
+                        out.push(None);
+                        continue;
+                    }
+                    SoftOutcome::Inserted => {}
+                }
+            }
+            let h = new_task(d, false);
+            map.insert(key, h.clone());
+            fresh.push(h.clone());
+            out.push(Some(h));
+        }
+    }
+    for task in fresh {
+        spawn_task(ctx, task, false, false);
+    }
+    Ok(out)
+}
+
+fn new_task(target: &str, demanded: bool) -> Arc<Task> {
+    Arc::new(Task {
+        target: target.to_string(),
+        demanded: AtomicBool::new(demanded),
+        state: Mutex::new(State::Running),
+        cv: Condvar::new(),
+    })
+}
+
+/// Start a task's worker thread. A speculative task gets an EMPTY ancestor
+/// chain — the chain is do-file call-stack lineage and a speculative
+/// traversal is not on that call stack (inheriting it fabricated
+/// `X -> g -> X` cycle errors); real cycles are the waits-for graph's job.
+/// It also extends its watch list with its own creation edge, so every
+/// blocking primitive underneath can observe an abort.
+fn spawn_task(ctx: &Ctx, task: Arc<Task>, force: bool, demanded: bool) {
+    match ctx.child_for_thread() {
+        Ok(mut cctx) => {
+            if !demanded {
+                cctx.chain = Vec::new();
+                if let Some(ctxname) = &ctx.target {
+                    cctx.spec_watch.push(EdgeRef {
+                        owner: waits::owner_id().to_string(),
+                        waiter: ctxname.to_ascii_lowercase(),
+                        dep: task.target.to_ascii_lowercase(),
+                    });
+                }
+            }
+            let t = task.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("redo:{}", task.target))
+                .spawn(move || run_task(cctx, t, force));
+            if let Err(e) = spawned {
+                settle(&task, Err(anyhow!("could not spawn build thread: {e}")));
+            }
+        }
+        Err(e) => settle(&task, Err(e)),
+    }
+}
+
 /// Wait for every task in this process to settle. Called before `ifchange`
 /// and top-level `redo` return, so speculative work never outlives the
-/// process that started it (a killed process's half-done build would be
-/// safe — Uncommitted marker, kernel-released lock — but never desirable).
+/// process that started it. Safe against deadlock because every in-flight
+/// task's blocking primitives are edge-guarded or watch-polling
+/// (SpeculationMP rule R1): a task caught in a cross-branch cycle is
+/// evicted/aborted by the winning demand and settles.
 pub fn drain(ctx: &Ctx) {
     loop {
         let pending: Vec<Arc<Task>> = {
@@ -182,22 +332,86 @@ pub fn drain(ctx: &Ctx) {
     }
 }
 
-fn wait_task(task: &Task) -> Result<(), String> {
+fn wait_task(task: &Task) -> Outcome {
     let mut st = task.state.lock().unwrap();
     loop {
         match &*st {
             State::Running => st = task.cv.wait(st).unwrap(),
-            State::Done => return Ok(()),
-            State::Failed(m) => return Err(m.clone()),
+            State::Done => return Outcome::Done,
+            State::Failed(m) => return Outcome::Failed(m.clone()),
+            State::SpecFailed(m) => return Outcome::SpecFailed(m.clone()),
         }
     }
+}
+
+/// What an edge-guarded, interruptible checker wait observed.
+enum WatchedOutcome {
+    Done,
+    /// The dep failed (hard or quarantined): soft for the checker either
+    /// way — it just takes the rebuild path.
+    SoftFailed(String),
+    /// Our checker edge was evicted by a hard demand (rule R3): stop
+    /// waiting and take the rebuild path.
+    Evicted,
+}
+
+/// Wait on a dep task under our checker edge, polling for eviction and for
+/// lineage abort. Errors only for real faults (I/O) or an aborted
+/// speculative lineage (which fails this task, quarantined by grade).
+fn wait_task_watched(ctx: &Ctx, task: &Task, edge: &EdgeRef) -> Result<WatchedOutcome> {
+    loop {
+        {
+            let mut st = task.state.lock().unwrap();
+            loop {
+                match &*st {
+                    State::Done => return Ok(WatchedOutcome::Done),
+                    State::Failed(m) => return Ok(WatchedOutcome::SoftFailed(m.clone())),
+                    State::SpecFailed(m) => {
+                        return Ok(WatchedOutcome::SoftFailed(m.clone()))
+                    }
+                    State::Running => {}
+                }
+                let (g, timeout) = task.cv.wait_timeout(st, POLL).unwrap();
+                st = g;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+        }
+        // Timed out while the dep still runs: poll our edge and our watch.
+        if !waits::edge_alive(&ctx.conn, edge)? {
+            return Ok(WatchedOutcome::Evicted);
+        }
+        abort_check(ctx)?;
+    }
+}
+
+/// Fail fast if this speculative lineage has been aborted (a watched
+/// creation edge vanished). No-op for non-speculative contexts.
+pub(crate) fn abort_check(ctx: &Ctx) -> Result<()> {
+    if !ctx.spec_watch.is_empty() && waits::watch_dead(&ctx.conn, &ctx.spec_watch)? {
+        bail!(
+            "speculation aborted: a real dependency demand superseded this \
+             speculative build (it will be re-run when genuinely needed)"
+        );
+    }
+    Ok(())
 }
 
 fn settle(task: &Task, res: Result<()>) {
     let mut st = task.state.lock().unwrap();
     *st = match res {
         Ok(()) => State::Done,
-        Err(e) => State::Failed(format!("{e:#}")),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if task.demanded.load(Ordering::Acquire) {
+                State::Failed(msg)
+            } else {
+                // Rule R4: speculative outcomes are quarantined, whatever
+                // the cause (abort, dep failure, do-file error).
+                State::SpecFailed(msg)
+            }
+        }
     };
     task.cv.notify_all();
 }
@@ -226,11 +440,11 @@ fn task_body(ctx: &Ctx, target: &str, force: bool) -> Result<()> {
         });
         return build::mark_verified(ctx, target);
     }
-    // Speculative wait edges leave the graph before the build starts (the
-    // spec's BeginBuild clears cedges): from here on only this target's
-    // do-file — via its redo-ifchange children — inserts edges for it.
+    // Checker wait edges leave the graph before the build starts (the
+    // spec's MoveToBuild): from here on only this target's do-file — via
+    // its redo-ifchange children — inserts edges for it.
     let _ = waits::clear_waiter(&ctx.conn, target);
-    let src = acquire_token(ctx, target);
+    let src = acquire_token(ctx, target)?;
     let r = build::build(ctx, target, force);
     release_token(ctx, src);
     r
@@ -238,10 +452,12 @@ fn task_body(ctx: &Ctx, target: &str, force: bool) -> Result<()> {
 
 /// The checking phase: decide whether `target` must rebuild, speculating
 /// over its RECORDED deps in parallel. Returns `Ok(true)` for the rebuild
-/// path (any evidence of out-of-dateness, any soft failure) and `Ok(false)`
-/// only when every recorded dep settled successfully and every recorded
-/// check passed — the preconditions the spec's `Verify` demands. `Err` is
-/// reserved for real faults (I/O, database), which fail the task.
+/// path (any evidence of out-of-dateness, any soft failure, any refused or
+/// evicted wait) and `Ok(false)` only when every recorded dep settled
+/// successfully, every recorded check passed, and every wait edge survived
+/// unevicted — the preconditions the spec's `Verify` demands. `Err` is
+/// reserved for real faults (I/O, database, lineage abort), which fail the
+/// task.
 fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
     let target_abs = ctx.root.dir.join(target);
     let mut must = false;
@@ -310,14 +526,17 @@ fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
     // parallel — even when this target is already known to need a rebuild.
     // The recorded graph is a parallelization plan: the do-file will most
     // likely redo-ifchange these same deps, and by then they are already
-    // settling. A stale recorded dep costs wasted speculative work; it can
-    // never corrupt build order (Speculation.tla, ActualDepsFirst) because
-    // the do-file's own ifchange calls remain the ground truth.
+    // settling. Each fresh spawn is guarded by the creation-edge cycle
+    // check (SpeculationMP rule R3): a refused spawn is a soft failure —
+    // speculation that could close a cycle never starts.
     let dep_names: Vec<String> = buildable.iter().map(|(d, _)| d.clone()).collect();
-    let handles = activate(ctx, &dep_names, false)?;
+    let handles = activate_spec(ctx, &dep_names)?;
+    if handles.iter().any(|h| h.is_none()) {
+        must = true;
+    }
 
     if must {
-        // Abandon the rest of the checking (the spec's BeginBuild under
+        // Abandon the rest of the checking (the spec's MoveToBuild under
         // mustRebuild): the activated deps keep settling in the background.
         return Ok(true);
     }
@@ -385,13 +604,15 @@ fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
     }
 
     // Wait for the speculatively activated deps. Every wait is preceded by
-    // the atomic cycle-check-and-insert on the shared waits-for graph; a
-    // cycle here is SOFT (stale recorded edges must not invent errors), and
-    // so is a dep that fails — both just force the rebuild path.
+    // the atomic soft check-and-insert of our checker edge; a refusal, an
+    // eviction, and a failed dep are all SOFT (stale recorded edges must
+    // never invent errors) — they just force the rebuild path.
     let mut checked = dofiles.len() + ifcreates.len() + sources.len();
+    let mut inserted: Vec<EdgeRef> = Vec::with_capacity(buildable.len());
     for ((dep, edge_csum), handle) in buildable.iter().zip(&handles) {
-        match waits::try_wait(&ctx.root, &ctx.conn, ctx.session, target, dep)? {
-            WaitOutcome::Cycle => {
+        let handle = handle.as_ref().expect("refusals returned early via `must`");
+        match waits::try_soft(&ctx.root, &ctx.conn, target, dep, waits::EdgeKind::Checker)? {
+            SoftOutcome::Cycle => {
                 build::vlog(ctx, || {
                     format!(
                         "{target}: waiting for recorded dependency {dep} would close \
@@ -401,18 +622,37 @@ fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
                 });
                 return Ok(true);
             }
-            WaitOutcome::Inserted => {}
+            SoftOutcome::Inserted => {}
         }
-        if let Err(e) = wait_task(handle) {
-            build::vlog(ctx, || {
-                format!(
-                    "{target}: OUT OF DATE: recorded dependency {dep} failed to \
-                     build ({e}); rebuilding — its do-file decides whether the \
-                     dependency is still real"
-                )
-            });
-            return Ok(true);
+        let edge = EdgeRef {
+            owner: waits::owner_id().to_string(),
+            waiter: target.to_ascii_lowercase(),
+            dep: dep.to_ascii_lowercase(),
+        };
+        match wait_task_watched(ctx, handle, &edge)? {
+            WatchedOutcome::Done => {}
+            WatchedOutcome::SoftFailed(e) => {
+                build::vlog(ctx, || {
+                    format!(
+                        "{target}: OUT OF DATE: recorded dependency {dep} failed to \
+                         build ({e}); rebuilding — its do-file decides whether the \
+                         dependency is still real"
+                    )
+                });
+                return Ok(true);
+            }
+            WatchedOutcome::Evicted => {
+                build::vlog(ctx, || {
+                    format!(
+                        "{target}: OUT OF DATE: a running do-file's dependency \
+                         demand superseded our speculative wait on {dep} (edge \
+                         evicted); rebuilding"
+                    )
+                });
+                return Ok(true);
+            }
         }
+        inserted.push(edge);
         match build::current_csum(ctx, dep)? {
             None => {
                 build::vlog(ctx, || {
@@ -440,6 +680,22 @@ fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
         checked += 1;
     }
 
+    // Missed-eviction guard: verifying is only sound if every checker edge
+    // we inserted is still standing (an eviction we never observed while
+    // between waits means a demand needed us on the rebuild path — match
+    // the spec's sticky mustRebuild).
+    for e in &inserted {
+        if !waits::edge_alive(&ctx.conn, e)? {
+            build::vlog(ctx, || {
+                format!(
+                    "{target}: OUT OF DATE: a checker wait edge was evicted by a \
+                     real dependency demand; rebuilding instead of verifying"
+                )
+            });
+            return Ok(true);
+        }
+    }
+
     build::vlog(ctx, || {
         format!("{target}: UP TO DATE: all {checked} recorded dependencies are unchanged")
     });
@@ -452,28 +708,30 @@ fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
 /// released by any process in the tree is observed within one interval.
 /// Token acquisition never happens while holding a target lock —
 /// `build::build` locks after the token is held — which is the discipline
-/// TokenPool.tla's deadlock-freedom rests on.
-fn acquire_token(ctx: &Ctx, target: &str) -> TokenSrc {
+/// TokenPool.tla's deadlock-freedom rests on. A speculative lineage checks
+/// its abort watch while it waits.
+fn acquire_token(ctx: &Ctx, target: &str) -> Result<TokenSrc> {
     if !ctx.tasks.own_busy.swap(true, Ordering::AcqRel) {
         build::jlog(ctx, || format!("{target}: build slot: own token"));
-        return TokenSrc::Own;
+        return Ok(TokenSrc::Own);
     }
     if ctx.jobs.try_acquire() {
         build::jlog(ctx, || format!("{target}: build slot: pool token"));
-        return TokenSrc::Pool;
+        return Ok(TokenSrc::Pool);
     }
     build::jlog(ctx, || {
         format!("{target}: no token free; polling until one is released")
     });
     loop {
         thread::sleep(Duration::from_millis(10));
+        abort_check(ctx)?;
         if !ctx.tasks.own_busy.swap(true, Ordering::AcqRel) {
             build::jlog(ctx, || format!("{target}: build slot: own token (after wait)"));
-            return TokenSrc::Own;
+            return Ok(TokenSrc::Own);
         }
         if ctx.jobs.try_acquire() {
             build::jlog(ctx, || format!("{target}: build slot: pool token (after wait)"));
-            return TokenSrc::Pool;
+            return Ok(TokenSrc::Pool);
         }
     }
 }
