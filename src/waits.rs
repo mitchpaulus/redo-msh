@@ -254,6 +254,87 @@ pub fn try_soft(
     Ok(SoftOutcome::Cycle)
 }
 
+/// Batched form of [`try_soft`]: many edges for ONE waiter name, checked
+/// and inserted sequentially inside a single write transaction (each
+/// check sees the batch's earlier inserts, so the semantics equal N
+/// sequential `try_soft` calls — at one transaction's cost instead of N).
+/// A sentinel waiter (`\x01...`, used by top-level processes for creation
+/// edges) is unreachable by construction, so its checks are skipped.
+pub fn try_soft_batch(
+    root: &Root,
+    conn: &Connection,
+    waiter: &str,
+    deps: &[String],
+    kind: EdgeKind,
+) -> Result<Vec<SoftOutcome>> {
+    debug_assert!(kind != EdgeKind::Demand);
+    if deps.is_empty() {
+        return Ok(Vec::new());
+    }
+    ensure_liveness(root)?;
+    let w = waiter.to_ascii_lowercase();
+    let unreachable_waiter = w.starts_with('\u{1}');
+    for attempt in 0..2 {
+        let outcomes = db::write_txn(conn, |c| {
+            let mut out = Vec::with_capacity(deps.len());
+            for dep in deps {
+                let d = dep.to_ascii_lowercase();
+                if !unreachable_waiter && reachable(c, &d, &w, false)? {
+                    out.push(SoftOutcome::Cycle);
+                } else {
+                    c.execute(
+                        "INSERT OR IGNORE INTO waits(waiter, dep, owner, kind)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![w, d, owner_id(), kind as i64],
+                    )?;
+                    out.push(SoftOutcome::Inserted);
+                }
+            }
+            Ok(out)
+        })?;
+        if attempt == 1 || outcomes.iter().all(|o| *o == SoftOutcome::Inserted) {
+            return Ok(outcomes);
+        }
+        // Some cycle may ride a dead process's leftovers: GC once, retry.
+        gc_dead_edges(root, conn)?;
+    }
+    unreachable!("the retry loop always returns on its second pass")
+}
+
+/// Batched happy path of the HARD check-and-insert: every dep whose edge
+/// closes no cycle is inserted in ONE transaction; the ones that do hit a
+/// cycle are reported back for the caller's per-dep [`try_demand`]
+/// eviction loop. Insertions use OR REPLACE (the creation-edge upgrade).
+pub fn try_demand_batch(
+    root: &Root,
+    conn: &Connection,
+    waiter: &str,
+    deps: &[String],
+) -> Result<Vec<bool>> {
+    if deps.is_empty() {
+        return Ok(Vec::new());
+    }
+    ensure_liveness(root)?;
+    let w = waiter.to_ascii_lowercase();
+    db::write_txn(conn, |c| {
+        let mut inserted = Vec::with_capacity(deps.len());
+        for dep in deps {
+            let d = dep.to_ascii_lowercase();
+            if reachable(c, &d, &w, false)? {
+                inserted.push(false);
+            } else {
+                c.execute(
+                    "INSERT OR REPLACE INTO waits(waiter, dep, owner, kind)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![w, d, owner_id(), EdgeKind::Demand as i64],
+                )?;
+                inserted.push(true);
+            }
+        }
+        Ok(inserted)
+    })
+}
+
 /// One atomic step of the HARD check-and-insert for `waiter -> dep` (rule
 /// R3). The caller loops on `Evicted`. Dead-owner GC is the caller's
 /// concern (`gc_dead_edges` on the first `RealCycle`), because only the

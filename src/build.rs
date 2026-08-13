@@ -61,8 +61,25 @@ pub struct Ctx {
     /// dependency demand has superseded this speculation and every blocking
     /// primitive here must abort (quarantined, retryable — rule R4). Empty
     /// for demanded work. Inherited by child redo processes through
-    /// `REDO_SPEC_WATCH`; task threads append their own creation edge.
+    /// `REDO_SPEC_WATCH`; task threads rebuild it from the process base
+    /// plus their own creation edge.
     pub spec_watch: Vec<crate::waits::EdgeRef>,
+    /// Rule R5: the abandon flag of the speculative task this thread runs
+    /// (set by the drain to cancel it). `None` for demanded work and for
+    /// process-level contexts.
+    pub abandon: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The live grade of the task this thread runs (shared with the
+    /// registry entry, flipped true on upgrade). `None` = demanded from
+    /// birth. Speculation may only consume SURPLUS parallelism: while this
+    /// is `Some(false)` and nobody waits on the result (`wanted`), the
+    /// task must not take the process's own token — stealing the last
+    /// token would make the demanded pipeline wait behind speculation,
+    /// resurrecting the hostage latency R5 exists to kill.
+    pub demanded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// True once a checker blocks on this task's result: its settle is now
+    /// on somebody's critical path, so it may use the own token like
+    /// demanded work.
+    pub wanted: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 const E_ROOT: &str = "REDO_ROOT";
@@ -89,11 +106,14 @@ impl Ctx {
             depth: 0,
             chain: Vec::new(),
             target: None,
-            tasks: Arc::new(crate::parallel::Registry::new()),
+            tasks: Arc::new(crate::parallel::Registry::new(Vec::new())),
             jobs: Arc::new(Jobserver::init_top(j.max(1))),
             config,
             log_sink: None, // `redo()` installs the run trace before building.
             spec_watch: Vec::new(),
+            abandon: None,
+            demanded: None,
+            wanted: None,
         };
         jlog(&ctx, || {
             format!(
@@ -130,6 +150,9 @@ impl Ctx {
             .unwrap_or_default();
         let target = std::env::var(E_TARGET).ok().filter(|s| !s.is_empty());
         let config = crate::config::Config::load(&root.dir)?;
+        let env_watch = std::env::var(crate::waits::ENV_SPEC_WATCH)
+            .map(|s| crate::waits::watch_from_env(&s))
+            .unwrap_or_default();
         let ctx = Ctx {
             root,
             conn,
@@ -137,13 +160,14 @@ impl Ctx {
             depth,
             chain,
             target,
-            tasks: Arc::new(crate::parallel::Registry::new()),
+            tasks: Arc::new(crate::parallel::Registry::new(env_watch.clone())),
             jobs: Arc::new(Jobserver::from_env()),
             config,
             log_sink: std::env::var_os(crate::logs::ENV_LOG_PATH).map(PathBuf::from),
-            spec_watch: std::env::var(crate::waits::ENV_SPEC_WATCH)
-                .map(|s| crate::waits::watch_from_env(&s))
-                .unwrap_or_default(),
+            spec_watch: env_watch,
+            abandon: None,
+            demanded: None,
+            wanted: None,
         };
         jlog(&ctx, || match std::env::var(crate::jobserver::ENV) {
             Ok(spec) => format!(
@@ -157,11 +181,16 @@ impl Ctx {
 
     /// A context for a task worker thread: same root/session/chain/target and
     /// shared registry + jobserver, but its own SQLite connection (rusqlite
-    /// connections are not shareable across threads).
+    /// connections are not shareable across threads; idle ones are recycled
+    /// through the registry's pool — `run_task` returns them).
     pub(crate) fn child_for_thread(&self) -> Result<Ctx> {
+        let conn = match self.tasks.take_conn() {
+            Some(c) => c,
+            None => self.root.open_db()?,
+        };
         Ok(Ctx {
             root: self.root.clone(),
-            conn: self.root.open_db()?,
+            conn,
             session: self.session,
             depth: self.depth,
             chain: self.chain.clone(),
@@ -171,8 +200,12 @@ impl Ctx {
             config: self.config.clone(),
             log_sink: self.log_sink.clone(),
             spec_watch: self.spec_watch.clone(),
+            abandon: None,   // `spawn_task` sets these for its task
+            demanded: None,
+            wanted: None,
         })
     }
+
 
 }
 
@@ -797,7 +830,7 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
                 session: ctx.session,
                 target: target_rel.to_string(),
             });
-            if ctx.spec_watch.is_empty() {
+            if ctx.spec_watch.is_empty() && ctx.abandon.is_none() {
                 crate::lock::lock_target(&ctx.root, target_rel)?
             } else {
                 loop {
@@ -1027,9 +1060,38 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         command.env("PATH", path);
     }
 
-    let status = command
-        .status()
+    // Speculative work must stay cancellable even while its do-file runs
+    // (SpeculationMP rules R3/R5): instead of blocking on the child, poll
+    // it alongside the abort/abandon signals and KILL it when the
+    // speculation is no longer wanted. Killing mid-build is crash-safe by
+    // design (Uncommitted marker recorded above, temps swept by the guard
+    // and the startup GC, kernel-released locks); any nested redo
+    // processes watching our lineage unwind via REDO_SPEC_WATCH.
+    let mut child = command
+        .spawn()
         .map_err(|e| interpreter_spawn_error(e, &interp, &df.dofile_abs, child_path.as_deref()))?;
+    let speculative = ctx.abandon.is_some() || !ctx.spec_watch.is_empty();
+    let status = if !speculative {
+        child.wait()?
+    } else {
+        loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            if crate::parallel::speculation_dead(ctx)? {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(g) = done_guard.as_mut() {
+                    g.record_exit(1);
+                }
+                bail!(
+                    "speculation aborted: the build of {target_rel} is no longer \
+                     needed here (it will be re-run when genuinely needed)"
+                );
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+    };
     if let Some(g) = done_guard.as_mut() {
         // Signal death has no code; classify it as failed (exit 1).
         g.record_exit(status.code().unwrap_or(1));
@@ -1194,8 +1256,14 @@ fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
         format!("parallel group of {}: {}", deps.len(), deps.join(", "))
     });
     if let Some(parent) = &ctx.target {
-        for d in deps {
-            demand_edge(ctx, parent, d)?;
+        // Happy path first: every cycle-free demand edge goes in as one
+        // batched transaction; only deps whose edge hit a cycle take the
+        // per-dep evict/retry loop.
+        let inserted = crate::waits::try_demand_batch(&ctx.root, &ctx.conn, parent, deps)?;
+        for (d, ok) in deps.iter().zip(inserted) {
+            if !ok {
+                demand_edge(ctx, parent, d)?;
+            }
         }
     }
     let result = crate::parallel::ensure_all(ctx, deps, false);

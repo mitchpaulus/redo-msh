@@ -63,20 +63,70 @@ pub struct Registry {
     tasks: Mutex<HashMap<String, Arc<Task>>>,
     /// Whether the process's implicit own jobserver token is in use.
     own_busy: AtomicBool,
+    /// The PROCESS-level abort watch (from `REDO_SPEC_WATCH`): the creation
+    /// edges guarding this whole process's speculative lineage. Task threads
+    /// build their watch from this base (never from the spawning thread's
+    /// extended watch — a sibling speculative task's fate is its own).
+    env_watch: Vec<EdgeRef>,
+    /// Parks token waiters. A release wakes exactly ONE waiter
+    /// (`notify_one`); the wait's timeout covers tokens freed elsewhere in
+    /// the process tree, which cannot notify us. Without this, hundreds of
+    /// queued tasks each poll every 10ms for the whole build — a
+    /// super-linear scheduler churn that measured ~40% on wide builds.
+    token_mx: Mutex<()>,
+    token_cv: Condvar,
+    /// Idle read connections recycled between task threads. Tasks are
+    /// mostly short-lived and heavily overlapped in *time* but not in
+    /// *concurrency* (a wide scan peaks at a handful of live tasks), so a
+    /// small pool replaces hundreds of connection opens — each of which
+    /// costs pragmas, page-cache warmup, and file locking.
+    conn_pool: Mutex<Vec<rusqlite::Connection>>,
 }
 
+/// Idle connections kept for reuse; beyond this they are simply closed.
+const CONN_POOL_MAX: usize = 64;
+
 impl Registry {
-    pub fn new() -> Registry {
+    pub fn new(env_watch: Vec<EdgeRef>) -> Registry {
         Registry {
             tasks: Mutex::new(HashMap::new()),
             own_busy: AtomicBool::new(false),
+            env_watch,
+            token_mx: Mutex::new(()),
+            token_cv: Condvar::new(),
+            conn_pool: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take an idle pooled connection, if any.
+    pub(crate) fn take_conn(&self) -> Option<rusqlite::Connection> {
+        self.conn_pool.lock().unwrap().pop()
+    }
+
+    /// Return a connection to the pool for the next task thread.
+    pub(crate) fn return_conn(&self, conn: rusqlite::Connection) {
+        let mut pool = self.conn_pool.lock().unwrap();
+        if pool.len() < CONN_POOL_MAX {
+            pool.push(conn);
         }
     }
 }
 
 impl Default for Registry {
     fn default() -> Self {
-        Self::new()
+        Self::new(Vec::new())
+    }
+}
+
+/// The creation-edge waiter name this process uses for speculative spawns:
+/// its context target, or — for a top-level process, which has no name
+/// anyone could wait on — a per-process sentinel that nothing can reach
+/// (so it can never be on a cycle) but that still gives the speculation an
+/// evictable/abandonable edge.
+fn creation_waiter(ctx: &Ctx) -> String {
+    match &ctx.target {
+        Some(t) => t.clone(),
+        None => format!("\u{1}top:{}", waits::owner_id()),
     }
 }
 
@@ -86,7 +136,15 @@ impl Default for Registry {
 struct Task {
     target: String,
     /// Grade (rule R4): true once any real demand asked for this target.
-    demanded: AtomicBool,
+    /// Shared (via `Ctx::demanded`) with the task's own thread, which uses
+    /// it to gate own-token eligibility.
+    demanded: Arc<AtomicBool>,
+    /// True once a checker blocks on this task's result — it is then on a
+    /// critical path and may use the own token even while speculative.
+    wanted: Arc<AtomicBool>,
+    /// Rule R5: set by the drain to tell a still-speculative task to stop
+    /// (its thread polls this and kills its running do-file, if any).
+    abandon: Arc<AtomicBool>,
     state: Mutex<State>,
     cv: Condvar,
 }
@@ -234,32 +292,48 @@ fn activate_spec(ctx: &Ctx, deps: &[String]) -> Result<Vec<Option<Arc<Task>>>> {
     let mut fresh: Vec<Arc<Task>> = Vec::new();
     {
         let mut map = ctx.tasks.tasks.lock().unwrap();
+        // Partition into already-claimed (shared as-is) and fresh; the
+        // fresh spawns' creation edges go in as ONE batched transaction.
+        let mut fresh_names: Vec<String> = Vec::new();
+        let mut slots: Vec<Option<Arc<Task>>> = Vec::with_capacity(deps.len());
         for d in deps {
-            let key = d.to_ascii_lowercase();
-            if let Some(h) = map.get(&key) {
-                out.push(Some(h.clone()));
-                continue;
-            }
-            if let Some(ctxname) = &ctx.target {
-                match waits::try_soft(&ctx.root, &ctx.conn, ctxname, d, waits::EdgeKind::Creation)?
-                {
-                    SoftOutcome::Cycle => {
-                        build::vlog(ctx, || {
-                            format!(
-                                "{d}: NOT speculating: waiting for it here could close \
-                                 a dependency cycle (creation edge refused)"
-                            )
-                        });
-                        out.push(None);
-                        continue;
-                    }
-                    SoftOutcome::Inserted => {}
+            match map.get(&d.to_ascii_lowercase()) {
+                Some(h) => slots.push(Some(h.clone())),
+                None => {
+                    fresh_names.push(d.clone());
+                    slots.push(None);
                 }
             }
-            let h = new_task(d, false);
-            map.insert(key, h.clone());
-            fresh.push(h.clone());
-            out.push(Some(h));
+        }
+        let waiter = creation_waiter(ctx);
+        let outcomes =
+            waits::try_soft_batch(&ctx.root, &ctx.conn, &waiter, &fresh_names, waits::EdgeKind::Creation)?;
+        let mut oc = outcomes.into_iter();
+        let mut fresh_it = fresh_names.into_iter();
+        for slot in slots {
+            match slot {
+                Some(h) => out.push(Some(h)),
+                None => {
+                    let d = fresh_it.next().expect("one name per empty slot");
+                    match oc.next().expect("one outcome per fresh name") {
+                        SoftOutcome::Cycle => {
+                            build::vlog(ctx, || {
+                                format!(
+                                    "{d}: NOT speculating: waiting for it here could \
+                                     close a dependency cycle (creation edge refused)"
+                                )
+                            });
+                            out.push(None);
+                        }
+                        SoftOutcome::Inserted => {
+                            let h = new_task(&d, false);
+                            map.insert(d.to_ascii_lowercase(), h.clone());
+                            fresh.push(h.clone());
+                            out.push(Some(h));
+                        }
+                    }
+                }
+            }
         }
     }
     for task in fresh {
@@ -271,30 +345,45 @@ fn activate_spec(ctx: &Ctx, deps: &[String]) -> Result<Vec<Option<Arc<Task>>>> {
 fn new_task(target: &str, demanded: bool) -> Arc<Task> {
     Arc::new(Task {
         target: target.to_string(),
-        demanded: AtomicBool::new(demanded),
+        demanded: Arc::new(AtomicBool::new(demanded)),
+        wanted: Arc::new(AtomicBool::new(false)),
+        abandon: Arc::new(AtomicBool::new(false)),
         state: Mutex::new(State::Running),
         cv: Condvar::new(),
     })
 }
 
-/// Start a task's worker thread. A speculative task gets an EMPTY ancestor
-/// chain — the chain is do-file call-stack lineage and a speculative
-/// traversal is not on that call stack (inheriting it fabricated
-/// `X -> g -> X` cycle errors); real cycles are the waits-for graph's job.
-/// It also extends its watch list with its own creation edge, so every
-/// blocking primitive underneath can observe an abort.
+impl Task {
+    fn demanded_flag(&self) -> Arc<AtomicBool> {
+        self.demanded.clone()
+    }
+}
+
+/// Start a task's worker thread. Watches are built from the PROCESS-level
+/// base (`Registry::env_watch`), never the spawning thread's extended
+/// watch: a sibling speculative task's abort must not cascade here. A
+/// speculative task additionally gets:
+/// * an EMPTY ancestor chain — the chain is do-file call-stack lineage and
+///   a speculative traversal is not on that call stack (inheriting it
+///   fabricated `X -> g -> X` cycle errors); real cycles are the
+///   waits-for graph's job;
+/// * its own creation edge appended to its watch, plus the abandon flag
+///   (rule R5), so every blocking primitive underneath — including the
+///   running do-file's poll-wait — can observe an abort or abandonment.
 fn spawn_task(ctx: &Ctx, task: Arc<Task>, force: bool, demanded: bool) {
     match ctx.child_for_thread() {
         Ok(mut cctx) => {
+            cctx.spec_watch = ctx.tasks.env_watch.clone();
+            cctx.demanded = Some(task.demanded_flag());
+            cctx.wanted = Some(task.wanted.clone());
             if !demanded {
                 cctx.chain = Vec::new();
-                if let Some(ctxname) = &ctx.target {
-                    cctx.spec_watch.push(EdgeRef {
-                        owner: waits::owner_id().to_string(),
-                        waiter: ctxname.to_ascii_lowercase(),
-                        dep: task.target.to_ascii_lowercase(),
-                    });
-                }
+                cctx.spec_watch.push(EdgeRef {
+                    owner: waits::owner_id().to_string(),
+                    waiter: creation_waiter(ctx).to_ascii_lowercase(),
+                    dep: task.target.to_ascii_lowercase(),
+                });
+                cctx.abandon = Some(task.abandon.clone());
             }
             let t = task.clone();
             let spawned = thread::Builder::new()
@@ -308,13 +397,18 @@ fn spawn_task(ctx: &Ctx, task: Arc<Task>, force: bool, demanded: bool) {
     }
 }
 
-/// Wait for every task in this process to settle. Called before `ifchange`
-/// and top-level `redo` return, so speculative work never outlives the
-/// process that started it. Safe against deadlock because every in-flight
-/// task's blocking primitives are edge-guarded or watch-polling
-/// (SpeculationMP rule R1): a task caught in a cross-branch cycle is
-/// evicted/aborted by the winning demand and settles.
+/// Wait for every task in this process to settle, ABANDONING the ones
+/// still speculative (SpeculationMP rule R5): speculation that nobody
+/// demanded by the time this process is done cannot hold its return
+/// hostage. Abandonment sets the task's flag and deletes its creation
+/// edge, so the task's own polls — including the poll-wait on a running
+/// do-file, which is killed — unwind it promptly; it settles quarantined
+/// (`SpecFailed`) and is re-run whenever a real demand arrives. Called
+/// before `ifchange` and top-level `redo` return, so speculative work
+/// never outlives the process that started it. Deadlock-free because
+/// every remaining in-flight task is demanded and edge-guarded (rule R1).
 pub fn drain(ctx: &Ctx) {
+    let waiter = creation_waiter(ctx).to_ascii_lowercase();
     loop {
         let pending: Vec<Arc<Task>> = {
             let map = ctx.tasks.tasks.lock().unwrap();
@@ -324,8 +418,39 @@ pub fn drain(ctx: &Ctx) {
                 .collect()
         };
         if pending.is_empty() {
+            // Completed speculative tasks' creation edges (and the top
+            // sentinel's, if any) no longer guard anything.
+            let _ = waits::clear_waiter(&ctx.conn, &waiter);
             return;
         }
+        for t in &pending {
+            if !t.demanded.load(Ordering::Acquire)
+                && !t.abandon.swap(true, Ordering::AcqRel)
+            {
+                build::jlog(ctx, || {
+                    format!(
+                        "{}: abandoning speculative task at drain (undemanded; \
+                         will be re-run when genuinely needed)",
+                        t.target
+                    )
+                });
+                // Delete the creation edge so child processes of this
+                // speculative lineage (watching it via REDO_SPEC_WATCH)
+                // unwind too. Guarded on kind: an upgrade race must not
+                // delete a demand edge.
+                let _ = ctx.conn.execute(
+                    "DELETE FROM waits WHERE owner = ?1 AND waiter = ?2 \
+                     AND dep = ?3 AND kind = 2",
+                    rusqlite::params![
+                        waits::owner_id(),
+                        &waiter,
+                        t.target.to_ascii_lowercase()
+                    ],
+                );
+            }
+        }
+        // Abandoned tasks parked in the token wait wake promptly.
+        ctx.tasks.token_cv.notify_all();
         for t in pending {
             let _ = wait_task(&t);
         }
@@ -359,6 +484,12 @@ enum WatchedOutcome {
 /// lineage abort. Errors only for real faults (I/O) or an aborted
 /// speculative lineage (which fails this task, quarantined by grade).
 fn wait_task_watched(ctx: &Ctx, task: &Task, edge: &EdgeRef) -> Result<WatchedOutcome> {
+    // This task's result is now on our critical path: it may use the own
+    // token even while speculative (and if it was parked waiting for one,
+    // wake it).
+    if !task.wanted.swap(true, Ordering::AcqRel) {
+        ctx.tasks.token_cv.notify_all();
+    }
     loop {
         {
             let mut st = task.state.lock().unwrap();
@@ -386,16 +517,31 @@ fn wait_task_watched(ctx: &Ctx, task: &Task, edge: &EdgeRef) -> Result<WatchedOu
     }
 }
 
-/// Fail fast if this speculative lineage has been aborted (a watched
-/// creation edge vanished). No-op for non-speculative contexts.
+/// Fail fast if this speculative work is dead: its task was abandoned at a
+/// drain (rule R5), or a watched creation edge vanished (evicted by a real
+/// demand, rule R3). No-op for non-speculative contexts.
 pub(crate) fn abort_check(ctx: &Ctx) -> Result<()> {
-    if !ctx.spec_watch.is_empty() && waits::watch_dead(&ctx.conn, &ctx.spec_watch)? {
+    if speculation_dead(ctx)? {
         bail!(
-            "speculation aborted: a real dependency demand superseded this \
-             speculative build (it will be re-run when genuinely needed)"
+            "speculation aborted: no longer needed here (it will be re-run \
+             when genuinely needed)"
         );
     }
     Ok(())
+}
+
+/// The boolean form of [`abort_check`], for callers that need to clean up
+/// (kill a child process) before failing.
+pub(crate) fn speculation_dead(ctx: &Ctx) -> Result<bool> {
+    if let Some(flag) = &ctx.abandon {
+        if flag.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+    }
+    if !ctx.spec_watch.is_empty() && waits::watch_dead(&ctx.conn, &ctx.spec_watch)? {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn settle(task: &Task, res: Result<()>) {
@@ -417,15 +563,28 @@ fn settle(task: &Task, res: Result<()>) {
 }
 
 fn run_task(ctx: Ctx, task: Arc<Task>, force: bool) {
-    let res = task_body(&ctx, &task.target, force);
+    let mut edges_inserted = false;
+    let res = task_body(&ctx, &task.target, force, &mut edges_inserted);
     // A settled target no longer blocks: its wait edges leave the shared
     // graph on every outcome (verified, built, failed), including error
-    // paths that broke out of the checking loop early.
-    let _ = waits::clear_waiter(&ctx.conn, &task.target);
+    // paths that broke out of the checking loop early. Skipped when this
+    // task never inserted any — a DELETE still costs the database write
+    // lock, and most tasks (leaves, forced builds) have no edges.
+    if edges_inserted {
+        let _ = waits::clear_waiter(&ctx.conn, &task.target);
+    }
     settle(&task, res);
+    // Recycle this thread's connection for the next task.
+    let registry = ctx.tasks.clone();
+    registry.return_conn(ctx.conn);
 }
 
-fn task_body(ctx: &Ctx, target: &str, force: bool) -> Result<()> {
+fn task_body(
+    ctx: &Ctx,
+    target: &str,
+    force: bool,
+    edges_inserted: &mut bool,
+) -> Result<()> {
     // Already built or verified this session (possibly by another process).
     if !force && build::file_runid(&ctx.conn, target)? == Some(ctx.session) {
         build::vlog(ctx, || {
@@ -433,7 +592,7 @@ fn task_body(ctx: &Ctx, target: &str, force: bool) -> Result<()> {
         });
         return Ok(());
     }
-    let must_rebuild = force || check_recorded(ctx, target)?;
+    let must_rebuild = force || check_recorded(ctx, target, edges_inserted)?;
     if !must_rebuild {
         build::vlog(ctx, || {
             format!("{target}: up to date; marking it verified for this run")
@@ -443,7 +602,10 @@ fn task_body(ctx: &Ctx, target: &str, force: bool) -> Result<()> {
     // Checker wait edges leave the graph before the build starts (the
     // spec's MoveToBuild): from here on only this target's do-file — via
     // its redo-ifchange children — inserts edges for it.
-    let _ = waits::clear_waiter(&ctx.conn, target);
+    if *edges_inserted {
+        let _ = waits::clear_waiter(&ctx.conn, target);
+        *edges_inserted = false;
+    }
     let src = acquire_token(ctx, target)?;
     let r = build::build(ctx, target, force);
     release_token(ctx, src);
@@ -458,7 +620,7 @@ fn task_body(ctx: &Ctx, target: &str, force: bool) -> Result<()> {
 /// unevicted — the preconditions the spec's `Verify` demands. `Err` is
 /// reserved for real faults (I/O, database, lineage abort), which fail the
 /// task.
-fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
+fn check_recorded(ctx: &Ctx, target: &str, edges_inserted: &mut bool) -> Result<bool> {
     let target_abs = ctx.root.dir.join(target);
     let mut must = false;
 
@@ -603,27 +765,31 @@ fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
         }
     }
 
-    // Wait for the speculatively activated deps. Every wait is preceded by
-    // the atomic soft check-and-insert of our checker edge; a refusal, an
-    // eviction, and a failed dep are all SOFT (stale recorded edges must
-    // never invent errors) — they just force the rebuild path.
+    // Wait for the speculatively activated deps. Every wait is covered by
+    // our checker edges, all inserted up front in ONE batched atomic
+    // check-and-insert (inserting an edge earlier than the wait it guards
+    // is safe — it only declares the wait sooner); a refusal, an eviction,
+    // and a failed dep are all SOFT (stale recorded edges must never
+    // invent errors) — they just force the rebuild path.
     let mut checked = dofiles.len() + ifcreates.len() + sources.len();
+    let dep_only: Vec<String> = buildable.iter().map(|(d, _)| d.clone()).collect();
+    let outcomes =
+        waits::try_soft_batch(&ctx.root, &ctx.conn, target, &dep_only, waits::EdgeKind::Checker)?;
+    *edges_inserted = outcomes.iter().any(|o| *o == SoftOutcome::Inserted);
+    if let Some(pos) = outcomes.iter().position(|o| *o == SoftOutcome::Cycle) {
+        let dep = &dep_only[pos];
+        build::vlog(ctx, || {
+            format!(
+                "{target}: waiting for recorded dependency {dep} would close \
+                 a dependency cycle; treating it as out of date (the do-file \
+                 is the ground truth for whether the cycle is real)"
+            )
+        });
+        return Ok(true);
+    }
     let mut inserted: Vec<EdgeRef> = Vec::with_capacity(buildable.len());
     for ((dep, edge_csum), handle) in buildable.iter().zip(&handles) {
         let handle = handle.as_ref().expect("refusals returned early via `must`");
-        match waits::try_soft(&ctx.root, &ctx.conn, target, dep, waits::EdgeKind::Checker)? {
-            SoftOutcome::Cycle => {
-                build::vlog(ctx, || {
-                    format!(
-                        "{target}: waiting for recorded dependency {dep} would close \
-                         a dependency cycle; treating it as out of date (the do-file \
-                         is the ground truth for whether the cycle is real)"
-                    )
-                });
-                return Ok(true);
-            }
-            SoftOutcome::Inserted => {}
-        }
         let edge = EdgeRef {
             owner: waits::owner_id().to_string(),
             waiter: target.to_ascii_lowercase(),
@@ -711,7 +877,15 @@ fn check_recorded(ctx: &Ctx, target: &str) -> Result<bool> {
 /// TokenPool.tla's deadlock-freedom rests on. A speculative lineage checks
 /// its abort watch while it waits.
 fn acquire_token(ctx: &Ctx, target: &str) -> Result<TokenSrc> {
-    if !ctx.tasks.own_busy.swap(true, Ordering::AcqRel) {
+    // Speculation only consumes SURPLUS parallelism: a still-speculative
+    // task may take pool tokens but never the process's own token (which
+    // the demanded pipeline needs for forward progress). The gate is
+    // re-read every attempt — an upgrade mid-wait unlocks the own token.
+    let own_ok = |ctx: &Ctx| {
+        ctx.demanded.as_ref().map_or(true, |d| d.load(Ordering::Acquire))
+            || ctx.wanted.as_ref().map_or(false, |w| w.load(Ordering::Acquire))
+    };
+    if own_ok(ctx) && !ctx.tasks.own_busy.swap(true, Ordering::AcqRel) {
         build::jlog(ctx, || format!("{target}: build slot: own token"));
         return Ok(TokenSrc::Own);
     }
@@ -722,10 +896,23 @@ fn acquire_token(ctx: &Ctx, target: &str) -> Result<TokenSrc> {
     build::jlog(ctx, || {
         format!("{target}: no token free; polling until one is released")
     });
+    // Park until an in-process release wakes us (one waiter per token) or
+    // the timeout fires. The timeout is deliberately long: in-process
+    // handoff — the hot path — is notification-driven, and the timeout
+    // only covers tokens freed by OTHER processes in the tree (whose pipe
+    // writes cannot notify us) and eviction/abandon signals, both of which
+    // tolerate a poll interval.
     loop {
-        thread::sleep(Duration::from_millis(10));
+        {
+            let g = ctx.tasks.token_mx.lock().unwrap();
+            let _ = ctx
+                .tasks
+                .token_cv
+                .wait_timeout(g, Duration::from_millis(50))
+                .unwrap();
+        }
         abort_check(ctx)?;
-        if !ctx.tasks.own_busy.swap(true, Ordering::AcqRel) {
+        if own_ok(ctx) && !ctx.tasks.own_busy.swap(true, Ordering::AcqRel) {
             build::jlog(ctx, || format!("{target}: build slot: own token (after wait)"));
             return Ok(TokenSrc::Own);
         }
@@ -741,4 +928,5 @@ fn release_token(ctx: &Ctx, src: TokenSrc) {
         TokenSrc::Own => ctx.tasks.own_busy.store(false, Ordering::Release),
         TokenSrc::Pool => ctx.jobs.release(),
     }
+    ctx.tasks.token_cv.notify_one();
 }

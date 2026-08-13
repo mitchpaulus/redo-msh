@@ -109,8 +109,11 @@ fn choose_journal_mode(db_path: &Path) -> JournalMode {
             ),
         }
     }
+    // Cached per process: every task thread opens its own connection, and
+    // the filesystem under one database does not change mid-run.
+    static KIND: std::sync::OnceLock<crate::fsguard::FsKind> = std::sync::OnceLock::new();
     let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    match crate::fsguard::classify(dir) {
+    match KIND.get_or_init(|| crate::fsguard::classify(dir)) {
         crate::fsguard::FsKind::MmapUnsafe => JournalMode::Persist,
         _ => JournalMode::Wal,
     }
@@ -205,9 +208,17 @@ fn sidecar(db_path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn apply_pragmas(conn: &Connection, mode: JournalMode) -> Result<()> {
-    // busy_timeout must be set before journal_mode: the mode change itself
-    // takes locks and can contend with concurrent peers.
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // The busy handler must be set before journal_mode: the mode change
+    // itself takes locks and can contend with concurrent peers. A custom
+    // handler with a short fixed sleep replaces SQLite's default
+    // millisecond-scale backoff: under the parallel engine many short
+    // write transactions collide constantly, and paying 1-25ms per
+    // collision serializes the build far below the database's actual
+    // throughput. 200µs x 300k retries preserves the 60s overall budget.
+    conn.busy_handler(Some(|count| {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        (count as u64) < BUSY_TIMEOUT.as_micros() as u64 / 200
+    }))?;
     match mode {
         JournalMode::Wal => {
             // WAL: many readers + one writer; preferred for the parallel peer

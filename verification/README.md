@@ -188,6 +188,18 @@ kernel build locks, drain-before-return — under corrected rules:
   is reported to no one, and a later real demand *reclaims* and re-runs
   the instance. Demanding a live speculative instance upgrades it
   (creation edge superseded by the demand edge), making it un-abortable.
+- **R5 — drain cancellation.** A draining process may ABANDON any of its
+  still-speculative instances instead of waiting for them, in any state
+  including mid-build (the implementation kills the do-file — crash-safe
+  by the LockSession argument: Uncommitted marker, kernel-released locks,
+  temp GC). Abandonment settles `sfail` like any other speculative
+  outcome. This bounds ifchange return latency: undemanded speculation
+  cannot hold the caller hostage (measured: a stale 5s dep no longer
+  delays an unrelated 0.07s rebuild). The implementation additionally
+  keeps speculation off the process's OWN jobserver token unless a
+  checker is actually waiting on its result — surplus parallelism only —
+  so speculation can never capture the last token ahead of demanded
+  work.
 
 | Config | Scenario | Result |
 |---|---|---|

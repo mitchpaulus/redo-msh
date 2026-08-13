@@ -54,6 +54,13 @@
 (*      edge is superseded by the hard demand edge), making it             *)
 (*      un-abortable.                                                      *)
 (*                                                                         *)
+(*   R5 (drain cancellation): a draining process may ABANDON any of its    *)
+(*      still-speculative instances instead of waiting for them, in any    *)
+(*      state including mid-build (the implementation kills the do-file;   *)
+(*      crash-safety covers it). Abandonment settles "sfail" like any      *)
+(*      other speculative outcome. This bounds ifchange return latency:    *)
+(*      undemanded speculation can never hold the caller hostage.          *)
+(*                                                                         *)
 (* Tokens are out of scope (TokenPool.tla verifies that budget             *)
 (* independently; token waits cannot deadlock by the own-token argument).  *)
 (* One redo-ifchange call per do-file is modeled; sequential calls repeat  *)
@@ -407,6 +414,28 @@ FinishDemands(p, t) ==
     /\ UNCHANGED <<grade, cpend, mustR, apend, edges, lock, mark, clean,
                    builds>>
 
+(* R5 — drain cancellation. A draining builder need not WAIT for its       *)
+(* speculative instances: it may abandon any of them, in any in-flight     *)
+(* state (mid-build included — the implementation kills the speculative    *)
+(* do-file, which is crash-safe by the same argument as LockSession's      *)
+(* crashes: Uncommitted marker, kernel-released locks, temp GC). An        *)
+(* abandoned instance settles "sfail": quarantined and reclaimed by a      *)
+(* real demand exactly like any other speculative failure (R4).           *)
+(* Demanded instances and upgraded (formerly speculative) instances are    *)
+(* never abandoned. This is what bounds an ifchange's return latency:      *)
+(* speculation that nobody demanded by drain time cannot hold the caller   *)
+(* hostage.                                                                *)
+AbandonSpec(p, t, s) ==
+    /\ ist[p][t] = "bdrain" /\ lock[t] = p
+    /\ ist[t][s] \in InFlight /\ grade[t][s] = "spec"
+    /\ ist' = [ist EXCEPT ![t][s] = "sfail"]
+    /\ lock' = IF lock[s] = t THEN [lock EXCEPT ![s] = "-"] ELSE lock
+    /\ apend' = IF lock[s] = t THEN [apend EXCEPT ![s] = {}] ELSE apend
+    /\ cpend' = [cpend EXCEPT ![t][s] = {}]
+    /\ edges' = {e \in DropWaitsBoth(edges, t, s) :
+                   ~(e.own = t /\ e.w = t /\ e.d = s)}
+    /\ UNCHANGED <<grade, mustR, mark, clean, builds>>
+
 (* Drain-then-commit: the child process waits for every instance in ITS    *)
 (* registry to settle — waits visible through the creation and demand      *)
 (* edges (R1) — then the target commits. Speculative failures among the    *)
@@ -442,6 +471,7 @@ PStep(p, t) ==
          \/ BObserveFail(p, t, d) \/ BReclaim(p, t, d)
          \/ \E e \in edges :
               EvictChecker(p, t, d, e) \/ EvictCreation(p, t, d, e)
+    \/ \E s \in Targets : AbandonSpec(p, t, s)
     \/ FinishDemands(p, t) \/ Commit(p, t) \/ BuildFail(p, t)
 
 Quiescent == \A p \in Procs, t \in Targets : ist[p][t] \in SettledSt
