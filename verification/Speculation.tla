@@ -69,6 +69,14 @@ StaleActual == ("a" :> {"c", "d"}) @@ ("b" :> {}) @@ ("c" :> {}) @@ ("d" :> {})
 TwoTargets == {"a", "b"}
 CycleEdges == ("a" :> {"b"}) @@ ("b" :> {"a"})
 NoEdges2 == ("a" :> {}) @@ ("b" :> {})
+\* Reversed: recorded says a needs b; the do-files now say b needs a. The
+\* real graph is acyclic, so under BuildsCanFail = FALSE nothing may fail —
+\* but BWait's cycle check cannot tell hard edges from speculative ones and
+\* hard-fails b through a's cedge (Speculation_Reversed.cfg keeps finding
+\* this in 4 states). This refutes the "stale edges never invent an error"
+\* claim for THIS design; the corrected rules live in SpeculationMP.tla.
+RevRecorded == ("a" :> {"b"}) @@ ("b" :> {})
+RevActual == ("a" :> {}) @@ ("b" :> {"a"})
 RootsA == {"a"}
 RootsAB == {"a", "b"}
 NoTargets == {}
@@ -349,5 +357,9 @@ AllDone == <>(\A t \in Targets : st[t] \in DoneSt)
 
 (* Real dependency cycle: EVERY interleaving reports it as an error. *)
 AllFail == <>(\A t \in Targets : st[t] = "failed")
+
+(* With BuildsCanFail = FALSE and an acyclic Actual graph, no target may
+   ever fail. Speculation_Reversed.cfg shows this design violating it. *)
+NoFailure == \A t \in Targets : st[t] # "failed"
 
 ============================================================================

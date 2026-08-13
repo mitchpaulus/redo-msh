@@ -67,5 +67,18 @@ run Speculation.tla Speculation_Diamond.cfg ok
 run Speculation.tla Speculation_Stale.cfg ok
 run Speculation.tla Speculation_StaleCycle.cfg ok
 run Speculation.tla Speculation_TrueCycle.cfg ok
+# Documented gap in the single-claim design: a reversed dependency edge
+# makes BWait hard-fail through a speculative cedge. Must keep failing
+# until nobody implements this design (SpeculationMP is the replacement).
+run Speculation.tla Speculation_Reversed.cfg violation
+
+# The corrected multi-process machine (per-process registries, kernel
+# locks, drain — with typed edges, creation edges, and soft eviction).
+# This is the design the implementation must be rebuilt to match.
+run SpeculationMP.tla SpeculationMP_Reversed.cfg ok
+run SpeculationMP.tla SpeculationMP_CrossStale.cfg ok
+run SpeculationMP.tla SpeculationMP_TrueCycle.cfg ok
+run SpeculationMP.tla SpeculationMP_Stale.cfg ok
+run SpeculationMP.tla SpeculationMP_SpecAbort.cfg ok
 
 exit "$FAILED"

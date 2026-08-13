@@ -142,6 +142,67 @@ The design rule this spec pins down — **failure severity**:
 | `Speculation_Stale` | dropped dep, kept dep, mid-build discovered dep (5,166 states) | ✅ |
 | `Speculation_StaleCycle` | database records a cycle; do-files fixed | ✅ `AllDone` — self-heals |
 | `Speculation_TrueCycle` | empty database; do-files genuinely cyclic | ✅ `AllFail` — clean error |
+| `Speculation_Reversed` | one edge REVERSED between runs (recorded a→b, actual b→a) | ❌ **kept failing on purpose** |
+
+**The severity rule is refuted by `Speculation_Reversed`.** The configs
+above never contained a dependency whose *direction* flips between runs — a
+routine refactor. Given that shape, `BWait`'s cycle check (which cannot
+tell hard edges from speculative `cedges`) hard-fails `b`'s real build
+through `a`'s speculative edge in 4 states, violating `NoFailure` on an
+acyclic project. "Stale edges can waste work but never invent an error" is
+therefore FALSE for this design. The config is kept failing, like
+`CycleLock_CycleParallel`, to document the hole; the corrected rules are
+specified and verified in `SpeculationMP.tla` below.
+
+### SpeculationMP.tla — the corrected multi-process machine (BUILD THIS)
+
+Speculation.tla also models one **global** claim per target; the shipped
+implementation had one claim per target **per process**, and its two
+unmodeled waits — a second instance of an in-flight target blocking on the
+per-target kernel lock, and `redo-ifchange` draining every task in its
+process before returning — composed into a reproducible deadlock on an
+acyclic project (stale recorded deps crossing two parallel branches; hangs
+10/10 in practice, `SpeculationMP_CrossStale` is that exact shape) and
+into fabricated cycle errors from speculative tasks.
+
+`SpeculationMP.tla` is the first-principles replacement, modeling the real
+execution shape honestly — multiple processes, per-process registries,
+kernel build locks, drain-before-return — under corrected rules:
+
+- **R1 — complete graph.** Every wait-until-settled is an edge in one
+  shared by-name graph, inserted atomically with a cycle check. Spawning a
+  speculative instance inserts a **creation edge** `ctx → s` (ctx = the
+  target whose do-file owns the spawning process), which is what makes the
+  eventual drain wait visible. Kernel-lock waits carry no edge and are
+  *proven* safe: edges are keyed by target name, so waiter → name plus the
+  foreign builder's own name → deps edges bridge the lock wait.
+- **R2 — typed edges.** Checker waits and creation edges are SOFT;
+  running-do-file demands are HARD.
+- **R3 — cycle rules.** Soft insert on any cycle: refuse softly (checker
+  rebuilds; speculation that could close a cycle is never started). Hard
+  insert on an all-hard cycle: real dependency error. Hard insert on a
+  cycle riding a soft edge: the *speculation* yields — evict a soft edge
+  (checker → sticky mustRebuild; creation → the speculative instance
+  aborts, even mid-do-file), then the demand retries.
+- **R4 — quarantine.** A speculative failure or abort settles as `sfail`,
+  is reported to no one, and a later real demand *reclaims* and re-runs
+  the instance. Demanding a live speculative instance upgrades it
+  (creation edge superseded by the demand edge), making it un-abortable.
+
+| Config | Scenario | Result |
+|---|---|---|
+| `SpeculationMP_CrossStale` | the reproduced implementation deadlock shape (crossed stale deps, acyclic reality) | ✅ no deadlock, `NoFailure`, all roots done |
+| `SpeculationMP_Reversed` | the `Speculation_Reversed` shape that refutes the old design | ✅ `NoFailure`, all roots done |
+| `SpeculationMP_TrueCycle` | genuinely cyclic do-files, empty database | ✅ `AllRootsFail` — clean error, never a hang |
+| `SpeculationMP_Stale` | dropped/kept/discovered deps on the multi-process machine | ✅ |
+| `SpeculationMP_SpecAbort` | a mid-do-file speculative build must abort retryably when its demand cycles into its spawning subtree | ✅ (`sfail` reachable via `brun`, verified by trace) |
+
+Invariants on all acyclic configs: `NoFailure`, `ActualDepsFirst`,
+`CommitOnce`, `LockConsistent`; liveness: `EventuallyQuiescent` plus
+`AllRootsDone`/`AllRootsFail`. Tokens stay TokenPool's concern; the model
+also encodes the implementation's real checker behavior of abandoning the
+check *immediately* on must-rebuild evidence, racing ahead of its own
+speculation — the interleavings where the old design died.
 
 Invariants on all configs: `BuildOnce`, `TokenBound` (executing do-files +
 free tokens = J; blocked ones hold no slot), `ActualDepsFirst` (a committed
@@ -246,16 +307,40 @@ fixing this would make the hang easy to hit.
 - Static lock ordering is **not** available: redo discovers dependencies
   during execution, so no global order exists up front.
 
-**Status: fix chosen, verified, and implemented.** `ParallelEnsure.tla`
-specifies the waits-for-graph design and `ParallelEnsure_Cycle` proves it
-turns this exact scenario into a clean error on every interleaving. The
-implementation lives in `src/waits.rs` (the shared graph: atomic
-check-and-insert in one SQLite write transaction, owner-liveness GC) and
-`src/parallel.rs` (the speculative parallel traversal; soft/hard failure
-severity per Speculation.tla). The chain check remains only as a fast path
-for path-local cycles (it produces the readable `a -> b -> a` message);
-`CycleLock_CycleParallel` is kept as-is, deliberately: it documents why the
-chain mechanism alone is insufficient and must keep finding the deadlock.
+**Status: first implementation refuted; corrected design verified and
+implemented** (`src/waits.rs` typed edges + eviction, `src/parallel.rs`
+grades/quarantine/interruptible waits, `src/build.rs` demand loop and
+watch propagation; integration tests `crossed_stale_deps_neither_hang_nor_error`
+and `speculative_build_of_ancestor_dependent_aborts_quarantined` pin the
+two reproduced failure shapes). History of the refutation: the original
+waits-for-graph mechanism shipped in `src/waits.rs`
+and `src/parallel.rs`, but adversarial review found the verified theorems
+did not transfer: Speculation.tla assumes one global claim per target,
+while the implementation claims per process — and the two waits that
+difference creates (a duplicate instance blocking on the kernel target
+lock, and `drain` blocking every ifchange return on all speculative tasks)
+never entered the shared graph. Reproduced consequences on an ACYCLIC
+project: a deterministic deadlock (crossed stale recorded deps, 10/10
+hangs), silently-swallowed fabricated `X -> g -> X` cycle errors from
+speculative tasks inheriting `REDO_CHAIN`, and a 64× ifchange-latency
+hostage effect from draining stale speculative builds. Separately,
+`Speculation_Reversed` refutes the old severity rule inside the spec
+itself. The corrected machine — typed edges, creation edges, soft
+eviction, speculation quarantine — is specified and fully verified in
+`SpeculationMP.tla`, and the implementation now matches it. Two
+implementation-level notes beyond the model: a `RealCycle` verdict seen
+right after this process aborted a speculative lineage is re-checked for a
+bounded window (the model's atomic abort corresponds to the lineage's
+processes unwinding and clearing their residual edges), and eviction
+delivery is by polling (evicted waiters re-check their edge on a 50ms
+interruptible wait; speculative lineages carry their creation edges in
+`REDO_SPEC_WATCH` and every blocking primitive polls the list). The chain
+check's only remaining role is the readable `a -> b -> a` message for
+path-local cycles, and it no longer runs on speculative task threads
+(their chain is empty).
+`CycleLock_CycleParallel` is kept as-is, deliberately: it documents why
+the chain mechanism alone is insufficient and must keep finding the
+deadlock.
 
 ## Abstractions and assumptions
 
