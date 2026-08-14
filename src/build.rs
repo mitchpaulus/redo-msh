@@ -1014,6 +1014,13 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         .arg(&df.arg_base)
         .arg(&tmp3_rel)
         .current_dir(&df.dodir_abs)
+        // Never hand the terminal to a do-file: with stdout/stderr already
+        // redirected, a null stdin leaves no tty on any child stream, so
+        // shells that do job control (mshell probes stdin/stdout/stderr for
+        // a control terminal) skip it entirely. N parallel children sharing
+        // one tty otherwise race each other's tcsetpgrp restores. Prompts
+        // stay in the redo process, which keeps its tty.
+        .stdin(std::process::Stdio::null())
         .stdout(capture_file)
         .stderr(errlog)
         .env(E_ROOT, &ctx.root.dir)
