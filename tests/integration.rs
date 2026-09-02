@@ -1428,3 +1428,68 @@ fn explicit_redo_of_forgotten_target_refuses_then_heals_with_yes() {
     assert!(p.redo(&["use.txt"]).status.success());
     assert_eq!(p.read("use.txt"), "built\n");
 }
+
+/// A builder blocked on another process's lock follows that builder's log
+/// live (as apenwarr's redo-log does on `waiting`), instead of parking until
+/// its own do-file finishes and replaying everything else as one late dump.
+/// `b` grabs `shared`'s lock first; `a` waits on it, and `shared`'s output
+/// must stream under `a`'s block — before `a` resumes — not after `b`.
+#[cfg(unix)]
+#[test]
+fn waiting_on_lock_follows_the_holder_live() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "shared.txt.do",
+        "args :2: out!\n\
+         0 i!\n\
+         (\n\
+         \t@i 5 >= if break end\n\
+         \t\"SHARED\" wle\n\
+         \t['sleep' '0.1']!\n\
+         \t@i 1 + i!\n\
+         ) loop\n\
+         \"s\\n\" @out writeFile\n",
+    );
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n\
+         ['sleep' '0.2']!\n\
+         \"A-1\" wle\n\
+         ['redo-msh' 'ifchange' 'shared.txt']!\n\
+         \"A-2\" wle\n\
+         \"a\\n\" @out writeFile\n",
+    );
+    p.write(
+        "b.txt.do",
+        "args :2: out!\n\
+         \"B-1\" wle\n\
+         ['redo-msh' 'ifchange' 'shared.txt']!\n\
+         \"B-2\" wle\n\
+         \"b\\n\" @out writeFile\n",
+    );
+    p.write("all.do", "['redo-msh' 'ifchange' 'a.txt' 'b.txt']!\n");
+
+    let out = p.redo(&["-j2", "all"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    let err = stderr(&out);
+    let lines: Vec<&str> = err.lines().collect();
+    let pos = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| *l == needle)
+            .unwrap_or_else(|| panic!("missing line {needle:?} in:\n{err}"))
+    };
+    assert_eq!(lines.iter().filter(|l| **l == "SHARED").count(), 5, "{err}");
+    let waiting = pos("    redo  shared.txt  (waiting on lock)");
+    let last_shared = lines.iter().rposition(|l| *l == "SHARED").unwrap();
+    let resumed = pos("  redo  a.txt  (resumed)");
+    assert!(pos("A-1") < waiting, "{err}");
+    assert!(waiting < last_shared, "{err}");
+    assert!(last_shared < resumed, "{err}");
+    assert!(resumed < pos("A-2"), "{err}");
+    assert!(pos("A-2") < pos("B-2"), "{err}");
+    assert!(p.log_files().is_empty(), "logs left behind: {:?}", p.log_files());
+}
