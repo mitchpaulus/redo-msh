@@ -54,6 +54,11 @@ run() { # run <Module.tla> <Config.cfg> <expect: ok|deadlock>
 
 run TokenPool.tla TokenPool_J2.cfg ok
 run TokenPool.tla TokenPool_J3.cfg ok
+# The shipping overwrite prompt releases its token and spins on the pool
+# while holding the target lock: a predicted deadlock. Must keep failing
+# until prompt_overwrite holds its token (the PromptHold config).
+run TokenPool.tla TokenPool_PromptRelease.cfg deadlock
+run TokenPool.tla TokenPool_PromptHold.cfg ok
 run LockSession.tla LockSession.cfg ok
 run CycleLock.tla CycleLock_Diamond.cfg ok
 run CycleLock.tla CycleLock_CycleSerial.cfg ok
@@ -80,5 +85,12 @@ run SpeculationMP.tla SpeculationMP_CrossStale.cfg ok
 run SpeculationMP.tla SpeculationMP_TrueCycle.cfg ok
 run SpeculationMP.tla SpeculationMP_Stale.cfg ok
 run SpeculationMP.tla SpeculationMP_SpecAbort.cfg ok
+# R6: hand-edited targets prompt only on demanded lineages; elsewhere the
+# lineage aborts (sfail) so an upgrade can never report an unasked refusal.
+run SpeculationMP.tla SpeculationMP_HandEditSpec.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditYes.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditNo.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditLinDrop.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditLinKeep.cfg ok
 
 exit "$FAILED"

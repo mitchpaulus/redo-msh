@@ -44,6 +44,26 @@ Verified (J=2/NTop=2/NSub=2 and J=3/NTop=3/NSub=2; the larger config explores
 - **Termination** — the try-acquire discipline is deadlock-free; every job
   completes.
 
+The overwrite prompt (`prompt_overwrite` in `src/build.rs`) is modeled
+through the `PromptMode` constant. A top job may stop before its do-file to
+ask the human, with the target's kernel lock already held, so other jobs
+that need that target block on the lock (holding their tokens) until the
+prompter's build commits. Three modes:
+
+| Config | `PromptMode` | Result |
+|---|---|---|
+| `TokenPool_J2`, `TokenPool_J3` | `none` | ✅ the original model (regression) |
+| `TokenPool_PromptRelease` | `release` — the shipping code: release one token to the pool, spin on the pool to get one back | ❌ **deadlock, predicted and found** (10 steps at J=2): the released token is taken by a job that then blocks on the prompter's lock; every other token ends up there too; the prompter's spin never sees a free token. `run.sh` expects this failure. |
+| `TokenPool_PromptHold` | `hold` — the prompter keeps its token while the human thinks | ✅ conservation, `Bound`, `Termination` (J=2, NTop=3, NSub=2; 73,564 states) |
+
+Two smaller facts the release model also pins down: `Jobserver::release`
+always writes to the *pool*, even when the worker runs on the process's own
+token, so the pool transiently holds J tokens (`TypeOK` is widened for that
+mode); and the reacquired token is then run under the `own` label, which
+`FinishTop` frees as an own token — numerically a wash, so
+`TokenConservation` (stated with the loan term `LentOwn`) still holds. The
+deadlock, not the bookkeeping, is the reason to switch to `hold`.
+
 ### LockSession.tla — per-target build exclusion, with crashes
 
 Models one target, one session, three racing processes running
@@ -200,6 +220,23 @@ kernel build locks, drain-before-return — under corrected rules:
   checker is actually waiting on its result — surplus parallelism only —
   so speculation can never capture the last token ahead of demanded
   work.
+- **R6 — hand-edited targets.** The overwrite guard runs after the kernel
+  lock is won, before the do-file. A target in `HandEdited` is only ever
+  *asked about* (`prompt` state, lock held; `yes` → build, `no` → hard
+  fail) by a demanded instance whose entire lineage — every builder
+  process above it up to top — is demanded. Anywhere else (a speculative
+  instance; a demanded instance inside a speculative lineage; an orphan
+  whose builder is gone) the hand-edit **aborts the lineage**: the nearest
+  speculative or orphaned root and its whole process subtree are killed,
+  R5-style, settling `sfail`. The reason it must abort rather than
+  quietly refuse: a demand can upgrade the lineage *before* the refusal is
+  observed, and the refusal would then be reported as a real failure
+  without the user ever having been asked. With `sfail`, the demand
+  reclaims and re-runs the instance in a demanded lineage, which asks.
+  A hand-edited target is never `clean` (its hash cannot match), so it
+  cannot slip past the guard through `Verify`. Per-prompt answers are
+  nondeterministic (`PromptAnswers`); the session-wide `all`/`quit`
+  answers are refinements of that.
 
 | Config | Scenario | Result |
 |---|---|---|
@@ -208,6 +245,11 @@ kernel build locks, drain-before-return — under corrected rules:
 | `SpeculationMP_TrueCycle` | genuinely cyclic do-files, empty database | ✅ `AllRootsFail` — clean error, never a hang |
 | `SpeculationMP_Stale` | dropped/kept/discovered deps on the multi-process machine | ✅ |
 | `SpeculationMP_SpecAbort` | a mid-do-file speculative build must abort retryably when its demand cycles into its spawning subtree | ✅ (`sfail` reachable via `brun`, verified by trace) |
+| `SpeculationMP_HandEditSpec` | the SpecAbort shape with `s` hand-edited: only ever built speculatively | ✅ `NeverPrompted`, `NoFailure`, root done |
+| `SpeculationMP_HandEditYes` | `c` (recorded+actual dep) and `d` (discovered) hand-edited, answers `yes` | ✅ root done, `PromptOnlyDemanded` |
+| `SpeculationMP_HandEditNo` | same, answers `no` | ✅ `AllRootsFail` — the refusal is a reported hard failure |
+| `SpeculationMP_HandEditLinDrop` | stale `a → b` builds `b` speculatively; `b`'s do-file demands hand-edited `x`; `a` no longer needs `b` | ✅ `NeverPrompted` — the lineage aborts, `a` rebuilds via `c` |
+| `SpeculationMP_HandEditLinKeep` | same, but `a` still needs `b`: the lineage is upgraded before or after the abort | ✅ `x` is asked about exactly on the demanded path, root done |
 
 Invariants on all acyclic configs: `NoFailure`, `ActualDepsFirst`,
 `CommitOnce`, `LockConsistent`; liveness: `EventuallyQuiescent` plus
@@ -364,9 +406,23 @@ deadlock.
   do-file that backgrounds `redo-ifchange` and keeps computing would violate
   TokenPool's `Bound` (but not token conservation).
 - Content hashing / out-of-date evaluation is abstracted to worst case:
-  everything is out of date at session start. `redo-ifcreate`, `redo-always`,
-  force-rebuild, and the overwrite prompt's token release/reacquire are not
-  modeled.
+  everything is out of date at session start. `redo-ifcreate`, `redo-always`
+  and force-rebuild are not modeled. The overwrite prompt is: its token
+  behavior in TokenPool (`PromptMode`), its speculation rule in
+  SpeculationMP (R6). TokenPool models prompts at the top level only (a
+  nested process's prompt is the same shape one level down); the
+  `all`/`quit` answers are not distinguished from per-prompt `yes`/`no`.
+- SpeculationMP's kills do not all cascade alike: R6's `KillSubtree` kills
+  the whole process subtree (as the implementation's abort watch does),
+  while `EvictCreation` and `AbandonSpec` settle only the aborted instance
+  and let its sub-instances settle on their own. The latter is a sound
+  over-approximation when sub-instances *can* settle; a hand-edited target
+  under an orphaned demander would reclaim-loop forever, which is exactly
+  why R6 cascades.
+- A prompt can outlive its demander: a sibling demand's hard failure fails
+  the builder while a question is open (`HandEditNo` reaches this). The
+  implementation's drain-before-return keeps the child process alive until
+  the question is answered; the answer is then stale but harmless.
 - TokenPool models two levels of process nesting; the `Bound` result is
   checked to that depth, conjectured for deeper trees.
 
@@ -395,8 +451,14 @@ deadlock.
   tokens with a try-acquire retry loop, so a token freed anywhere in the
   process tree is observed within one poll interval (the eager-scheduling
   obligation, contract item 7).
-- The overwrite prompt's release/spin-reacquire path in `prompt_overwrite`
-  (a token-conservation risk worth adding to TokenPool).
+- ~~The overwrite prompt's release/spin-reacquire path in
+  `prompt_overwrite`~~ — modeled (`TokenPool_PromptRelease`): it is a
+  deadlock, not just a conservation risk. The implementation must switch
+  to holding the token across the prompt (`TokenPool_PromptHold`), gate
+  prompts on a lineage-demanded check that aborts speculative lineages
+  (R6), and decide interactivity once at the top level — a nested redo's
+  stdin is null and its stderr is a log file, so today's per-process
+  `user_present()` never asks below the top level.
 - Rust-level concurrency (atomics orderings, channel lifetimes) is out of
   TLA+'s scope; `loom` tests of `run_parallel` and the jobserver's
   compare-exchange loop are the complementary tool.

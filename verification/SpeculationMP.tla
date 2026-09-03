@@ -61,6 +61,23 @@
 (*      other speculative outcome. This bounds ifchange return latency:    *)
 (*      undemanded speculation can never hold the caller hostage.          *)
 (*                                                                         *)
+(*   R6 (hand-edited targets): the overwrite guard runs after the kernel   *)
+(*      lock is won and before the do-file. A target the user may own     *)
+(*      (HandEdited) is only ever ASKED ABOUT by an instance whose whole   *)
+(*      lineage -- itself and every builder process above it up to top --  *)
+(*      is demanded ("prompt", lock held, answer yes -> build, no ->       *)
+(*      fail). Anywhere else (a speculative instance, a demanded instance  *)
+(*      inside a speculative lineage, an orphan whose builder is gone)     *)
+(*      the hand-edit ABORTS THE LINEAGE: the nearest speculative root is  *)
+(*      killed with its whole process subtree, exactly like an R5 kill,   *)
+(*      settling "sfail". Why not just refuse (fail) quietly there: a      *)
+(*      demand can upgrade the lineage before the failure is observed,    *)
+(*      and the refusal would then be REPORTED without the user having    *)
+(*      been asked. With sfail, the demand reclaims and re-runs the        *)
+(*      instance in a demanded lineage, which asks. Answers are per prompt *)
+(*      and nondeterministic (PromptAnswers); the session-wide "all" and   *)
+(*      "quit" answers are refinements of that.                            *)
+(*                                                                         *)
 (* Tokens are out of scope (TokenPool.tla verifies that budget             *)
 (* independently; token waits cannot deadlock by the own-token argument).  *)
 (* One redo-ifchange call per do-file is modeled; sequential calls repeat  *)
@@ -70,11 +87,14 @@
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS Targets, Recorded, Actual, Roots, Cleanable, BuildsCanFail
+CONSTANTS Targets, Recorded, Actual, Roots, Cleanable, BuildsCanFail,
+          HandEdited, PromptAnswers
 
 ASSUME /\ Roots \subseteq Targets
        /\ Cleanable \subseteq Targets
        /\ BuildsCanFail \in BOOLEAN
+       /\ HandEdited \subseteq Targets
+       /\ PromptAnswers \subseteq {"yes", "no"}
 
 (* Process identities: "top" (the user's invocation) plus, for every       *)
 (* target, the redo-ifchange child process of that target's do-file. A     *)
@@ -114,6 +134,21 @@ AbortTargets == {"t", "s", "u"}
 AbortRecorded == ("t" :> {}) @@ ("s" :> {}) @@ ("u" :> {"s"})
 AbortActual == ("t" :> {"u"}) @@ ("s" :> {"t"}) @@ ("u" :> {})
 RootsT == {"t"}
+\* R6 instances. A stale recorded edge a -> b speculatively builds b, whose
+\* do-file demands hand-edited x. In LinDrop, a no longer needs b: x must
+\* never be asked about. In LinKeep, a still needs b: the lineage is
+\* upgraded (before or after the abort), and x is asked about exactly on
+\* the demanded path.
+LinTargets == {"a", "b", "c", "x"}
+LinRecorded == ("a" :> {"b"}) @@ ("b" :> {}) @@ ("c" :> {}) @@ ("x" :> {})
+LinDropActual == ("a" :> {"c"}) @@ ("b" :> {"x"}) @@ ("c" :> {}) @@ ("x" :> {})
+LinKeepActual == ("a" :> {"b"}) @@ ("b" :> {"x"}) @@ ("c" :> {}) @@ ("x" :> {})
+HandX == {"x"}
+HandS == {"s"}
+HandCD == {"c", "d"}
+Yes == {"yes"}
+No == {"no"}
+YesNo == {"yes", "no"}
 
 VARIABLES
     ist,     \* [Procs -> [Targets -> IState]] per-process instance states
@@ -132,9 +167,10 @@ vars == <<ist, grade, cpend, mustR, apend, edges, lock, mark, clean, builds>>
 (* Instance lifecycle. "new" = claimed, not yet activated. "lockw" =       *)
 (* blocked on the kernel lock (edge-free by design, R1). "sfail" =         *)
 (* speculative failure/abort: quarantined, reclaimable by a demand.        *)
-IStates == {"none", "new", "checking", "lockw", "brun", "bdrain",
+(* "prompt" = lock held, waiting for the human's overwrite answer (R6).   *)
+IStates == {"none", "new", "checking", "lockw", "prompt", "brun", "bdrain",
             "done", "sfail", "fail"}
-InFlight == {"new", "checking", "lockw", "brun", "bdrain"}
+InFlight == {"new", "checking", "lockw", "prompt", "brun", "bdrain"}
 SettledSt == {"none", "done", "sfail", "fail"}
 
 TypeOK ==
@@ -148,7 +184,7 @@ TypeOK ==
     /\ edges \subseteq [own: Procs, w: Targets, d: Targets, soft: BOOLEAN]
     /\ lock \in [Targets -> Procs \cup {"-"}]
     /\ mark \in [Targets -> {"-", "verified", "committed"}]
-    /\ clean \subseteq Cleanable
+    /\ clean \subseteq Cleanable \ HandEdited
     /\ builds \in [Targets -> Nat]
 
 Init ==
@@ -162,7 +198,8 @@ Init ==
     /\ edges = {}
     /\ lock = [t \in Targets |-> "-"]
     /\ mark = [t \in Targets |-> "-"]
-    /\ clean \in SUBSET Cleanable
+    \* a hand-edited file never matches its recorded hash: never clean
+    /\ clean \in SUBSET (Cleanable \ HandEdited)
     /\ builds = [t \in Targets |-> 0]
 
 ----------------------------------------------------------------------------
@@ -296,15 +333,112 @@ MoveToBuild(p, t) ==
 (* the session mark is re-checked (the double-checked skip that makes      *)
 (* concurrent claims of one target safe).                                  *)
 
+(* --- R6 lineage helpers ------------------------------------------------ *)
+
+(* The builder process of process p's target: process p exists because    *)
+(* some instance of target p is building (and holds p's lock).            *)
+Builder(p) == lock[p]
+
+(* Is every instance on the chain p, Builder(p), ... , top demanded and    *)
+(* alive? Fuel bounds the recursion (lock chains are acyclic: a cyclic     *)
+(* one would be an all-hard cycle, refused by BDemand).                    *)
+RECURSIVE DemLin(_, _)
+DemLin(p, n) ==
+    IF p = Top THEN TRUE
+    ELSE IF n = 0 THEN FALSE
+    ELSE LET q == Builder(p)
+         IN /\ q # "-"
+            /\ ist[q][p] \in {"prompt", "brun", "bdrain"}
+            /\ grade[q][p] = "dem"
+            /\ DemLin(q, n - 1)
+DemLineage(p) == DemLin(p, Cardinality(Procs))
+
+(* The nearest process up the chain that is speculative (its instance in  *)
+(* its builder's registry is spec-graded) or orphaned (its builder is      *)
+(* gone). Only meaningful when ~DemLineage(p).                             *)
+RECURSIVE AbortRootOf(_, _)
+AbortRootOf(p, n) ==
+    IF n = 0 \/ Builder(p) = "-" \/ grade[Builder(p)][p] = "spec" THEN p
+    ELSE AbortRootOf(Builder(p), n - 1)
+AbortRoot(p) == AbortRootOf(p, Cardinality(Procs))
+
+(* Every process whose builder chain passes through r (r included).       *)
+RECURSIVE Subtree(_)
+Subtree(S) ==
+    LET nxt == S \cup {q \in Targets : Builder(q) \in S}
+    IN IF nxt = S THEN S ELSE Subtree(nxt)
+
+(* Kill the process subtree under r: the R5 kill (the do-file dies, and    *)
+(* the abort watch reaches every redo process below it). Every in-flight  *)
+(* instance in those registries settles sfail, every lock they hold is    *)
+(* released (Uncommitted markers keep those targets out of date), and     *)
+(* every edge they own leaves the graph -- as does r's own instance in    *)
+(* its builder's registry, if any, with its waits and creation edge.      *)
+KillSubtree(r) ==
+    LET P == Subtree({r})
+        q == Builder(r)
+        Dead(k, x) == k \in P /\ ist[k][x] \in InFlight
+    IN /\ ist' = [k \in Procs |-> [x \in Targets |->
+                    IF Dead(k, x) \/ (k = q /\ x = r /\ q # "-")
+                      THEN "sfail" ELSE ist[k][x]]]
+       \* locks HELD BY the dead processes, and the lock ON the root that
+       \* its (surviving) builder holds for it
+       /\ lock' = [x \in Targets |->
+                    IF lock[x] \in P \/ x = r THEN "-" ELSE lock[x]]
+       /\ apend' = [x \in Targets |->
+                     IF lock[x] \in P \/ x = r THEN {} ELSE apend[x]]
+       /\ cpend' = [k \in Procs |-> [x \in Targets |->
+                      IF k \in P \/ (k = q /\ x = r) THEN {} ELSE cpend[k][x]]]
+       /\ edges' = {e \in edges :
+                      /\ e.own \notin P
+                      /\ ~(e.own = q /\ e.w = r)
+                      /\ ~(e.own = q /\ e.w = q /\ e.d = r /\ e.soft)}
+
+----------------------------------------------------------------------------
+(* The kernel build lock. Blocking here carries no edge; after acquiring,  *)
+(* the session mark is re-checked (the double-checked skip that makes      *)
+(* concurrent claims of one target safe). Then the overwrite guard (R6):   *)
+(* a hand-edited target in a demanded lineage is asked about; anywhere     *)
+(* else it aborts the lineage instead of building.                         *)
+
 AcquireLock(p, t) ==
     /\ ist[p][t] = "lockw" /\ lock[t] = "-"
     /\ IF mark[t] # "-"
          THEN /\ ist' = [ist EXCEPT ![p][t] = "done"]
-              /\ UNCHANGED <<apend, lock>>
-         ELSE /\ ist' = [ist EXCEPT ![p][t] = "brun"]
+              /\ UNCHANGED <<apend, lock, cpend, edges>>
+         ELSE IF t \notin HandEdited
+         THEN /\ ist' = [ist EXCEPT ![p][t] = "brun"]
               /\ lock' = [lock EXCEPT ![t] = p]
               /\ apend' = [apend EXCEPT ![t] = Actual[t]]
-    /\ UNCHANGED <<grade, cpend, mustR, edges, mark, clean, builds>>
+              /\ UNCHANGED <<cpend, edges>>
+         ELSE IF DemLineage(p) /\ grade[p][t] = "dem"
+         THEN /\ ist' = [ist EXCEPT ![p][t] = "prompt"]
+              /\ lock' = [lock EXCEPT ![t] = p]
+              /\ UNCHANGED <<apend, cpend, edges>>
+         ELSE IF grade[p][t] = "spec"
+         THEN \* a speculative instance simply yields: never asks
+              /\ ist' = [ist EXCEPT ![p][t] = "sfail"]
+              /\ edges' = DropWaits(edges, p, t)
+              /\ UNCHANGED <<apend, lock, cpend>>
+         ELSE \* demanded, but inside a speculative or orphaned lineage
+              KillSubtree(AbortRoot(p))
+    /\ UNCHANGED <<grade, mustR, mark, clean, builds>>
+
+(* The human answers the overwrite question. *)
+PromptYes(p, t) ==
+    /\ "yes" \in PromptAnswers
+    /\ ist[p][t] = "prompt" /\ lock[t] = p
+    /\ ist' = [ist EXCEPT ![p][t] = "brun"]
+    /\ apend' = [apend EXCEPT ![t] = Actual[t]]
+    /\ UNCHANGED <<grade, cpend, mustR, edges, lock, mark, clean, builds>>
+
+PromptNo(p, t) ==
+    /\ "no" \in PromptAnswers
+    /\ ist[p][t] = "prompt" /\ lock[t] = p
+    /\ ist' = [ist EXCEPT ![p][t] = "fail"]
+    /\ lock' = [lock EXCEPT ![t] = "-"]
+    /\ edges' = DropWaitsBoth(edges, p, t)
+    /\ UNCHANGED <<grade, cpend, mustR, apend, mark, clean, builds>>
 
 ----------------------------------------------------------------------------
 (* Building: the do-file runs and demands its ACTUAL deps through its      *)
@@ -466,6 +600,7 @@ PStep(p, t) ==
     \/ \E d \in Recorded[t] :
          CSpawn(p, t, d) \/ CWait(p, t, d) \/ CObserve(p, t, d)
     \/ Verify(p, t) \/ MoveToBuild(p, t) \/ AcquireLock(p, t)
+    \/ PromptYes(p, t) \/ PromptNo(p, t)
     \/ \E d \in Actual[t] :
          \/ BDemand(p, t, d) \/ BObserveDone(p, t, d)
          \/ BObserveFail(p, t, d) \/ BReclaim(p, t, d)
@@ -501,7 +636,24 @@ CommitOnce == \A t \in Targets : builds[t] <= 1
 
 LockConsistent ==
     \A t \in Targets :
-        lock[t] # "-" => ist[lock[t]][t] \in {"brun", "bdrain"}
+        lock[t] # "-" => ist[lock[t]][t] \in {"prompt", "brun", "bdrain"}
+
+(* R6: a prompt is only ever entered by a demanded instance in a demanded  *)
+(* lineage -- enforced at entry by AcquireLock's guard. It is not a state  *)
+(* invariant that the lineage STAYS alive: a sibling demand's hard failure *)
+(* (PromptNo on d while c is prompting, in HandEditNo) fails the builder   *)
+(* above while the question is still open. The implementation's drain-    *)
+(* before-return keeps that child process alive until c settles, so the   *)
+(* open question is still answered -- stale, but harmless: yes builds c   *)
+(* for next time, no fails an instance nobody reads. The configs whose    *)
+(* hand-edited target is never really demanded check NeverPrompted, which *)
+(* is the property with teeth.                                             *)
+PromptOnlyDemanded ==
+    \A p \in Procs, t \in Targets :
+        ist[p][t] = "prompt" => grade[p][t] = "dem"
+
+(* For configs where the hand-edited target is never really demanded. *)
+NeverPrompted == \A p \in Procs, t \in Targets : ist[p][t] # "prompt"
 
 EventuallyQuiescent == <>Quiescent
 
