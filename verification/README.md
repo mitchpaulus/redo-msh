@@ -53,7 +53,7 @@ prompter's build commits. Three modes:
 | Config | `PromptMode` | Result |
 |---|---|---|
 | `TokenPool_J2`, `TokenPool_J3` | `none` | ✅ the original model (regression) |
-| `TokenPool_PromptRelease` | `release` — the shipping code: release one token to the pool, spin on the pool to get one back | ❌ **deadlock, predicted and found** (10 steps at J=2): the released token is taken by a job that then blocks on the prompter's lock; every other token ends up there too; the prompter's spin never sees a free token. `run.sh` expects this failure. |
+| (`release`, not in `run.sh`) | `release` — what `prompt_overwrite` did before 2026-09-03: release one token to the pool, spin on the pool to get one back | ❌ **deadlock** (10 steps at J=2): the released token is taken by a job that then blocks on the prompter's lock; every other token ends up there too; the prompter's spin never sees a free token. Kept in the spec as the record of why the code holds its token. |
 | `TokenPool_PromptHold` | `hold` — the prompter keeps its token while the human thinks | ✅ conservation, `Bound`, `Termination` (J=2, NTop=3, NSub=2; 73,564 states) |
 
 Two smaller facts the release model also pins down: `Jobserver::release`
@@ -452,9 +452,9 @@ deadlock.
   process tree is observed within one poll interval (the eager-scheduling
   obligation, contract item 7).
 - ~~The overwrite prompt's release/spin-reacquire path in
-  `prompt_overwrite`~~ — modeled (`TokenPool_PromptRelease`): it is a
-  deadlock, not just a conservation risk. The implementation must switch
-  to holding the token across the prompt (`TokenPool_PromptHold`), gate
+  `prompt_overwrite`~~ — modeled (TokenPool `PromptMode = "release"`): it
+  was a deadlock, not just a conservation risk; the code now holds its
+  token across the prompt (`TokenPool_PromptHold`). Still to do: gate
   prompts on a lineage-demanded check that aborts speculative lineages
   (R6), and decide interactivity once at the top level — a nested redo's
   stdin is null and its stderr is a log file, so today's per-process

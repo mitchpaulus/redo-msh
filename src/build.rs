@@ -754,39 +754,37 @@ fn open_console() -> std::io::Result<(fs::File, fs::File)> {
 /// Parallel-build protocol: prompts are serialized by a kernel file lock
 /// (`lock_prompt`) so exactly one question owns the terminal at a time, and
 /// the full problem text is written *after* the lock is won so the question
-/// on screen is always the one the next keystroke answers. While blocked on
-/// the human, this worker's jobserver token is returned to the pool — other
-/// jobs keep the build saturated — and taken back before the build resumes.
+/// on screen is always the one the next keystroke answers.
+///
+/// The worker KEEPS its jobserver token while blocked on the human. It is
+/// tempting to lend the token out so the build stays saturated, but this
+/// prompt runs with the target's kernel lock held, and lock waiters keep
+/// their tokens: the lent token is taken by a job that then blocks on this
+/// very lock, and once every token is parked there the prompter can never
+/// get one back (verification/TokenPool_PromptRelease.cfg finds that
+/// deadlock in ten steps at -j2; TokenPool_PromptHold.cfg verifies this
+/// version). One idle slot while the user thinks is the price.
 fn prompt_overwrite(ctx: &Ctx, target_rel: &str, problem: &str) -> Result<Answer> {
     use std::io::{BufRead, Write};
     let (rin, mut wout) = match open_console() {
         Ok(t) => t,
         Err(_) => return Ok(Answer::No),
     };
-    ctx.jobs.release();
-    let answer = (|| {
-        let _serial = crate::lock::lock_prompt(&ctx.root)?;
-        write!(
-            wout,
-            "\nredo-msh: {problem}\n\
-             Overwrite {target_rel}? [y]es / [n]o / [a]ll this run / [q]uit asking: "
-        )?;
-        wout.flush()?;
-        let mut line = String::new();
-        std::io::BufReader::new(rin).read_line(&mut line)?;
-        Ok(match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => Answer::Yes,
-            "a" | "all" => Answer::All,
-            "q" | "quit" => Answer::Quit,
-            _ => Answer::No,
-        })
-    })();
-    // Take a token back before resuming, on the answer and error paths alike.
-    // The pool is try-only, so spin: any running job's completion frees one.
-    while !ctx.jobs.try_acquire() {
-        thread::sleep(std::time::Duration::from_millis(50));
-    }
-    answer
+    let _serial = crate::lock::lock_prompt(&ctx.root)?;
+    write!(
+        wout,
+        "\nredo-msh: {problem}\n\
+         Overwrite {target_rel}? [y]es / [n]o / [a]ll this run / [q]uit asking: "
+    )?;
+    wout.flush()?;
+    let mut line = String::new();
+    std::io::BufReader::new(rin).read_line(&mut line)?;
+    Ok(match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Answer::Yes,
+        "a" | "all" => Answer::All,
+        "q" | "quit" => Answer::Quit,
+        _ => Answer::No,
+    })
 }
 
 // ---- the build operation ----------------------------------------------------

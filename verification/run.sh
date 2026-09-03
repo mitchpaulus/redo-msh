@@ -54,10 +54,8 @@ run() { # run <Module.tla> <Config.cfg> <expect: ok|deadlock>
 
 run TokenPool.tla TokenPool_J2.cfg ok
 run TokenPool.tla TokenPool_J3.cfg ok
-# The shipping overwrite prompt releases its token and spins on the pool
-# while holding the target lock: a predicted deadlock. Must keep failing
-# until prompt_overwrite holds its token (the PromptHold config).
-run TokenPool.tla TokenPool_PromptRelease.cfg deadlock
+# The overwrite prompt holds its token across the question (the release-
+# and-spin alternative deadlocks; see TokenPool.tla's PromptMode).
 run TokenPool.tla TokenPool_PromptHold.cfg ok
 run LockSession.tla LockSession.cfg ok
 run CycleLock.tla CycleLock_Diamond.cfg ok
