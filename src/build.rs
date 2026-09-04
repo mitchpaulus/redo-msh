@@ -101,6 +101,7 @@ impl Ctx {
         let root = Root::discover(&cwd)?;
         let conn = root.open_db()?;
         let session = db::next_runid(&conn)?;
+        db::forget_overwrite_modes(&conn, session)?;
         let config = crate::config::Config::load(&root.dir)?;
         // Decide interactivity here, where the standard streams still say
         // something, and publish it to the whole process tree.
@@ -598,6 +599,13 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
         Some(p) => p,
         None => return Ok(()),
     };
+    // A decision made at an earlier prompt anywhere in the session (another
+    // thread, a child, a sibling process) settles this one.
+    if OVERWRITE_MODE.load(Ordering::Relaxed) == OW_ASK {
+        if let Some(mode) = db::overwrite_mode(&ctx.conn, ctx.session)? {
+            OVERWRITE_MODE.store(mode as u8, Ordering::Relaxed);
+        }
+    }
     if overwrite_all() {
         let why = if std::env::var("REDO_YES").as_deref() == Ok("1") {
             "--yes"
@@ -614,9 +622,13 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
             Answer::Yes => return Ok(()),
             Answer::All => {
                 OVERWRITE_MODE.store(OW_ALL, Ordering::Relaxed);
+                db::set_overwrite_mode(&ctx.conn, ctx.session, OW_ALL as i64)?;
                 return Ok(());
             }
-            Answer::Quit => OVERWRITE_MODE.store(OW_NONE, Ordering::Relaxed),
+            Answer::Quit => {
+                OVERWRITE_MODE.store(OW_NONE, Ordering::Relaxed);
+                db::set_overwrite_mode(&ctx.conn, ctx.session, OW_NONE as i64)?;
+            }
             Answer::No => {}
         }
     }
@@ -676,10 +688,11 @@ fn abort_unless_lineage_demanded(ctx: &Ctx, target_rel: &str) -> Result<()> {
     Ok(())
 }
 
-/// Session-wide overwrite decision, shared by every worker thread in this
-/// process. `all`/`quit` prompt answers land here so later targets stop
-/// asking; the corresponding env vars carry the decision both down from
-/// `--yes` and across to child redo processes.
+/// Session-wide overwrite decision. This atomic is the per-process cache;
+/// the record of truth is the `meta` row `db::overwrite_mode` keyed by
+/// session, which is what reaches a sibling redo process already running
+/// when the answer was given. The env vars carry `--yes` down and give
+/// later-spawned children a head start.
 const OW_ASK: u8 = 0;
 const OW_ALL: u8 = 1;
 const OW_NONE: u8 = 2;
@@ -843,6 +856,16 @@ fn prompt_overwrite(ctx: &Ctx, target_rel: &str, problem: &str) -> Result<Answer
         Err(_) => return Ok(Answer::No),
     };
     let _serial = crate::lock::lock_prompt(&ctx.root)?;
+    // Whoever held the lock before us may have answered for the session.
+    match db::overwrite_mode(&ctx.conn, ctx.session)? {
+        Some(m) if m == OW_ALL as i64 => return Ok(Answer::All),
+        Some(m) if m == OW_NONE as i64 => return Ok(Answer::Quit),
+        _ => {}
+    }
+    // A nested redo runs in a background process group (its do-file's shell
+    // gives every command its own), and a background read of the terminal
+    // stops the process with SIGTTIN. Own the terminal for the question.
+    let _fg = ConsoleForeground::take(&rin);
     write!(
         wout,
         "\nredo-msh: {problem}\n\
@@ -857,6 +880,68 @@ fn prompt_overwrite(ctx: &Ctx, target_rel: &str, problem: &str) -> Result<Answer
         "q" | "quit" => Answer::Quit,
         _ => Answer::No,
     })
+}
+
+/// Foreground ownership of the console for the duration of a prompt: makes
+/// this process group the terminal's foreground group and restores the
+/// previous one on drop. The prompt lock serializes prompters, so the
+/// save/restore pairs never interleave. `SIGTTOU` is ignored while the
+/// switch happens, because `tcsetpgrp` from a background group would itself
+/// stop the process. While a question is open, Ctrl-C reaches the
+/// prompting process rather than the top-level one; its build then fails
+/// upward like any other, which is what the user meant anyway.
+#[cfg(unix)]
+struct ConsoleForeground {
+    fd: std::os::unix::io::RawFd,
+    prev: libc::pid_t,
+    prev_ttou: libc::sighandler_t,
+}
+
+#[cfg(unix)]
+impl ConsoleForeground {
+    fn take(console: &fs::File) -> Option<ConsoleForeground> {
+        use std::os::unix::io::AsRawFd;
+        let fd = console.as_raw_fd();
+        // SAFETY: plain libc calls on a valid fd; signal disposition changes
+        // are process-wide but restored on drop.
+        unsafe {
+            let prev = libc::tcgetpgrp(fd);
+            if prev < 0 {
+                return None;
+            }
+            let mine = libc::getpgrp();
+            if prev == mine {
+                return None;
+            }
+            let prev_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            if libc::tcsetpgrp(fd, mine) != 0 {
+                libc::signal(libc::SIGTTOU, prev_ttou);
+                return None;
+            }
+            Some(ConsoleForeground { fd, prev, prev_ttou })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConsoleForeground {
+    fn drop(&mut self) {
+        // SAFETY: as in `take`.
+        unsafe {
+            libc::tcsetpgrp(self.fd, self.prev);
+            libc::signal(libc::SIGTTOU, self.prev_ttou);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ConsoleForeground;
+
+#[cfg(not(unix))]
+impl ConsoleForeground {
+    fn take(_console: &fs::File) -> Option<ConsoleForeground> {
+        None
+    }
 }
 
 // ---- the build operation ----------------------------------------------------

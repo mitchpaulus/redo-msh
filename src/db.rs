@@ -18,7 +18,7 @@
 //! counter (clock-independent).
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -338,6 +338,41 @@ fn init_schema(conn: &Connection) -> Result<()> {
 /// Atomically increment and return the global build counter. A single
 /// UPDATE…RETURNING statement, so two concurrent processes can never read
 /// each other's increment (the old UPDATE-then-SELECT pair could).
+/// The session-wide overwrite decision ("all" / "quit" at a prompt), shared
+/// by EVERY process of the session through the database — the in-process
+/// atomic and the child environment only reach this process and children
+/// spawned later; a sibling redo already running would otherwise ask the
+/// same question again. Stored in `meta` under `overwrite:<session>`; the
+/// value is the caller's mode code. `None`: no decision yet.
+pub fn overwrite_mode(conn: &Connection, session: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![format!("overwrite:{session}")],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?)
+}
+
+pub fn set_overwrite_mode(conn: &Connection, session: i64, mode: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+        params![format!("overwrite:{session}"), mode],
+    )?;
+    Ok(())
+}
+
+/// Forget every session's overwrite decision but `keep`'s. Called at
+/// top-level session start; a concurrent top-level session that had
+/// answered "all" is at worst asked once more.
+pub fn forget_overwrite_modes(conn: &Connection, keep: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key LIKE 'overwrite:%' AND key <> ?1",
+        params![format!("overwrite:{keep}")],
+    )?;
+    Ok(())
+}
+
 pub fn next_runid(conn: &Connection) -> Result<i64> {
     let runid: i64 = conn.query_row(
         "UPDATE meta SET value = value + 1 WHERE key = 'runid' RETURNING value",
@@ -481,6 +516,16 @@ mod tests {
 
         assert_eq!(next_runid(&conn).unwrap(), 1);
         assert_eq!(next_runid(&conn).unwrap(), 2);
+
+        // Session-wide overwrite decisions: per session, forgotten at the
+        // next session start.
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), None);
+        set_overwrite_mode(&conn, 2, 1).unwrap();
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), Some(1));
+        set_overwrite_mode(&conn, 2, 2).unwrap();
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), Some(2));
+        forget_overwrite_modes(&conn, 3).unwrap();
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), None);
 
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);

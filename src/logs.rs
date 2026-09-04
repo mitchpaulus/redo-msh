@@ -383,6 +383,11 @@ fn follow_run(root: &Root, session: i64) {
         match stack.last_mut().expect("stack is non-empty").reader.next_line() {
             Some(line) => {
                 delay_ms = POLL_DELAY_INITIAL_MS;
+                // An open overwrite prompt owns the screen: hold this line
+                // (and everything after it) until the human has answered.
+                while !crate::lock::probe_prompt_free(root) {
+                    std::thread::sleep(std::time::Duration::from_millis(POLL_DELAY_INITIAL_MS));
+                }
                 match event_parse(&line) {
                     Some(ev) => handle_event(root, session, &mut stack, &mut walk, ev, &line),
                     None => print_user_line(stack.last_mut().expect("stack is non-empty"), &line),
