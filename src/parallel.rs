@@ -1,6 +1,7 @@
 //! The aggressive parallel ensure engine, implementing the machine verified
 //! in `verification/SpeculationMP.tla` (see `verification/README.md` for
-//! the full rules R1–R4).
+//! the full rules R1–R6; R6, the overwrite prompt's lineage rule, lives in
+//! `build::abort_unless_lineage_demanded`).
 //!
 //! The recorded dependency edges in the database are treated as a
 //! parallelization plan: ensuring a target fans out over its recorded deps,
@@ -45,7 +46,7 @@
 use crate::build::{self, Ctx};
 use crate::jobserver::TokenSrc;
 use crate::waits::{self, EdgeRef, SoftOutcome};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -54,6 +55,24 @@ use std::time::Duration;
 
 /// How often blocked waits re-check their edge / watch for eviction.
 const POLL: Duration = Duration::from_millis(50);
+
+/// The error a speculative lineage unwinds with once it is dead (evicted,
+/// abandoned, or aborted from below by rule R6). Typed so that `settle`
+/// can quarantine it WHATEVER the task's grade says by then: the grade is
+/// a racy flag, and a demand that upgrades the task after its lineage was
+/// killed but before it settled would otherwise turn "no longer needed" into
+/// a reported failure. Quarantined, the demand reclaims and re-runs it
+/// (`ensure_all`) — the model's atomic abort-or-upgrade, restored.
+#[derive(Debug)]
+pub struct SpecAborted(pub String);
+
+impl std::fmt::Display for SpecAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "speculation aborted: {}", self.0)
+    }
+}
+
+impl std::error::Error for SpecAborted {}
 
 /// One claim per target per session, process-wide. Shared by every task
 /// thread through `Ctx` (an `Arc`); settled tasks stay in the map as the
@@ -188,6 +207,13 @@ pub fn ensure_all(ctx: &Ctx, targets: &[String], force: bool) -> Result<()> {
                 Outcome::Done => break Ok(()),
                 Outcome::Failed(m) => break Err(m),
                 Outcome::SpecFailed(m) => {
+                    // No point re-running anything if THIS process's own
+                    // lineage is dead: we are unwinding too (rule R6's
+                    // abort-from-below lands here first, in the dying
+                    // process's own ifchange).
+                    if speculation_dead(ctx)? {
+                        break Err(m);
+                    }
                     reclaims += 1;
                     if reclaims > 2 {
                         break Err(m);
@@ -235,6 +261,17 @@ fn activate_demanded(ctx: &Ctx, targets: &[String], force: bool) -> Result<Vec<A
             let reuse = match map.get(&key) {
                 Some(h) if matches!(*h.state.lock().unwrap(), State::SpecFailed(_)) => None,
                 Some(h) => {
+                    // A top-level process inserts no demand edges of its own
+                    // (nothing can wait on it), so nothing has superseded
+                    // this task's sentinel creation edge yet. Upgrade it
+                    // here: rule R6's abort-from-below matches on edge kind,
+                    // and this is what makes abort-or-upgrade atomic at the
+                    // top level too. The sentinel is never anyone's dep, so
+                    // the demand insert cannot see a cycle.
+                    if ctx.target.is_none() && !h.demanded.load(Ordering::Acquire) {
+                        let waiter = creation_waiter(ctx);
+                        let _ = waits::try_demand(&ctx.root, &ctx.conn, &waiter, t)?;
+                    }
                     h.demanded.store(true, Ordering::Release);
                     Some(h.clone())
                 }
@@ -522,10 +559,10 @@ fn wait_task_watched(ctx: &Ctx, task: &Task, edge: &EdgeRef) -> Result<WatchedOu
 /// demand, rule R3). No-op for non-speculative contexts.
 pub(crate) fn abort_check(ctx: &Ctx) -> Result<()> {
     if speculation_dead(ctx)? {
-        bail!(
-            "speculation aborted: no longer needed here (it will be re-run \
-             when genuinely needed)"
-        );
+        return Err(SpecAborted(
+            "no longer needed here (it will be re-run when genuinely needed)".into(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -550,7 +587,8 @@ fn settle(task: &Task, res: Result<()>) {
         Ok(()) => State::Done,
         Err(e) => {
             let msg = format!("{e:#}");
-            if task.demanded.load(Ordering::Acquire) {
+            let aborted = e.downcast_ref::<SpecAborted>().is_some();
+            if task.demanded.load(Ordering::Acquire) && !aborted {
                 State::Failed(msg)
             } else {
                 // Rule R4: speculative outcomes are quarantined, whatever

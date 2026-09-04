@@ -622,6 +622,82 @@ fn manual_edit_protected() {
     assert_eq!(p.read("out.txt"), "src\n");
 }
 
+/// SpeculationMP rule R6: a hand-edited target reached only through
+/// SPECULATION is never asked about (nor refused, which is what "asked"
+/// degrades to without a terminal). `a` recorded a dep on `b`, and `b` on
+/// `x`; `x` is then edited by hand and `a` switches to `c`. Checking `a`
+/// speculatively rebuilds `b`, whose do-file demands `x` inside a
+/// speculative lineage. That lineage must abort quietly; the run succeeds,
+/// the hand edit survives, and no "refusing to overwrite" ever appears in
+/// the output or any log. (Before R6 the guard fired for the speculative
+/// `x` and its refusal surfaced through the verbose trace.) The check runs
+/// inside `top`'s child process so that `-j2` applies: a top-level `redo`
+/// forces its target and does not speculate, and a top-level `ifchange`
+/// takes no `-j`.
+#[cfg(unix)]
+#[test]
+fn hand_edit_under_speculation_aborts_instead_of_asking() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    // x is out of date through a source: a hand edit alone does not make a
+    // target out of date (its own inputs are what redo checks), so the
+    // guard is only reached once x would actually be rebuilt.
+    p.write("s.txt", "1\n");
+    p.write(
+        "x.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 's.txt']!\n\"gen\\n\" @out writeFile\n",
+    );
+    p.write(
+        "b.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'x.txt']!\n\"x.txt\" readFile @out writeFile\n",
+    );
+    // Slow enough that the speculative branch reaches x before a's own
+    // build finishes and the drain abandons it.
+    p.write("c.txt.do", "args :2: out!\n['sleep' '0.5']!\n\"c\\n\" @out writeFile\n");
+    // a's dep is chosen by a source file, so the checker cannot know up front
+    // that a must rebuild, and speculation over the recorded a -> b runs.
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n\
+         ['redo-msh' 'ifchange' 'flag.txt']!\n\
+         \"flag.txt\" readFile dep!\n\
+         ['redo-msh' 'ifchange' @dep]!\n\
+         @dep readFile @out writeFile\n",
+    );
+    p.write(
+        "top.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'a.txt']!\n\"a.txt\" readFile @out writeFile\n",
+    );
+    p.write("flag.txt", "b.txt");
+    let out = p.redo(&["top.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(p.read("top.txt"), "gen\n");
+
+    std::fs::write(p.dir.join("x.txt"), "HAND\n").unwrap();
+    p.write("s.txt", "2\n");
+    p.write("flag.txt", "c.txt");
+    // -j2: the speculative branch needs a token while a's own build holds
+    // one; -v is where a quarantined refusal would surface.
+    let out = p
+        .redo_cmd(&["-j2", "-v", "top.txt"])
+        .env("REDO_KEEP_LOGS", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(p.read("top.txt"), "c\n");
+    assert_eq!(p.read("x.txt"), "HAND\n", "the hand edit must survive");
+    let mut everything = stderr(&out);
+    for f in p.log_files() {
+        everything.push_str(&std::fs::read_to_string(p.dir.join(".redom/logs").join(f)).unwrap_or_default());
+    }
+    assert!(
+        !everything.to_lowercase().contains("refusing to overwrite"),
+        "speculative work asked (or refused) about x:\n{everything}"
+    );
+}
+
 /// `sources`, `targets`, and `ood` introspection.
 #[test]
 fn introspection() {

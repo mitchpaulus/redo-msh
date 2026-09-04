@@ -607,6 +607,8 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
         eprintln!("redo-msh: {problem}\nredo-msh: overwriting {target_rel} ({why})");
         return Ok(());
     }
+    // Rule R6: only work that is DEMANDED, all the way up, may ask.
+    abort_unless_lineage_demanded(ctx, target_rel)?;
     if !overwrite_none() && user_present() {
         match prompt_overwrite(ctx, target_rel, &problem)? {
             Answer::Yes => return Ok(()),
@@ -623,6 +625,55 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
          Refusing to overwrite it. Rerun with --yes to rebuild over it, \
          or move the file out of the way."
     )
+}
+
+/// SpeculationMP rule R6. A hand-edited target must only be asked about by
+/// a demanded task whose whole lineage — every speculative build process
+/// above it — has been demanded too; otherwise the human is interrupted for
+/// work nobody asked for. Anywhere else, the speculation yields: the
+/// nearest still-speculative creation edge above us is deleted (the R3
+/// eviction, done from below), which kills that lineage the way any evicted
+/// speculation dies, and this build unwinds with the typed abort error.
+///
+/// Why abort rather than quietly refuse: a demand can upgrade the lineage
+/// between the refusal and its observation, and the refusal would then be
+/// REPORTED without the user ever having been asked. Quarantined instead,
+/// the demand reclaims and re-runs the target in a demanded lineage, which
+/// asks. The delete matches on edge kind, so it is atomic against exactly
+/// that upgrade: if every watched edge has already been superseded by a
+/// demand edge, the lineage IS demanded and we fall through to the prompt.
+fn abort_unless_lineage_demanded(ctx: &Ctx, target_rel: &str) -> Result<()> {
+    // Nearest creation edge first: this thread's own, then the process's.
+    for e in ctx.spec_watch.iter().rev() {
+        if crate::waits::abort_creation(&ctx.root, &ctx.conn, e)? {
+            jlog(ctx, || {
+                format!(
+                    "{target_rel}: hand-edited; aborting the speculative lineage \
+                     ({} -> {}) instead of asking",
+                    e.waiter, e.dep
+                )
+            });
+            return Err(crate::parallel::SpecAborted(format!(
+                "{target_rel} was modified outside redo; a speculative build must \
+                 not ask about it (it will be asked about when genuinely needed)"
+            ))
+            .into());
+        }
+    }
+    // Every watched edge is gone or upgraded. Gone means someone else killed
+    // the lineage: unwind on that. A top-level speculative task has no
+    // creation edge at all — its live grade is the only signal.
+    crate::parallel::abort_check(ctx)?;
+    if let Some(flag) = &ctx.demanded {
+        if !flag.load(Ordering::Acquire) {
+            return Err(crate::parallel::SpecAborted(format!(
+                "{target_rel} was modified outside redo; a speculative build must \
+                 not ask about it (it will be asked about when genuinely needed)"
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Session-wide overwrite decision, shared by every worker thread in this
@@ -1110,10 +1161,11 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
                 if let Some(g) = done_guard.as_mut() {
                     g.record_exit(1);
                 }
-                bail!(
-                    "speculation aborted: the build of {target_rel} is no longer \
-                     needed here (it will be re-run when genuinely needed)"
-                );
+                return Err(crate::parallel::SpecAborted(format!(
+                    "the build of {target_rel} is no longer needed here (it will \
+                     be re-run when genuinely needed)"
+                ))
+                .into());
             }
             thread::sleep(std::time::Duration::from_millis(25));
         }

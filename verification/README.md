@@ -457,8 +457,18 @@ deadlock.
   token across the prompt (`TokenPool_PromptHold`), and the top-level
   process decides interactivity once (`REDO_INTERACTIVE`) instead of every
   child re-probing streams that are null/log-redirected below the top
-  level. Still to do: gate prompts on a lineage-demanded check that aborts
-  speculative lineages (R6).
+  level, and the guard aborts speculative lineages from below instead of
+  asking (R6, `abort_unless_lineage_demanded`; a typed abort error makes
+  abort-or-upgrade settle as quarantined whatever the racy grade flag says
+  by then).
+- **Hand edits are not, by themselves, out of date.** SpeculationMP assumes
+  a hand-edited target is never `clean` (its hash cannot match). The
+  implementation's checker only looks at a target's *inputs*: a hand-edited
+  `x` whose deps are unchanged verifies as up to date, and only a consumer
+  of `x` notices the content change. The guard is therefore reached only
+  when `x` would be rebuilt for its own reasons. The model's assumption is
+  the stricter one; whether a hand edit should itself dirty the target is
+  an open design question, not a verified property.
 - Rust-level concurrency (atomics orderings, channel lifetimes) is out of
   TLA+'s scope; `loom` tests of `run_parallel` and the jobserver's
   compare-exchange loop are the complementary tool.

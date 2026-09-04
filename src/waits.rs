@@ -419,6 +419,29 @@ pub fn try_demand(
     })
 }
 
+/// Abort a speculative lineage from BELOW (SpeculationMP rule R6): delete
+/// the creation edge guarding it, exactly as an R3 eviction would, so every
+/// blocked primitive watching that edge unwinds. Atomic against the upgrade
+/// that supersedes a creation edge with a demand edge (`try_demand`'s
+/// `INSERT OR REPLACE`): the delete matches on kind, so it returns `false`
+/// — nothing aborted — when the lineage was already demanded, and the
+/// caller must then treat its work as demanded after all.
+pub fn abort_creation(root: &Root, conn: &Connection, e: &EdgeRef) -> Result<bool> {
+    ensure_liveness(root)?;
+    db::write_txn(conn, |c| {
+        let n = c.execute(
+            "DELETE FROM waits WHERE owner = ?1 AND waiter = ?2 AND dep = ?3 AND kind = ?4",
+            params![e.owner, e.waiter, e.dep, EdgeKind::Creation as i64],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        // Same as the eviction: the aborted instance's own waits go too.
+        c.execute("DELETE FROM waits WHERE waiter = ?1", params![e.dep])?;
+        Ok(true)
+    })
+}
+
 /// Whether an edge is still present (any kind — an upgraded creation edge
 /// is alive as a demand edge). The poll behind interruptible waits and
 /// speculation watches.
