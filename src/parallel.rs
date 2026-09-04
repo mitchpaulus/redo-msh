@@ -680,6 +680,30 @@ fn check_recorded(ctx: &Ctx, target: &str, edges_inserted: &mut bool) -> Result<
         });
         must = true;
     }
+    // An up-to-date target is the do-file's output for its current inputs.
+    // Unchanged inputs are only half of that: the output must still be what
+    // redo produced. A file edited since is out of date on its own, which
+    // sends it down the rebuild path, where the overwrite guard asks before
+    // anything is clobbered (SpeculationMP: a hand-edited target is never
+    // `clean`).
+    if let Some(recorded) = &built_csum {
+        if target_abs.exists() {
+            match build::current_csum(ctx, target)? {
+                Some(cur) if &cur != recorded => {
+                    build::vlog(ctx, || {
+                        format!(
+                            "{target}: OUT OF DATE: modified outside redo since it was \
+                             built (hash was {} at last build, is now {})",
+                            build::hash8(Some(recorded)),
+                            build::hash8(Some(&cur))
+                        )
+                    });
+                    must = true;
+                }
+                _ => {}
+            }
+        }
+    }
 
     // Classify the recorded edges. Cheap verdict-only kinds are evaluated
     // inline; content checks are deferred until after the speculative

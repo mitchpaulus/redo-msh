@@ -461,14 +461,13 @@ deadlock.
   asking (R6, `abort_unless_lineage_demanded`; a typed abort error makes
   abort-or-upgrade settle as quarantined whatever the racy grade flag says
   by then).
-- **Hand edits are not, by themselves, out of date.** SpeculationMP assumes
-  a hand-edited target is never `clean` (its hash cannot match). The
-  implementation's checker only looks at a target's *inputs*: a hand-edited
-  `x` whose deps are unchanged verifies as up to date, and only a consumer
-  of `x` notices the content change. The guard is therefore reached only
-  when `x` would be rebuilt for its own reasons. The model's assumption is
-  the stricter one; whether a hand edit should itself dirty the target is
-  an open design question, not a verified property.
+- **A hand-edited target is out of date on its own** (2026-09-04). The
+  checker used to look only at a target's *inputs*, so an edited `x` with
+  unchanged deps verified as up to date and only `x`'s consumers noticed —
+  the tree reported clean while containing an output no do-file produced.
+  Now the output is also checked against the hash redo recorded after
+  building it, in both the live checker and `redo-msh ood`, which is the
+  assumption SpeculationMP makes (`clean ⊆ Cleanable \ HandEdited`).
 - Rust-level concurrency (atomics orderings, channel lifetimes) is out of
   TLA+'s scope; `loom` tests of `run_parallel` and the jobserver's
   compare-exchange loop are the complementary tool.

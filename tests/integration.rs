@@ -612,7 +612,16 @@ fn manual_edit_protected() {
     assert!(p.redo(&["out.txt"]).status.success());
 
     std::fs::write(p.dir.join("out.txt"), "HAND\n").unwrap();
-    // Non-tty, no --yes: must refuse and preserve the edit.
+    // The edit alone makes the target out of date: its inputs are unchanged,
+    // but the output is no longer what its do-file produced.
+    let ood = p.stdout_of(&["ood"]);
+    assert!(ood.lines().any(|l| l == "out.txt"), "ood: {ood:?}");
+    // ...so even an unforced check reaches the overwrite guard. Non-tty, no
+    // --yes: must refuse and preserve the edit.
+    let out = p.redo(&["ifchange", "out.txt"]);
+    assert!(!out.status.success(), "unforced check must reach the guard and refuse");
+    assert_eq!(p.read("out.txt"), "HAND\n");
+    // Forced (named on the command line): same refusal.
     let out = p.redo(&["out.txt"]);
     assert!(!out.status.success());
     assert_eq!(p.read("out.txt"), "HAND\n");

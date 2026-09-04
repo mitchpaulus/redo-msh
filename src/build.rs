@@ -1558,9 +1558,15 @@ pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> 
         };
         format!("{path_rel}: hashed the file contents ({why}): {}", hash8(Some(&csum)))
     });
-    // Refresh the cache for an existing row (do not invent rows here).
+    // Refresh the cache for an existing SOURCE row (do not invent rows here).
+    // A generated target's row is not a cache: its stamp and csum are what
+    // redo produced when it last built the file, and the overwrite guard
+    // compares the file on disk against exactly that. Writing an observed
+    // hash there — as a consumer's check of a hand-edited target would —
+    // rewrites the evidence and lets the next build clobber the edit.
     ctx.conn.execute(
-        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3 WHERE path = ?4",
+        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3
+         WHERE path = ?4 AND dofile IS NULL",
         params![mtime, size, csum, path_rel],
     )?;
     Ok(Some(csum))
@@ -1943,6 +1949,22 @@ fn is_ood_static(root: &Root, conn: &Connection, target: &str) -> Result<bool> {
     if built_csum.is_some() && !target_abs.exists() {
         why("OUT OF DATE: the previously built output is missing from disk");
         return Ok(true);
+    }
+    if let Some(recorded) = &built_csum {
+        if target_abs.exists() {
+            let cur = stamp::stamp_file(&target_abs)?.map(|s| s.csum);
+            if let Some(cur) = cur {
+                if &cur != recorded {
+                    why(&format!(
+                        "OUT OF DATE: modified outside redo since it was built (hash was \
+                         {} at last build, is now {})",
+                        hash8(Some(recorded)),
+                        hash8(Some(&cur))
+                    ));
+                    return Ok(true);
+                }
+            }
+        }
     }
     for (kind, dep, edge_csum) in read_deps(conn, target)? {
         match kind {
