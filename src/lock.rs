@@ -74,6 +74,30 @@ pub fn try_lock_target(root: &Root, target_rel: &str) -> Result<Option<TargetLoc
     }
 }
 
+fn prompt_lock_path(root: &Root) -> PathBuf {
+    root.redo_dir().join("prompt.lock")
+}
+
+/// Whether no prompt is open anywhere in the build tree. The log follower
+/// holds its output while one is: the question is on the console and the
+/// follower's stderr is the same screen. `flock` is per open file
+/// description, so a probe sees a prompt held by another thread of its own
+/// process too. A missing lock file means nobody ever prompted: free.
+pub fn probe_prompt_free(root: &Root) -> bool {
+    let file = match OpenOptions::new().read(true).write(true).open(prompt_lock_path(root)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Held interactive-prompt lock; releases on drop (or when the holder dies).
 pub struct PromptLock {
     _file: File,
@@ -85,7 +109,7 @@ pub struct PromptLock {
 /// `redo` processes, and a prompter that dies mid-question can never wedge
 /// the terminal for everyone else.
 pub fn lock_prompt(root: &Root) -> Result<PromptLock> {
-    let path = root.redo_dir().join("prompt.lock");
+    let path = prompt_lock_path(root);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)

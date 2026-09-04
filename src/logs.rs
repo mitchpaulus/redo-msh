@@ -321,6 +321,21 @@ struct Frame {
     /// A child block was printed since this frame's last own line, so its
     /// next user line is prefixed with a `(resumed)` marker.
     interrupted: bool,
+    /// Entered via a `waiting` event rather than a `do`: the log belongs to a
+    /// build whose `do` event lives elsewhere (an ancestor's log, or another
+    /// run's), so this frame must not delete it — see `Walk::wait_consumed`.
+    waited: bool,
+}
+
+/// Follower state that outlives any one frame.
+#[derive(Default)]
+struct Walk {
+    /// Lower-cased targets already traced; a repeat `do` (shared dep) prints
+    /// its header only.
+    visited: HashSet<String>,
+    /// Targets whose own-session log was replayed through a `waiting` frame
+    /// and is still on disk: deleted when the matching `do` event arrives.
+    wait_consumed: HashSet<String>,
 }
 
 /// Handle to the follower thread; join it after appending the run trace's
@@ -358,8 +373,9 @@ fn follow_run(root: &Root, session: i64) {
         path: run_path,
         reader,
         interrupted: false,
+        waited: false,
     });
-    let mut visited: HashSet<String> = HashSet::new();
+    let mut walk = Walk::default();
     let mut delay_ms = POLL_DELAY_INITIAL_MS;
 
     while !stack.is_empty() {
@@ -367,8 +383,13 @@ fn follow_run(root: &Root, session: i64) {
         match stack.last_mut().expect("stack is non-empty").reader.next_line() {
             Some(line) => {
                 delay_ms = POLL_DELAY_INITIAL_MS;
+                // An open overwrite prompt owns the screen: hold this line
+                // (and everything after it) until the human has answered.
+                while !crate::lock::probe_prompt_free(root) {
+                    std::thread::sleep(std::time::Duration::from_millis(POLL_DELAY_INITIAL_MS));
+                }
                 match event_parse(&line) {
-                    Some(ev) => handle_event(root, session, &mut stack, &mut visited, ev, &line),
+                    Some(ev) => handle_event(root, session, &mut stack, &mut walk, ev, &line),
                     None => print_user_line(stack.last_mut().expect("stack is non-empty"), &line),
                 }
             }
@@ -407,7 +428,7 @@ fn handle_event(
     root: &Root,
     session: i64,
     stack: &mut Vec<Frame>,
-    visited: &mut HashSet<String>,
+    walk: &mut Walk,
     ev: Event,
     raw: &[u8],
 ) {
@@ -417,8 +438,16 @@ fn handle_event(
         Event::Do { target, .. } => {
             print_note(child_indent, &format!("redo  {target}"));
             top.interrupted = true;
-            if !visited.insert(target.to_ascii_lowercase()) {
-                return; // Already traced (shared dep); header alone suffices.
+            let key = target.to_ascii_lowercase();
+            if !walk.visited.insert(key.clone()) {
+                // Already traced (shared dep); header alone suffices. If the
+                // trace came through a `waiting` frame, the log is ours to
+                // delete now: this `do` was appended after the log's creation
+                // (I3) by the build whose `done` that frame already replayed.
+                if walk.wait_consumed.remove(&key) && !keep_logs() {
+                    let _ = fs::remove_file(target_log_path(root, &target));
+                }
+                return;
             }
             if stack.len() > DEPTH_MAX {
                 print_note(child_indent, &format!("redo  {target}  (too deep to trace)"));
@@ -435,7 +464,14 @@ fn handle_event(
                     return;
                 }
             };
-            stack.push(Frame { target, indent: child_indent, path, reader, interrupted: false });
+            stack.push(Frame {
+                target,
+                indent: child_indent,
+                path,
+                reader,
+                interrupted: false,
+                waited: false,
+            });
         }
         Event::Done { session: done_session, exit, target } => {
             if target != top.target {
@@ -452,7 +488,10 @@ fn handle_event(
             let finished = stack.pop().expect("stack is non-empty");
             drop(finished.reader); // Close before deleting (Windows).
             let ours = done_session == session && finished.target != RUN_TARGET;
-            if ours && !keep_logs() {
+            if ours && finished.waited {
+                // Deferred to the `do` event (see `Walk::wait_consumed`).
+                walk.wait_consumed.insert(finished.target.to_ascii_lowercase());
+            } else if ours && !keep_logs() {
                 let _ = fs::remove_file(&finished.path);
             }
             if done_session != session && finished.target != RUN_TARGET {
@@ -464,8 +503,34 @@ fn handle_event(
             mark_interrupted(stack);
         }
         Event::Waiting { target, .. } => {
+            // Follow the builder we are blocked on, as apenwarr's redo-log
+            // does: the holder's `do` event sits in some other log (an
+            // ancestor's, or another run's) that this DFS may not reach for
+            // a long time, and parking here would turn everything built in
+            // the meantime into one late dump. The lock is held (I2), so the
+            // target's log — if the holder has created it yet — is the live
+            // one; a missing log means the holder is still deciding whether
+            // to build, and the note alone has to do.
             print_note(child_indent, &format!("redo  {target}  (waiting on lock)"));
             top.interrupted = true;
+            let key = target.to_ascii_lowercase();
+            if walk.visited.contains(&key) || stack.len() > DEPTH_MAX {
+                return;
+            }
+            let path = target_log_path(root, &target);
+            let reader = match open_with_retry(&path) {
+                Some(r) => r,
+                None => return,
+            };
+            walk.visited.insert(key);
+            stack.push(Frame {
+                target,
+                indent: child_indent,
+                path,
+                reader,
+                interrupted: false,
+                waited: true,
+            });
         }
     }
 }

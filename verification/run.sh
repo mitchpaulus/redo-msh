@@ -54,6 +54,9 @@ run() { # run <Module.tla> <Config.cfg> <expect: ok|deadlock>
 
 run TokenPool.tla TokenPool_J2.cfg ok
 run TokenPool.tla TokenPool_J3.cfg ok
+# The overwrite prompt holds its token across the question (the release-
+# and-spin alternative deadlocks; see TokenPool.tla's PromptMode).
+run TokenPool.tla TokenPool_PromptHold.cfg ok
 run LockSession.tla LockSession.cfg ok
 run CycleLock.tla CycleLock_Diamond.cfg ok
 run CycleLock.tla CycleLock_CycleSerial.cfg ok
@@ -67,5 +70,25 @@ run Speculation.tla Speculation_Diamond.cfg ok
 run Speculation.tla Speculation_Stale.cfg ok
 run Speculation.tla Speculation_StaleCycle.cfg ok
 run Speculation.tla Speculation_TrueCycle.cfg ok
+# Documented gap in the single-claim design: a reversed dependency edge
+# makes BWait hard-fail through a speculative cedge. Must keep failing
+# until nobody implements this design (SpeculationMP is the replacement).
+run Speculation.tla Speculation_Reversed.cfg violation
+
+# The corrected multi-process machine (per-process registries, kernel
+# locks, drain — with typed edges, creation edges, and soft eviction).
+# This is the design the implementation must be rebuilt to match.
+run SpeculationMP.tla SpeculationMP_Reversed.cfg ok
+run SpeculationMP.tla SpeculationMP_CrossStale.cfg ok
+run SpeculationMP.tla SpeculationMP_TrueCycle.cfg ok
+run SpeculationMP.tla SpeculationMP_Stale.cfg ok
+run SpeculationMP.tla SpeculationMP_SpecAbort.cfg ok
+# R6: hand-edited targets prompt only on demanded lineages; elsewhere the
+# lineage aborts (sfail) so an upgrade can never report an unasked refusal.
+run SpeculationMP.tla SpeculationMP_HandEditSpec.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditYes.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditNo.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditLinDrop.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditLinKeep.cfg ok
 
 exit "$FAILED"

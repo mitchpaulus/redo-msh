@@ -14,19 +14,18 @@
 
 use crate::db::{self, DepKind};
 use crate::dofile;
-use crate::jobserver::{Jobserver, TokenSrc};
+use crate::jobserver::Jobserver;
 use crate::root::Root;
 use crate::stamp::{self, Stamp};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,9 +42,11 @@ pub struct Ctx {
     pub chain: Vec<String>,
     /// The target whose do-file we are currently inside (`REDO_TARGET`), if any.
     pub target: Option<String>,
-    /// Targets currently being ensured in *this* process, for in-process cycle
-    /// detection during out-of-date traversal.
-    pub active: RefCell<HashSet<String>>,
+    /// The in-process task registry: one claim per target per session (the
+    /// parallel ensure engine, see `parallel.rs`). Also replaces the old
+    /// per-traversal cycle set — cycles are detected on the shared
+    /// waits-for graph (`waits.rs`).
+    pub tasks: Arc<crate::parallel::Registry>,
     /// Shared concurrency limiter for parallel builds.
     pub jobs: Arc<Jobserver>,
     /// Per-project interpreter configuration (`redo.toml`).
@@ -55,12 +56,39 @@ pub struct Ctx {
     /// (top-level `redo`). `None` (standalone `redo-ifchange` outside any
     /// build) disables log capture entirely — do-files inherit stderr.
     pub log_sink: Option<PathBuf>,
+    /// The creation edges guarding this SPECULATIVE lineage (SpeculationMP
+    /// rule R3): if any of them disappears from the waits graph, a real
+    /// dependency demand has superseded this speculation and every blocking
+    /// primitive here must abort (quarantined, retryable — rule R4). Empty
+    /// for demanded work. Inherited by child redo processes through
+    /// `REDO_SPEC_WATCH`; task threads rebuild it from the process base
+    /// plus their own creation edge.
+    pub spec_watch: Vec<crate::waits::EdgeRef>,
+    /// Rule R5: the abandon flag of the speculative task this thread runs
+    /// (set by the drain to cancel it). `None` for demanded work and for
+    /// process-level contexts.
+    pub abandon: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The live grade of the task this thread runs (shared with the
+    /// registry entry, flipped true on upgrade). `None` = demanded from
+    /// birth. Speculation may only consume SURPLUS parallelism: while this
+    /// is `Some(false)` and nobody waits on the result (`wanted`), the
+    /// task must not take the process's own token — stealing the last
+    /// token would make the demanded pipeline wait behind speculation,
+    /// resurrecting the hostage latency R5 exists to kill.
+    pub demanded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// True once a checker blocks on this task's result: its settle is now
+    /// on somebody's critical path, so it may use the own token like
+    /// demanded work.
+    pub wanted: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 const E_ROOT: &str = "REDO_ROOT";
 const E_TARGET: &str = "REDO_TARGET";
 const E_SESSION: &str = "REDO_SESSION";
 const E_DEPTH: &str = "REDO_DEPTH";
+/// Whether a human is attached to this build, decided ONCE by the top-level
+/// process and inherited by every child (see `user_present`).
+const E_INTERACTIVE: &str = "REDO_INTERACTIVE";
 const E_CHAIN: &str = "REDO_CHAIN";
 
 impl Ctx {
@@ -73,7 +101,13 @@ impl Ctx {
         let root = Root::discover(&cwd)?;
         let conn = root.open_db()?;
         let session = db::next_runid(&conn)?;
+        db::forget_overwrite_modes(&conn, session)?;
         let config = crate::config::Config::load(&root.dir)?;
+        // Decide interactivity here, where the standard streams still say
+        // something, and publish it to the whole process tree.
+        if std::env::var_os(E_INTERACTIVE).is_none() {
+            std::env::set_var(E_INTERACTIVE, if probe_user_present() { "1" } else { "0" });
+        }
         let ctx = Ctx {
             root,
             conn,
@@ -81,10 +115,14 @@ impl Ctx {
             depth: 0,
             chain: Vec::new(),
             target: None,
-            active: RefCell::new(HashSet::new()),
+            tasks: Arc::new(crate::parallel::Registry::new(Vec::new())),
             jobs: Arc::new(Jobserver::init_top(j.max(1))),
             config,
             log_sink: None, // `redo()` installs the run trace before building.
+            spec_watch: Vec::new(),
+            abandon: None,
+            demanded: None,
+            wanted: None,
         };
         jlog(&ctx, || {
             format!(
@@ -121,6 +159,9 @@ impl Ctx {
             .unwrap_or_default();
         let target = std::env::var(E_TARGET).ok().filter(|s| !s.is_empty());
         let config = crate::config::Config::load(&root.dir)?;
+        let env_watch = std::env::var(crate::waits::ENV_SPEC_WATCH)
+            .map(|s| crate::waits::watch_from_env(&s))
+            .unwrap_or_default();
         let ctx = Ctx {
             root,
             conn,
@@ -128,10 +169,14 @@ impl Ctx {
             depth,
             chain,
             target,
-            active: RefCell::new(HashSet::new()),
+            tasks: Arc::new(crate::parallel::Registry::new(env_watch.clone())),
             jobs: Arc::new(Jobserver::from_env()),
             config,
             log_sink: std::env::var_os(crate::logs::ENV_LOG_PATH).map(PathBuf::from),
+            spec_watch: env_watch,
+            abandon: None,
+            demanded: None,
+            wanted: None,
         };
         jlog(&ctx, || match std::env::var(crate::jobserver::ENV) {
             Ok(spec) => format!(
@@ -143,24 +188,33 @@ impl Ctx {
         Ok(ctx)
     }
 
-    /// A context for building one dependency on a worker thread: same
-    /// root/session/chain/target and shared jobserver, but its own SQLite
-    /// connection (rusqlite connections are not shareable across threads) and a
-    /// fresh in-process cycle set.
-    fn child_for_thread(&self) -> Result<Ctx> {
+    /// A context for a task worker thread: same root/session/chain/target and
+    /// shared registry + jobserver, but its own SQLite connection (rusqlite
+    /// connections are not shareable across threads; idle ones are recycled
+    /// through the registry's pool — `run_task` returns them).
+    pub(crate) fn child_for_thread(&self) -> Result<Ctx> {
+        let conn = match self.tasks.take_conn() {
+            Some(c) => c,
+            None => self.root.open_db()?,
+        };
         Ok(Ctx {
             root: self.root.clone(),
-            conn: self.root.open_db()?,
+            conn,
             session: self.session,
             depth: self.depth,
             chain: self.chain.clone(),
             target: self.target.clone(),
-            active: RefCell::new(HashSet::new()),
+            tasks: self.tasks.clone(),
             jobs: self.jobs.clone(),
             config: self.config.clone(),
             log_sink: self.log_sink.clone(),
+            spec_watch: self.spec_watch.clone(),
+            abandon: None,   // `spawn_task` sets these for its task
+            demanded: None,
+            wanted: None,
         })
     }
+
 
 }
 
@@ -196,7 +250,7 @@ fn debug_jobs() -> bool {
 
 /// Emit one decision-trace line (`--verbose`). `msg` is lazy so the
 /// non-verbose path pays nothing.
-fn vlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
+pub(crate) fn vlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
     if !verbose() {
         return;
     }
@@ -205,7 +259,7 @@ fn vlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
 
 /// Emit one jobserver-trace line (`--debug-jobs`): token acquisition,
 /// parallel-group launches, and completions.
-fn jlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
+pub(crate) fn jlog(ctx: &Ctx, msg: impl FnOnce() -> String) {
     if !debug_jobs() {
         return;
     }
@@ -228,7 +282,7 @@ fn trace_line(ctx: &Ctx, line: &str) {
 }
 
 /// Short display form of an optional content hash, for trace lines.
-fn hash8(h: Option<&str>) -> String {
+pub(crate) fn hash8(h: Option<&str>) -> String {
     match h {
         Some(h) => format!("{}…", &h[..h.len().min(8)]),
         None => "(none)".to_string(),
@@ -324,7 +378,7 @@ fn exact_dofile_exists(root: &Root, target_rel: &str) -> bool {
 /// exact `<target>.do` states unambiguous intent that the file is a target,
 /// so it stays buildable; the overwrite guard in `build_inner` then refuses
 /// or prompts before clobbering the user's file.
-fn is_target(ctx: &Ctx, path_rel: &str) -> Result<bool> {
+pub(crate) fn is_target(ctx: &Ctx, path_rel: &str) -> Result<bool> {
     let abs = ctx.root.dir.join(path_rel);
     let exists_as_file = fs::metadata(&abs).map(|m| !m.is_dir()).unwrap_or(false);
     if exists_as_file && !is_generated(&ctx.conn, path_rel)? {
@@ -353,7 +407,7 @@ fn is_target(ctx: &Ctx, path_rel: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-fn file_runid(conn: &Connection, path: &str) -> Result<Option<i64>> {
+pub(crate) fn file_runid(conn: &Connection, path: &str) -> Result<Option<i64>> {
     let r = conn
         .query_row("SELECT runid FROM files WHERE path = ?1", params![path], |row| {
             row.get::<_, Option<i64>>(0)
@@ -545,6 +599,13 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
         Some(p) => p,
         None => return Ok(()),
     };
+    // A decision made at an earlier prompt anywhere in the session (another
+    // thread, a child, a sibling process) settles this one.
+    if OVERWRITE_MODE.load(Ordering::Relaxed) == OW_ASK {
+        if let Some(mode) = db::overwrite_mode(&ctx.conn, ctx.session)? {
+            OVERWRITE_MODE.store(mode as u8, Ordering::Relaxed);
+        }
+    }
     if overwrite_all() {
         let why = if std::env::var("REDO_YES").as_deref() == Ok("1") {
             "--yes"
@@ -554,14 +615,20 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
         eprintln!("redo-msh: {problem}\nredo-msh: overwriting {target_rel} ({why})");
         return Ok(());
     }
+    // Rule R6: only work that is DEMANDED, all the way up, may ask.
+    abort_unless_lineage_demanded(ctx, target_rel)?;
     if !overwrite_none() && user_present() {
         match prompt_overwrite(ctx, target_rel, &problem)? {
             Answer::Yes => return Ok(()),
             Answer::All => {
                 OVERWRITE_MODE.store(OW_ALL, Ordering::Relaxed);
+                db::set_overwrite_mode(&ctx.conn, ctx.session, OW_ALL as i64)?;
                 return Ok(());
             }
-            Answer::Quit => OVERWRITE_MODE.store(OW_NONE, Ordering::Relaxed),
+            Answer::Quit => {
+                OVERWRITE_MODE.store(OW_NONE, Ordering::Relaxed);
+                db::set_overwrite_mode(&ctx.conn, ctx.session, OW_NONE as i64)?;
+            }
             Answer::No => {}
         }
     }
@@ -572,10 +639,60 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
     )
 }
 
-/// Session-wide overwrite decision, shared by every worker thread in this
-/// process. `all`/`quit` prompt answers land here so later targets stop
-/// asking; the corresponding env vars carry the decision both down from
-/// `--yes` and across to child redo processes.
+/// SpeculationMP rule R6. A hand-edited target must only be asked about by
+/// a demanded task whose whole lineage — every speculative build process
+/// above it — has been demanded too; otherwise the human is interrupted for
+/// work nobody asked for. Anywhere else, the speculation yields: the
+/// nearest still-speculative creation edge above us is deleted (the R3
+/// eviction, done from below), which kills that lineage the way any evicted
+/// speculation dies, and this build unwinds with the typed abort error.
+///
+/// Why abort rather than quietly refuse: a demand can upgrade the lineage
+/// between the refusal and its observation, and the refusal would then be
+/// REPORTED without the user ever having been asked. Quarantined instead,
+/// the demand reclaims and re-runs the target in a demanded lineage, which
+/// asks. The delete matches on edge kind, so it is atomic against exactly
+/// that upgrade: if every watched edge has already been superseded by a
+/// demand edge, the lineage IS demanded and we fall through to the prompt.
+fn abort_unless_lineage_demanded(ctx: &Ctx, target_rel: &str) -> Result<()> {
+    // Nearest creation edge first: this thread's own, then the process's.
+    for e in ctx.spec_watch.iter().rev() {
+        if crate::waits::abort_creation(&ctx.root, &ctx.conn, e)? {
+            jlog(ctx, || {
+                format!(
+                    "{target_rel}: hand-edited; aborting the speculative lineage \
+                     ({} -> {}) instead of asking",
+                    e.waiter, e.dep
+                )
+            });
+            return Err(crate::parallel::SpecAborted(format!(
+                "{target_rel} was modified outside redo; a speculative build must \
+                 not ask about it (it will be asked about when genuinely needed)"
+            ))
+            .into());
+        }
+    }
+    // Every watched edge is gone or upgraded. Gone means someone else killed
+    // the lineage: unwind on that. A top-level speculative task has no
+    // creation edge at all — its live grade is the only signal.
+    crate::parallel::abort_check(ctx)?;
+    if let Some(flag) = &ctx.demanded {
+        if !flag.load(Ordering::Acquire) {
+            return Err(crate::parallel::SpecAborted(format!(
+                "{target_rel} was modified outside redo; a speculative build must \
+                 not ask about it (it will be asked about when genuinely needed)"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Session-wide overwrite decision. This atomic is the per-process cache;
+/// the record of truth is the `meta` row `db::overwrite_mode` keyed by
+/// session, which is what reaches a sibling redo process already running
+/// when the answer was given. The env vars carry `--yes` down and give
+/// later-spawned children a head start.
 const OW_ASK: u8 = 0;
 const OW_ALL: u8 = 1;
 const OW_NONE: u8 = 2;
@@ -591,13 +708,26 @@ fn overwrite_none() -> bool {
         || std::env::var("REDO_NO").as_deref() == Ok("1")
 }
 
-/// Whether a human is plausibly attached: stdin or stderr is the terminal.
-/// The conversation itself runs on the console device (`/dev/tty`,
-/// `CONIN$`/`CONOUT$`), so a nested redo whose stderr is captured into a
-/// target log can still ask — but a run with every standard stream detached
-/// (CI, tests, cron) must fail closed rather than read keystrokes from
-/// whatever terminal happens to be attached to the process.
+/// Whether a human is attached to this build. The top-level process decides
+/// once (`probe_user_present`) and publishes the verdict as `REDO_INTERACTIVE`
+/// for the whole tree; a child redo must not re-probe, because its streams
+/// say nothing about the human: its stdin is `/dev/null` and its stderr is
+/// the target's log file (`run_dofile`), so a per-process probe answered
+/// "no" for every target below the top level and the prompt only ever fired
+/// for top-level targets. The conversation itself runs on the console device
+/// (`/dev/tty`, `CONIN$`/`CONOUT$`), which is reachable from any depth.
 fn user_present() -> bool {
+    match std::env::var(E_INTERACTIVE).as_deref() {
+        Ok("1") => true,
+        Ok(_) => false,
+        Err(_) => probe_user_present(),
+    }
+}
+
+/// The top-level probe: stdin or stderr is a terminal. A run with every
+/// standard stream detached (CI, tests, cron) must fail closed rather than
+/// read keystrokes from whatever terminal happens to be attached.
+fn probe_user_present() -> bool {
     std::io::stdin().is_terminal() || std::io::stderr().is_terminal()
 }
 
@@ -709,50 +839,123 @@ fn open_console() -> std::io::Result<(fs::File, fs::File)> {
 /// Parallel-build protocol: prompts are serialized by a kernel file lock
 /// (`lock_prompt`) so exactly one question owns the terminal at a time, and
 /// the full problem text is written *after* the lock is won so the question
-/// on screen is always the one the next keystroke answers. While blocked on
-/// the human, this worker's jobserver token is returned to the pool — other
-/// jobs keep the build saturated — and taken back before the build resumes.
+/// on screen is always the one the next keystroke answers.
+///
+/// The worker KEEPS its jobserver token while blocked on the human. It is
+/// tempting to lend the token out so the build stays saturated, but this
+/// prompt runs with the target's kernel lock held, and lock waiters keep
+/// their tokens: the lent token is taken by a job that then blocks on this
+/// very lock, and once every token is parked there the prompter can never
+/// get one back (verification/TokenPool_PromptRelease.cfg finds that
+/// deadlock in ten steps at -j2; TokenPool_PromptHold.cfg verifies this
+/// version). One idle slot while the user thinks is the price.
 fn prompt_overwrite(ctx: &Ctx, target_rel: &str, problem: &str) -> Result<Answer> {
     use std::io::{BufRead, Write};
     let (rin, mut wout) = match open_console() {
         Ok(t) => t,
         Err(_) => return Ok(Answer::No),
     };
-    ctx.jobs.release();
-    let answer = (|| {
-        let _serial = crate::lock::lock_prompt(&ctx.root)?;
-        write!(
-            wout,
-            "\nredo-msh: {problem}\n\
-             Overwrite {target_rel}? [y]es / [n]o / [a]ll this run / [q]uit asking: "
-        )?;
-        wout.flush()?;
-        let mut line = String::new();
-        std::io::BufReader::new(rin).read_line(&mut line)?;
-        Ok(match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => Answer::Yes,
-            "a" | "all" => Answer::All,
-            "q" | "quit" => Answer::Quit,
-            _ => Answer::No,
-        })
-    })();
-    // Take a token back before resuming, on the answer and error paths alike.
-    // The pool is try-only, so spin: any running job's completion frees one.
-    while !ctx.jobs.try_acquire() {
-        thread::sleep(std::time::Duration::from_millis(50));
+    let _serial = crate::lock::lock_prompt(&ctx.root)?;
+    // Whoever held the lock before us may have answered for the session.
+    match db::overwrite_mode(&ctx.conn, ctx.session)? {
+        Some(m) if m == OW_ALL as i64 => return Ok(Answer::All),
+        Some(m) if m == OW_NONE as i64 => return Ok(Answer::Quit),
+        _ => {}
     }
-    answer
+    // A nested redo runs in a background process group (its do-file's shell
+    // gives every command its own), and a background read of the terminal
+    // stops the process with SIGTTIN. Own the terminal for the question.
+    let _fg = ConsoleForeground::take(&rin);
+    write!(
+        wout,
+        "\nredo-msh: {problem}\n\
+         Overwrite {target_rel}? [y]es / [n]o / [a]ll this run / [q]uit asking: "
+    )?;
+    wout.flush()?;
+    let mut line = String::new();
+    std::io::BufReader::new(rin).read_line(&mut line)?;
+    Ok(match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Answer::Yes,
+        "a" | "all" => Answer::All,
+        "q" | "quit" => Answer::Quit,
+        _ => Answer::No,
+    })
+}
+
+/// Foreground ownership of the console for the duration of a prompt: makes
+/// this process group the terminal's foreground group and restores the
+/// previous one on drop. The prompt lock serializes prompters, so the
+/// save/restore pairs never interleave. `SIGTTOU` is ignored while the
+/// switch happens, because `tcsetpgrp` from a background group would itself
+/// stop the process. While a question is open, Ctrl-C reaches the
+/// prompting process rather than the top-level one; its build then fails
+/// upward like any other, which is what the user meant anyway.
+#[cfg(unix)]
+struct ConsoleForeground {
+    fd: std::os::unix::io::RawFd,
+    prev: libc::pid_t,
+    prev_ttou: libc::sighandler_t,
+}
+
+#[cfg(unix)]
+impl ConsoleForeground {
+    fn take(console: &fs::File) -> Option<ConsoleForeground> {
+        use std::os::unix::io::AsRawFd;
+        let fd = console.as_raw_fd();
+        // SAFETY: plain libc calls on a valid fd; signal disposition changes
+        // are process-wide but restored on drop.
+        unsafe {
+            let prev = libc::tcgetpgrp(fd);
+            if prev < 0 {
+                return None;
+            }
+            let mine = libc::getpgrp();
+            if prev == mine {
+                return None;
+            }
+            let prev_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            if libc::tcsetpgrp(fd, mine) != 0 {
+                libc::signal(libc::SIGTTOU, prev_ttou);
+                return None;
+            }
+            Some(ConsoleForeground { fd, prev, prev_ttou })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConsoleForeground {
+    fn drop(&mut self) {
+        // SAFETY: as in `take`.
+        unsafe {
+            libc::tcsetpgrp(self.fd, self.prev);
+            libc::signal(libc::SIGTTOU, self.prev_ttou);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ConsoleForeground;
+
+#[cfg(not(unix))]
+impl ConsoleForeground {
+    fn take(_console: &fs::File) -> Option<ConsoleForeground> {
+        None
+    }
 }
 
 // ---- the build operation ----------------------------------------------------
 
 /// Build `target_rel`, acquiring the per-target lock for build exclusion.
 ///
-/// The cross-process cycle check runs *before* locking (so a cycle errors
-/// instead of deadlocking). After acquiring the lock we re-check whether the
-/// target was built this session by whoever held the lock before us — the
-/// double-checked rebuild that makes concurrent builds safe. `force` (top-level
-/// `redo`) skips that check and always rebuilds.
+/// The chain check below is a fast path for path-local cycles (an ancestor
+/// do-file re-demanding a target it is inside of), kept for its readable
+/// error message; the authoritative cycle detection is the shared waits-for
+/// graph, whose atomic check-and-insert runs in `build_parallel` before any
+/// wait can start (`waits.rs`). After acquiring the lock we re-check whether
+/// the target was built this session by whoever held the lock before us —
+/// the double-checked rebuild that makes concurrent builds safe. `force`
+/// (top-level `redo`) skips that check and always rebuilds.
 pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     if ctx.chain.iter().any(|t| t.eq_ignore_ascii_case(target_rel)) {
         bail!(
@@ -771,6 +974,10 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     }
     // Try first so a contended lock can be announced in the live log (the
     // user otherwise sees an unexplained stall) before we block on it.
+    // Kernel-lock waits carry no wait-graph edge (SpeculationMP proves the
+    // by-name edges bridge them), so a demanded build may block outright —
+    // but a SPECULATIVE lineage must stay interruptible: it polls the lock
+    // and its abort watch, so an eviction reaches it even here.
     let _lock = match crate::lock::try_lock_target(&ctx.root, target_rel)? {
         Some(lock) => lock,
         None => {
@@ -778,7 +985,17 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
                 session: ctx.session,
                 target: target_rel.to_string(),
             });
-            crate::lock::lock_target(&ctx.root, target_rel)?
+            if ctx.spec_watch.is_empty() && ctx.abandon.is_none() {
+                crate::lock::lock_target(&ctx.root, target_rel)?
+            } else {
+                loop {
+                    crate::parallel::abort_check(ctx)?;
+                    if let Some(lock) = crate::lock::try_lock_target(&ctx.root, target_rel)? {
+                        break lock;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
         }
     };
     if !force && file_runid(&ctx.conn, target_rel)? == Some(ctx.session) {
@@ -952,6 +1169,13 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         .arg(&df.arg_base)
         .arg(&tmp3_rel)
         .current_dir(&df.dodir_abs)
+        // Never hand the terminal to a do-file: with stdout/stderr already
+        // redirected, a null stdin leaves no tty on any child stream, so
+        // shells that do job control (mshell probes stdin/stdout/stderr for
+        // a control terminal) skip it entirely. N parallel children sharing
+        // one tty otherwise race each other's tcsetpgrp restores. Prompts
+        // stay in the redo process, which keeps its tty.
+        .stdin(std::process::Stdio::null())
         .stdout(capture_file)
         .stderr(errlog)
         .env(E_ROOT, &ctx.root.dir)
@@ -959,6 +1183,17 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         .env(E_SESSION, ctx.session.to_string())
         .env(E_DEPTH, (ctx.depth + 1).to_string())
         .env(E_CHAIN, child_chain.join("\n"));
+    // A speculative lineage's abort watch travels to child redo processes:
+    // every blocking primitive below this do-file polls it (SpeculationMP
+    // rule R3's eviction has to reach the whole subtree).
+    if ctx.spec_watch.is_empty() {
+        command.env_remove(crate::waits::ENV_SPEC_WATCH);
+    } else {
+        command.env(
+            crate::waits::ENV_SPEC_WATCH,
+            crate::waits::watch_to_env(&ctx.spec_watch),
+        );
+    }
     // Carry a session-wide interactive decision ('a'/'q' at a prompt) into
     // child redo processes this do-file spawns; --yes already travels in the
     // inherited environment.
@@ -987,9 +1222,39 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         command.env("PATH", path);
     }
 
-    let status = command
-        .status()
+    // Speculative work must stay cancellable even while its do-file runs
+    // (SpeculationMP rules R3/R5): instead of blocking on the child, poll
+    // it alongside the abort/abandon signals and KILL it when the
+    // speculation is no longer wanted. Killing mid-build is crash-safe by
+    // design (Uncommitted marker recorded above, temps swept by the guard
+    // and the startup GC, kernel-released locks); any nested redo
+    // processes watching our lineage unwind via REDO_SPEC_WATCH.
+    let mut child = command
+        .spawn()
         .map_err(|e| interpreter_spawn_error(e, &interp, &df.dofile_abs, child_path.as_deref()))?;
+    let speculative = ctx.abandon.is_some() || !ctx.spec_watch.is_empty();
+    let status = if !speculative {
+        child.wait()?
+    } else {
+        loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            if crate::parallel::speculation_dead(ctx)? {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(g) = done_guard.as_mut() {
+                    g.record_exit(1);
+                }
+                return Err(crate::parallel::SpecAborted(format!(
+                    "the build of {target_rel} is no longer needed here (it will \
+                     be re-run when genuinely needed)"
+                ))
+                .into());
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+    };
     if let Some(g) = done_guard.as_mut() {
         // Signal death has no code; classify it as failed (exit 1).
         g.record_exit(status.code().unwrap_or(1));
@@ -1136,281 +1401,108 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Bring multiple buildable targets up to date, in parallel, bounded by the
-/// jobserver.
+/// Bring multiple buildable targets up to date, in parallel, through the
+/// task registry (`parallel.rs`). This is the mid-build (`redo-ifchange`)
+/// entry point: before waiting on any dep, the parent's HARD demand edges
+/// enter the shared waits-for graph via the atomic check-and-insert of
+/// SpeculationMP rule R3 — an all-hard cycle is a real dependency cycle
+/// (error on every interleaving, never a deadlock); a cycle riding a soft
+/// edge makes the SPECULATION yield (`try_demand` evicts it) and the
+/// demand retries. The demand insert also supersedes this process's own
+/// creation edge for the dep, upgrading a speculative task in flight to a
+/// demanded one.
 fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
-    if deps.len() <= 1 {
-        // No parallelism opportunity: run inline, consuming no extra tokens.
-        for d in deps {
-            jlog(ctx, || {
-                format!("{d}: only buildable target of this ifchange: running inline")
-            });
-            ensure(ctx, d)?;
-        }
+    if deps.is_empty() {
         return Ok(());
     }
-    run_parallel(ctx, deps, false)
-}
-
-/// The parallel scheduler shared by `ifchange` and top-level `redo`. Uses the
-/// process's own token for one job (guaranteeing progress) and try-acquires
-/// extra pool tokens for the rest; completions are awaited via a channel, and
-/// each pool token is returned as its job finishes. `force` distinguishes
-/// top-level `redo` (always rebuild) from `ifchange` (build only if out of
-/// date).
-fn run_parallel(ctx: &Ctx, targets: &[String], force: bool) -> Result<()> {
     jlog(ctx, || {
-        format!(
-            "parallel group of {}: {}",
-            targets.len(),
-            targets.join(", ")
-        )
+        format!("parallel group of {}: {}", deps.len(), deps.join(", "))
     });
-    let (tx, rx) = mpsc::channel::<(Result<()>, TokenSrc, String)>();
-    let n = targets.len();
-    let mut idx = 0;
-    let mut running = 0usize;
-    let mut own_in_use = false;
-    let mut first_err: Option<anyhow::Error> = None;
-
-    loop {
-        // Launch as many jobs as we have tokens for (stop launching on error).
-        while idx < n && first_err.is_none() {
-            let src = if !own_in_use {
-                own_in_use = true;
-                TokenSrc::Own
-            } else if ctx.jobs.try_acquire() {
-                TokenSrc::Pool
-            } else {
-                jlog(ctx, || {
-                    format!(
-                        "token pool empty: {} of {} queued ({}); waiting on {} running job(s)",
-                        n - idx,
-                        n,
-                        targets[idx..].join(", "),
-                        running
-                    )
-                });
-                break;
-            };
-            let target = targets[idx].clone();
-            jlog(ctx, || {
-                format!(
-                    "{target}: spawned ({})",
-                    match src {
-                        TokenSrc::Own => "own token",
-                        TokenSrc::Pool => "pool token",
-                    }
-                )
-            });
-            let cctx = ctx.child_for_thread()?;
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let r = if force {
-                    build(&cctx, &target, true)
-                } else {
-                    ensure(&cctx, &target)
-                };
-                let _ = tx.send((r, src, target));
-            });
-            idx += 1;
-            running += 1;
-        }
-
-        if running == 0 {
-            break;
-        }
-        // Wait for one job to finish and reclaim its token.
-        let (res, src, target) = rx.recv().expect("build worker channel closed");
-        running -= 1;
-        match src {
-            TokenSrc::Own => own_in_use = false,
-            TokenSrc::Pool => ctx.jobs.release(),
-        }
-        jlog(ctx, || {
-            format!(
-                "{target}: {} ({})",
-                if res.is_ok() { "finished" } else { "FAILED" },
-                match src {
-                    TokenSrc::Own => "own token freed",
-                    TokenSrc::Pool => "pool token returned",
-                }
-            )
-        });
-        if let Err(e) = res {
-            if first_err.is_none() {
-                jlog(ctx, || {
-                    format!("{target}: failed: not launching further targets from this group")
-                });
-                first_err = Some(e);
+    if let Some(parent) = &ctx.target {
+        // Happy path first: every cycle-free demand edge goes in as one
+        // batched transaction; only deps whose edge hit a cycle take the
+        // per-dep evict/retry loop.
+        let inserted = crate::waits::try_demand_batch(&ctx.root, &ctx.conn, parent, deps)?;
+        for (d, ok) in deps.iter().zip(inserted) {
+            if !ok {
+                demand_edge(ctx, parent, d)?;
             }
         }
     }
+    let result = crate::parallel::ensure_all(ctx, deps, false);
+    // Wait for speculative work this process started before returning to the
+    // do-file; then this ifchange no longer blocks on anything. Safe: every
+    // in-flight task is edge-covered (demand or creation edge), so a
+    // cross-branch cycle is resolved by eviction, never by hanging here.
+    crate::parallel::drain(ctx);
+    if let Some(parent) = &ctx.target {
+        let _ = crate::waits::clear_waiter(&ctx.conn, parent);
+    }
+    result
+}
 
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
+/// Insert the hard demand edge `parent -> dep`, looping over evictions
+/// (rule R3). A `RealCycle` is trusted only after dead-owner GC and — if we
+/// just aborted a speculative lineage — after a brief stabilization window:
+/// the aborted lineage's residual hard edges dissolve as its processes
+/// notice the abort and unwind, and the model's atomic abort corresponds to
+/// that whole unwind.
+fn demand_edge(ctx: &Ctx, parent: &str, dep: &str) -> Result<()> {
+    use crate::waits::DemandOutcome;
+    let mut gc_done = false;
+    let mut aborted_lineage = false;
+    let mut stabilize = 0u32;
+    loop {
+        crate::parallel::abort_check(ctx)?;
+        match crate::waits::try_demand(&ctx.root, &ctx.conn, parent, dep)? {
+            DemandOutcome::Inserted => return Ok(()),
+            DemandOutcome::Evicted { aborted_lineage: a } => {
+                jlog(ctx, || {
+                    format!(
+                        "{parent}: demand on {dep} evicted a speculative {} to \
+                         avoid a wait cycle; retrying",
+                        if a { "build (aborted)" } else { "checker wait" }
+                    )
+                });
+                if a {
+                    aborted_lineage = true;
+                }
+            }
+            DemandOutcome::RealCycle => {
+                if !gc_done {
+                    gc_done = true;
+                    crate::waits::gc_dead_edges(&ctx.root, &ctx.conn)?;
+                    continue;
+                }
+                if aborted_lineage && stabilize < 400 {
+                    stabilize += 1;
+                    thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                let _ = crate::waits::clear_waiter(&ctx.conn, parent);
+                let path = if ctx.chain.is_empty() {
+                    parent.to_string()
+                } else {
+                    ctx.chain.join(" -> ")
+                };
+                bail!("dependency cycle detected: {path} -> {dep}");
+            }
+        }
     }
 }
 
 /// Bring a buildable `target` up to date: build it if out of date, otherwise
-/// mark it verified for this session. Idempotent within a session.
+/// mark it verified for this session. Idempotent within a session. The whole
+/// traversal — speculative parallel checking over recorded deps, token-
+/// bounded builds, cycle handling on the shared waits-for graph — lives in
+/// `parallel.rs`.
 pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
-    // Already built or verified this session.
-    if file_runid(&ctx.conn, target)? == Some(ctx.session) {
-        vlog(ctx, || {
-            format!("{target}: skipping: already built or verified earlier in this run")
-        });
-        return Ok(());
-    }
-    // In-process cycle guard for the out-of-date traversal (the cross-process
-    // chain guard lives in build()). Fold case to match NOCASE identity.
-    let active_key = target.to_ascii_lowercase();
-    if !ctx.active.borrow_mut().insert(active_key.clone()) {
-        bail!("dependency cycle detected involving {target}");
-    }
-    let result = (|| {
-        if is_ood(ctx, target)? {
-            build(ctx, target, false)
-        } else {
-            vlog(ctx, || format!("{target}: up to date; marking it verified for this run"));
-            mark_verified(ctx, target)
-        }
-    })();
-    ctx.active.borrow_mut().remove(&active_key);
-    result
-}
-
-/// Decide whether a buildable `target` is out of date. With `--verbose`,
-/// every check — passing or failing — is traced with its evidence.
-fn is_ood(ctx: &Ctx, target: &str) -> Result<bool> {
-    let target_abs = ctx.root.dir.join(target);
-    let row = files_row(&ctx.conn, target)?;
-    let built_csum = match row {
-        Some(c) => c,
-        None => {
-            vlog(ctx, || {
-                format!("{target}: OUT OF DATE: redo has no record of ever building it")
-            });
-            return Ok(true); // never built
-        }
-    };
-    // A previously-produced file that is now gone must be rebuilt. (A phony
-    // target has no recorded csum, so its absence is expected.)
-    if built_csum.is_some() && !target_abs.exists() {
-        vlog(ctx, || {
-            format!(
-                "{target}: OUT OF DATE: the previously built output (hash {}) is \
-                 missing from disk",
-                hash8(built_csum.as_deref())
-            )
-        });
-        return Ok(true);
-    }
-
-    let mut checked = 0usize;
-    for (kind, dep, edge_csum) in read_deps(&ctx.conn, target)? {
-        checked += 1;
-        match kind {
-            DepKind::Always => {
-                vlog(ctx, || {
-                    format!("{target}: OUT OF DATE: its do-file called redo-always")
-                });
-                return Ok(true);
-            }
-            // Last build never committed (failed or crashed).
-            DepKind::Uncommitted => {
-                vlog(ctx, || {
-                    format!(
-                        "{target}: OUT OF DATE: the last build failed or crashed \
-                         before committing"
-                    )
-                });
-                return Ok(true);
-            }
-            DepKind::DoFile => {
-                let dep = dep.expect("dofile dep has a path");
-                let cur = current_csum(ctx, &dep)?;
-                if cur.as_deref() != edge_csum.as_deref() {
-                    vlog(ctx, || {
-                        format!(
-                            "{target}: OUT OF DATE: do-file {dep} changed (hash was {} \
-                             at last build, is now {})",
-                            hash8(edge_csum.as_deref()),
-                            hash8(cur.as_deref())
-                        )
-                    });
-                    return Ok(true);
-                }
-                vlog(ctx, || {
-                    format!("{target}: do-file {dep} unchanged (hash {})", hash8(cur.as_deref()))
-                });
-            }
-            DepKind::IfCreate => {
-                let dep = dep.expect("ifcreate dep has a path");
-                if ctx.root.dir.join(&dep).exists() {
-                    vlog(ctx, || {
-                        format!(
-                            "{target}: OUT OF DATE: {dep} now exists (the target \
-                             depends on it NOT existing — at build time it was a \
-                             missing do-file candidate or an ifcreate path)"
-                        )
-                    });
-                    return Ok(true);
-                }
-                vlog(ctx, || format!("{target}: ifcreate dependency {dep} is still absent"));
-            }
-            DepKind::IfChange => {
-                let dep = dep.expect("ifchange dep has a path");
-                // Bring the dependency up to date first (it may be a target).
-                if is_target(ctx, &dep)? {
-                    vlog(ctx, || {
-                        format!(
-                            "{target}: dependency {dep} is itself a buildable target; \
-                             bringing it up to date before comparing"
-                        )
-                    });
-                    ensure(ctx, &dep)?;
-                }
-                match current_csum(ctx, &dep)? {
-                    None => {
-                        vlog(ctx, || {
-                            format!("{target}: OUT OF DATE: dependency {dep} no longer exists")
-                        });
-                        return Ok(true); // dependency disappeared
-                    }
-                    Some(cur) => {
-                        if Some(cur.as_str()) != edge_csum.as_deref() {
-                            vlog(ctx, || {
-                                format!(
-                                    "{target}: OUT OF DATE: dependency {dep} changed \
-                                     (hash was {} at last build, is now {})",
-                                    hash8(edge_csum.as_deref()),
-                                    hash8(Some(&cur))
-                                )
-                            });
-                            return Ok(true);
-                        }
-                        vlog(ctx, || {
-                            format!(
-                                "{target}: dependency {dep} unchanged (hash {})",
-                                hash8(Some(&cur))
-                            )
-                        });
-                    }
-                }
-            }
-        }
-    }
-    vlog(ctx, || {
-        format!("{target}: UP TO DATE: all {checked} recorded dependencies are unchanged")
-    });
-    Ok(false)
+    crate::parallel::ensure(ctx, target)
 }
 
 /// Mark a target as verified-up-to-date this session and refresh its stamp
 /// cache, so later `ensure` calls in the same session short-circuit.
-fn mark_verified(ctx: &Ctx, target: &str) -> Result<()> {
+pub(crate) fn mark_verified(ctx: &Ctx, target: &str) -> Result<()> {
     let _ = current_csum(ctx, target)?; // refresh mtime/size/csum cache
     ctx.conn.execute(
         "UPDATE files SET runid = ?1 WHERE path = ?2",
@@ -1428,7 +1520,7 @@ fn mark_verified(ctx: &Ctx, target: &str) -> Result<()> {
 /// "always-hash on coarse FS" rule, derived from the data itself.
 ///
 /// Returns `Ok(None)` if the file does not exist.
-fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
+pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
     let abs = ctx.root.dir.join(path_rel);
     let meta = match fs::metadata(&abs) {
         Ok(m) => m,
@@ -1466,9 +1558,15 @@ fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
         };
         format!("{path_rel}: hashed the file contents ({why}): {}", hash8(Some(&csum)))
     });
-    // Refresh the cache for an existing row (do not invent rows here).
+    // Refresh the cache for an existing SOURCE row (do not invent rows here).
+    // A generated target's row is not a cache: its stamp and csum are what
+    // redo produced when it last built the file, and the overwrite guard
+    // compares the file on disk against exactly that. Writing an observed
+    // hash there — as a consumer's check of a hand-edited target would —
+    // rewrites the evidence and lets the next build clobber the edit.
     ctx.conn.execute(
-        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3 WHERE path = ?4",
+        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3
+         WHERE path = ?4 AND dofile IS NULL",
         params![mtime, size, csum, path_rel],
     )?;
     Ok(Some(csum))
@@ -1516,7 +1614,7 @@ fn files_built_at(conn: &Connection, path: &str) -> Result<Option<i64>> {
 
 /// Fetch a file row's recorded csum if the row exists. Returns
 /// `Some(None)` for a phony target (row exists, csum NULL).
-fn files_row(conn: &Connection, path: &str) -> Result<Option<Option<String>>> {
+pub(crate) fn files_row(conn: &Connection, path: &str) -> Result<Option<Option<String>>> {
     let row = conn
         .query_row(
             "SELECT csum FROM files WHERE path = ?1",
@@ -1528,7 +1626,7 @@ fn files_row(conn: &Connection, path: &str) -> Result<Option<Option<String>>> {
 }
 
 /// All dependency edges of a target as `(kind, dep, csum)`.
-fn read_deps(
+pub(crate) fn read_deps(
     conn: &Connection,
     target: &str,
 ) -> Result<Vec<(DepKind, Option<String>, Option<String>)>> {
@@ -1587,6 +1685,9 @@ pub fn always(ctx: &Ctx) -> Result<()> {
 pub fn redo(targets: &[String], j: usize) -> Result<()> {
     let mut ctx = Ctx::top_level(j)?;
     gc_temps(&ctx.root); // sweep temp files left by any crashed build
+    // Sweep wait edges (and liveness locks) left by dead processes, so a
+    // crashed traversal can never fabricate a cycle error in this run.
+    crate::waits::gc_sweep(&ctx.root, &ctx.conn);
 
     // The liveness lock goes on a sentinel file that is never read or
     // written, NOT on the run log: Windows kernel locks are mandatory, so a
@@ -1628,20 +1729,11 @@ pub fn redo(targets: &[String], j: usize) -> Result<()> {
 /// The build phase of a top-level `redo`, separated so `redo()` can run its
 /// log epilogue on every outcome.
 fn redo_build(ctx: &Ctx, targets: &[String]) -> Result<()> {
-    // Force-build the requested targets in parallel under the jobserver. We
-    // mark them verified-this-session via a forced build, so reuse the parallel
-    // scheduler but bypass the up-to-date check by clearing their session mark.
-    if targets.len() <= 1 {
-        for input in targets {
-            let target_rel = normalize_target(&ctx.root, input)?;
-            build(ctx, &target_rel, true)?;
-        }
-        return Ok(());
-    }
-    // Parallel forced top-level builds. Dedup (case-folded, first occurrence
-    // wins): forcing the same target twice in one session would rebuild it
-    // twice, and the follower could consume the first build's log while the
-    // second is live at the same path.
+    // Force-build the requested targets in parallel through the task
+    // registry. Dedup (case-folded, first occurrence wins): forcing the same
+    // target twice in one session would rebuild it twice, and the follower
+    // could consume the first build's log while the second is live at the
+    // same path.
     let mut seen = HashSet::new();
     let mut rels: Vec<String> = Vec::with_capacity(targets.len());
     for t in targets {
@@ -1650,12 +1742,11 @@ fn redo_build(ctx: &Ctx, targets: &[String]) -> Result<()> {
             rels.push(rel);
         }
     }
-    build_parallel_forced(ctx, &rels)
-}
-
-/// Like `build_parallel` but forces each target (top-level `redo`).
-fn build_parallel_forced(ctx: &Ctx, targets: &[String]) -> Result<()> {
-    run_parallel(ctx, targets, true)
+    let result = crate::parallel::ensure_all(ctx, &rels, true);
+    // Speculative dep tasks may still be settling; the run is not over (and
+    // the log follower must not be terminated) until they are.
+    crate::parallel::drain(ctx);
+    result
 }
 
 // ---- introspection commands -------------------------------------------------
@@ -1858,6 +1949,22 @@ fn is_ood_static(root: &Root, conn: &Connection, target: &str) -> Result<bool> {
     if built_csum.is_some() && !target_abs.exists() {
         why("OUT OF DATE: the previously built output is missing from disk");
         return Ok(true);
+    }
+    if let Some(recorded) = &built_csum {
+        if target_abs.exists() {
+            let cur = stamp::stamp_file(&target_abs)?.map(|s| s.csum);
+            if let Some(cur) = cur {
+                if &cur != recorded {
+                    why(&format!(
+                        "OUT OF DATE: modified outside redo since it was built (hash was \
+                         {} at last build, is now {})",
+                        hash8(Some(recorded)),
+                        hash8(Some(&cur))
+                    ));
+                    return Ok(true);
+                }
+            }
+        }
     }
     for (kind, dep, edge_csum) in read_deps(conn, target)? {
         match kind {

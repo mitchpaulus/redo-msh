@@ -368,6 +368,172 @@ fn cycle_errors_without_hang() {
     );
 }
 
+/// A dependency cycle entered concurrently from two sides must error, not
+/// deadlock. This is the exact scenario `CycleLock_CycleParallel` proves
+/// deadlocks under path-local (chain) cycle detection, and
+/// `ParallelEnsure_Cycle` proves errors out cleanly on every interleaving
+/// under the shared waits-for graph: two parallel branches (`x`, `y`) reach
+/// the cycle `a <-> b` from different entry points, so neither branch's own
+/// chain ever contains the whole loop.
+#[test]
+fn parallel_cycle_from_two_sides_errors_not_deadlocks() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.do", "['redo-msh' 'ifchange' 'b']!\n");
+    p.write("b.do", "['redo-msh' 'ifchange' 'a']!\n");
+    p.write("x.do", "['redo-msh' 'ifchange' 'a']!\n");
+    p.write("y.do", "['redo-msh' 'ifchange' 'b']!\n");
+    p.write("all.do", "['redo-msh' 'ifchange' 'x' 'y']!\n");
+    let out = p.redo(&["-j4", "all"]);
+    assert!(!out.status.success(), "two-sided cycle must fail");
+    assert!(
+        stderr(&out).contains("cycle"),
+        "expected a cycle error, got: {}",
+        stderr(&out)
+    );
+}
+
+/// A stale recorded dependency (the database says `app` needs `dropped`,
+/// the do-file no longer does) may cost speculative work but must never
+/// invent an error — even when the stale dep can no longer be built. This
+/// is Speculation.tla's soft-failure rule: speculative failures only force
+/// the rebuild path, and the do-file is the ground truth.
+#[test]
+fn stale_recorded_dep_failure_is_soft() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("dropped.txt.do", "args :2: out!\n\"d\\n\" @out writeFile\n");
+    p.write(
+        "app.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'dropped.txt']!\n\"v1\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["ifchange", "app.txt"]).status.success());
+
+    // The do-file drops the dep; the dep's own do-file starts failing. The
+    // recorded edge app -> dropped is now stale AND its speculative build
+    // fails — the rebuild must still succeed.
+    p.write("dropped.txt.do", "['redo-msh' 'ifchange' 'no-such-dep']!\n");
+    p.write("app.txt.do", "args :2: out!\n\"v2\\n\" @out writeFile\n");
+    let out = p.redo(&["ifchange", "app.txt"]);
+    assert!(
+        out.status.success(),
+        "stale failing dep must not fail the parent: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("app.txt"), "v2\n");
+}
+
+/// The cross-branch stale-speculation shape that deadlocked the first
+/// parallel implementation 10/10 (and that `SpeculationMP_CrossStale`
+/// proves the corrected machine survives): the database records d1 -> T2
+/// and d2 -> T1 from earlier runs, the do-files are rewired so the REAL
+/// graph is the acyclic T1 -> d1, T2 -> d2, and both tops build in
+/// parallel. Each branch's checker speculatively activates the OTHER
+/// branch's mid-build top; under the old design those speculative tasks
+/// blocked on kernel locks invisible to the waits graph while both
+/// ifchange drains waited on them. The creation-edge rule must dissolve
+/// this on every interleaving: no hang, no error, correct outputs.
+#[test]
+fn crossed_stale_deps_neither_hang_nor_error() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    // Phase 1: record the soon-to-be-stale cross edges d1 -> T2, d2 -> T1.
+    p.write("T2.do", "args :2: out!\n\"t2\\n\" @out writeFile\n");
+    p.write(
+        "d1.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'T2']!\n\"d1\\n\" @out writeFile\n",
+    );
+    p.write("T1.do", "args :2: out!\n\"t1\\n\" @out writeFile\n");
+    p.write(
+        "d2.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'T1']!\n\"d2\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["d1"]).status.success());
+    assert!(p.redo(&["d2"]).status.success());
+
+    // Phase 2: the deps drop their demands; the tops now demand the deps.
+    p.write("d1.do", "args :2: out!\n\"d1v2\\n\" @out writeFile\n");
+    p.write("d2.do", "args :2: out!\n\"d2v2\\n\" @out writeFile\n");
+    p.write(
+        "T1.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'd1']!\n\"t1v2\\n\" @out writeFile\n",
+    );
+    p.write(
+        "T2.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'd2']!\n\"t2v2\\n\" @out writeFile\n",
+    );
+    let out = p.redo(&["-j4", "T1", "T2"]);
+    assert!(
+        out.status.success(),
+        "acyclic project must converge (stale edges may never hang or error): {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("T1"), "t1v2\n");
+    assert_eq!(p.read("T2"), "t2v2\n");
+}
+
+/// A speculative build whose REAL dependency is the mid-build ancestor
+/// that (transitively) spawned it must abort quarantined — never fabricate
+/// a "dependency cycle" error, never fail the run — and must be re-run
+/// cleanly by the next real demand (`SpeculationMP_SpecAbort`, rules
+/// R3/R4). Under the old design this fabricated `X -> g -> X` from the
+/// inherited REDO_CHAIN and silently poisoned g.
+#[test]
+fn speculative_build_of_ancestor_dependent_aborts_quarantined() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    // g really depends on X (and stays that way); d's dep on g goes stale.
+    p.write("X.do", "args :2: out!\n\"x1\\n\" @out writeFile\n");
+    p.write(
+        "g.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'X']!\n\"g1\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["g"]).status.success());
+    p.write(
+        "d.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'g']!\n\"d1\\n\" @out writeFile\n",
+    );
+    assert!(p.redo(&["d"]).status.success());
+
+    // Now: X -> d, g -> X (acyclic); the recorded d -> g edge is stale and
+    // drags g into speculation while X is mid-build above it.
+    p.write("d.do", "args :2: out!\n\"d2\\n\" @out writeFile\n");
+    p.write(
+        "X.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'd']!\n\"x2\\n\" @out writeFile\n",
+    );
+    let out = p.redo(&["X"]);
+    assert!(
+        out.status.success(),
+        "speculation must never fail the run: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("dependency cycle"),
+        "no fabricated cycle error, got: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("X"), "x2\n");
+
+    // The quarantined attempt leaves g pending; a real demand re-runs it
+    // successfully (reclaim, rule R4).
+    let out = p.redo(&["ifchange", "g"]);
+    assert!(
+        out.status.success(),
+        "reclaimed build of g must succeed: {}",
+        stderr(&out)
+    );
+    assert_eq!(p.read("g"), "g1\n");
+}
+
 /// A phony target (no $3 and no stdout) produces no file but succeeds.
 #[test]
 fn phony_target() {
@@ -446,7 +612,16 @@ fn manual_edit_protected() {
     assert!(p.redo(&["out.txt"]).status.success());
 
     std::fs::write(p.dir.join("out.txt"), "HAND\n").unwrap();
-    // Non-tty, no --yes: must refuse and preserve the edit.
+    // The edit alone makes the target out of date: its inputs are unchanged,
+    // but the output is no longer what its do-file produced.
+    let ood = p.stdout_of(&["ood"]);
+    assert!(ood.lines().any(|l| l == "out.txt"), "ood: {ood:?}");
+    // ...so even an unforced check reaches the overwrite guard. Non-tty, no
+    // --yes: must refuse and preserve the edit.
+    let out = p.redo(&["ifchange", "out.txt"]);
+    assert!(!out.status.success(), "unforced check must reach the guard and refuse");
+    assert_eq!(p.read("out.txt"), "HAND\n");
+    // Forced (named on the command line): same refusal.
     let out = p.redo(&["out.txt"]);
     assert!(!out.status.success());
     assert_eq!(p.read("out.txt"), "HAND\n");
@@ -454,6 +629,82 @@ fn manual_edit_protected() {
     // --yes overwrites.
     assert!(p.redo(&["--yes", "out.txt"]).status.success());
     assert_eq!(p.read("out.txt"), "src\n");
+}
+
+/// SpeculationMP rule R6: a hand-edited target reached only through
+/// SPECULATION is never asked about (nor refused, which is what "asked"
+/// degrades to without a terminal). `a` recorded a dep on `b`, and `b` on
+/// `x`; `x` is then edited by hand and `a` switches to `c`. Checking `a`
+/// speculatively rebuilds `b`, whose do-file demands `x` inside a
+/// speculative lineage. That lineage must abort quietly; the run succeeds,
+/// the hand edit survives, and no "refusing to overwrite" ever appears in
+/// the output or any log. (Before R6 the guard fired for the speculative
+/// `x` and its refusal surfaced through the verbose trace.) The check runs
+/// inside `top`'s child process so that `-j2` applies: a top-level `redo`
+/// forces its target and does not speculate, and a top-level `ifchange`
+/// takes no `-j`.
+#[cfg(unix)]
+#[test]
+fn hand_edit_under_speculation_aborts_instead_of_asking() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    // x is out of date through a source: a hand edit alone does not make a
+    // target out of date (its own inputs are what redo checks), so the
+    // guard is only reached once x would actually be rebuilt.
+    p.write("s.txt", "1\n");
+    p.write(
+        "x.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 's.txt']!\n\"gen\\n\" @out writeFile\n",
+    );
+    p.write(
+        "b.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'x.txt']!\n\"x.txt\" readFile @out writeFile\n",
+    );
+    // Slow enough that the speculative branch reaches x before a's own
+    // build finishes and the drain abandons it.
+    p.write("c.txt.do", "args :2: out!\n['sleep' '0.5']!\n\"c\\n\" @out writeFile\n");
+    // a's dep is chosen by a source file, so the checker cannot know up front
+    // that a must rebuild, and speculation over the recorded a -> b runs.
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n\
+         ['redo-msh' 'ifchange' 'flag.txt']!\n\
+         \"flag.txt\" readFile dep!\n\
+         ['redo-msh' 'ifchange' @dep]!\n\
+         @dep readFile @out writeFile\n",
+    );
+    p.write(
+        "top.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'a.txt']!\n\"a.txt\" readFile @out writeFile\n",
+    );
+    p.write("flag.txt", "b.txt");
+    let out = p.redo(&["top.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(p.read("top.txt"), "gen\n");
+
+    std::fs::write(p.dir.join("x.txt"), "HAND\n").unwrap();
+    p.write("s.txt", "2\n");
+    p.write("flag.txt", "c.txt");
+    // -j2: the speculative branch needs a token while a's own build holds
+    // one; -v is where a quarantined refusal would surface.
+    let out = p
+        .redo_cmd(&["-j2", "-v", "top.txt"])
+        .env("REDO_KEEP_LOGS", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(p.read("top.txt"), "c\n");
+    assert_eq!(p.read("x.txt"), "HAND\n", "the hand edit must survive");
+    let mut everything = stderr(&out);
+    for f in p.log_files() {
+        everything.push_str(&std::fs::read_to_string(p.dir.join(".redom/logs").join(f)).unwrap_or_default());
+    }
+    assert!(
+        !everything.to_lowercase().contains("refusing to overwrite"),
+        "speculative work asked (or refused) about x:\n{everything}"
+    );
 }
 
 /// `sources`, `targets`, and `ood` introspection.
@@ -1261,4 +1512,69 @@ fn explicit_redo_of_forgotten_target_refuses_then_heals_with_yes() {
     p.write("use.txt.do", "args :2: out!\n['redo-msh' 'ifchange' 'sub/gen.txt']!\n\"sub/gen.txt\" readFile @out writeFile\n");
     assert!(p.redo(&["use.txt"]).status.success());
     assert_eq!(p.read("use.txt"), "built\n");
+}
+
+/// A builder blocked on another process's lock follows that builder's log
+/// live (as apenwarr's redo-log does on `waiting`), instead of parking until
+/// its own do-file finishes and replaying everything else as one late dump.
+/// `b` grabs `shared`'s lock first; `a` waits on it, and `shared`'s output
+/// must stream under `a`'s block — before `a` resumes — not after `b`.
+#[cfg(unix)]
+#[test]
+fn waiting_on_lock_follows_the_holder_live() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "shared.txt.do",
+        "args :2: out!\n\
+         0 i!\n\
+         (\n\
+         \t@i 5 >= if break end\n\
+         \t\"SHARED\" wle\n\
+         \t['sleep' '0.1']!\n\
+         \t@i 1 + i!\n\
+         ) loop\n\
+         \"s\\n\" @out writeFile\n",
+    );
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n\
+         ['sleep' '0.2']!\n\
+         \"A-1\" wle\n\
+         ['redo-msh' 'ifchange' 'shared.txt']!\n\
+         \"A-2\" wle\n\
+         \"a\\n\" @out writeFile\n",
+    );
+    p.write(
+        "b.txt.do",
+        "args :2: out!\n\
+         \"B-1\" wle\n\
+         ['redo-msh' 'ifchange' 'shared.txt']!\n\
+         \"B-2\" wle\n\
+         \"b\\n\" @out writeFile\n",
+    );
+    p.write("all.do", "['redo-msh' 'ifchange' 'a.txt' 'b.txt']!\n");
+
+    let out = p.redo(&["-j2", "all"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    let err = stderr(&out);
+    let lines: Vec<&str> = err.lines().collect();
+    let pos = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| *l == needle)
+            .unwrap_or_else(|| panic!("missing line {needle:?} in:\n{err}"))
+    };
+    assert_eq!(lines.iter().filter(|l| **l == "SHARED").count(), 5, "{err}");
+    let waiting = pos("    redo  shared.txt  (waiting on lock)");
+    let last_shared = lines.iter().rposition(|l| *l == "SHARED").unwrap();
+    let resumed = pos("  redo  a.txt  (resumed)");
+    assert!(pos("A-1") < waiting, "{err}");
+    assert!(waiting < last_shared, "{err}");
+    assert!(last_shared < resumed, "{err}");
+    assert!(resumed < pos("A-2"), "{err}");
+    assert!(pos("A-2") < pos("B-2"), "{err}");
+    assert!(p.log_files().is_empty(), "logs left behind: {:?}", p.log_files());
 }
