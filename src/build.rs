@@ -86,6 +86,9 @@ const E_ROOT: &str = "REDO_ROOT";
 const E_TARGET: &str = "REDO_TARGET";
 const E_SESSION: &str = "REDO_SESSION";
 const E_DEPTH: &str = "REDO_DEPTH";
+/// Whether a human is attached to this build, decided ONCE by the top-level
+/// process and inherited by every child (see `user_present`).
+const E_INTERACTIVE: &str = "REDO_INTERACTIVE";
 const E_CHAIN: &str = "REDO_CHAIN";
 
 impl Ctx {
@@ -99,6 +102,11 @@ impl Ctx {
         let conn = root.open_db()?;
         let session = db::next_runid(&conn)?;
         let config = crate::config::Config::load(&root.dir)?;
+        // Decide interactivity here, where the standard streams still say
+        // something, and publish it to the whole process tree.
+        if std::env::var_os(E_INTERACTIVE).is_none() {
+            std::env::set_var(E_INTERACTIVE, if probe_user_present() { "1" } else { "0" });
+        }
         let ctx = Ctx {
             root,
             conn,
@@ -636,13 +644,26 @@ fn overwrite_none() -> bool {
         || std::env::var("REDO_NO").as_deref() == Ok("1")
 }
 
-/// Whether a human is plausibly attached: stdin or stderr is the terminal.
-/// The conversation itself runs on the console device (`/dev/tty`,
-/// `CONIN$`/`CONOUT$`), so a nested redo whose stderr is captured into a
-/// target log can still ask — but a run with every standard stream detached
-/// (CI, tests, cron) must fail closed rather than read keystrokes from
-/// whatever terminal happens to be attached to the process.
+/// Whether a human is attached to this build. The top-level process decides
+/// once (`probe_user_present`) and publishes the verdict as `REDO_INTERACTIVE`
+/// for the whole tree; a child redo must not re-probe, because its streams
+/// say nothing about the human: its stdin is `/dev/null` and its stderr is
+/// the target's log file (`run_dofile`), so a per-process probe answered
+/// "no" for every target below the top level and the prompt only ever fired
+/// for top-level targets. The conversation itself runs on the console device
+/// (`/dev/tty`, `CONIN$`/`CONOUT$`), which is reachable from any depth.
 fn user_present() -> bool {
+    match std::env::var(E_INTERACTIVE).as_deref() {
+        Ok("1") => true,
+        Ok(_) => false,
+        Err(_) => probe_user_present(),
+    }
+}
+
+/// The top-level probe: stdin or stderr is a terminal. A run with every
+/// standard stream detached (CI, tests, cron) must fail closed rather than
+/// read keystrokes from whatever terminal happens to be attached.
+fn probe_user_present() -> bool {
     std::io::stdin().is_terminal() || std::io::stderr().is_terminal()
 }
 

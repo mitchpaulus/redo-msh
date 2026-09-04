@@ -454,11 +454,11 @@ deadlock.
 - ~~The overwrite prompt's release/spin-reacquire path in
   `prompt_overwrite`~~ — modeled (TokenPool `PromptMode = "release"`): it
   was a deadlock, not just a conservation risk; the code now holds its
-  token across the prompt (`TokenPool_PromptHold`). Still to do: gate
-  prompts on a lineage-demanded check that aborts speculative lineages
-  (R6), and decide interactivity once at the top level — a nested redo's
-  stdin is null and its stderr is a log file, so today's per-process
-  `user_present()` never asks below the top level.
+  token across the prompt (`TokenPool_PromptHold`), and the top-level
+  process decides interactivity once (`REDO_INTERACTIVE`) instead of every
+  child re-probing streams that are null/log-redirected below the top
+  level. Still to do: gate prompts on a lineage-demanded check that aborts
+  speculative lineages (R6).
 - Rust-level concurrency (atomics orderings, channel lifetimes) is out of
   TLA+'s scope; `loom` tests of `run_parallel` and the jobserver's
   compare-exchange loop are the complementary tool.
