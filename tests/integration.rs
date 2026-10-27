@@ -139,6 +139,20 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// Make a file writable again, as a person does before editing a built
+/// (read-only) output.
+fn make_writable(path: &Path) {
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    perms.set_readonly(false);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
 // ---- ported scenarios -------------------------------------------------------
 
 /// Basic build from sources, then incremental: no-op rebuild, edit a source.
@@ -445,7 +459,11 @@ fn manual_edit_protected() {
     );
     assert!(p.redo(&["out.txt"]).status.success());
 
-    std::fs::write(p.dir.join("out.txt"), "HAND\n").unwrap();
+    // Built outputs are read-only; editing one starts by making it writable.
+    let out_path = p.dir.join("out.txt");
+    assert!(std::fs::metadata(&out_path).unwrap().permissions().readonly());
+    make_writable(&out_path);
+    std::fs::write(&out_path, "HAND\n").unwrap();
     // Non-tty, no --yes: must refuse and preserve the edit.
     let out = p.redo(&["out.txt"]);
     assert!(!out.status.success());
@@ -631,20 +649,29 @@ fn default_does_not_cross_dirs() {
     assert!(!out.status.success(), "inner/default.do must not build x/foo");
 }
 
-/// The committed target gets normal (0644) permissions, not the private mode of
-/// the temp file. (ports t/130-mode)
-#[cfg(unix)]
+/// Committed targets are read-only, so editing a built output is a deliberate
+/// act; on Unix they are readable by everyone (not the private mode of the
+/// temp file) and writable by no one. (ports t/130-mode)
 #[test]
-fn output_mode_is_644() {
-    use std::os::unix::fs::PermissionsExt;
+fn built_outputs_are_read_only() {
     if skip() {
         return;
     }
     let p = Project::new();
     p.write("m.txt.do", "\"hi\" wl\n");
     assert!(p.redo(&["m.txt"]).status.success());
-    let mode = std::fs::metadata(p.dir.join("m.txt")).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o644, "committed target should be 0644, got {mode:o}");
+    let perms = std::fs::metadata(p.dir.join("m.txt")).unwrap().permissions();
+    assert!(perms.readonly(), "committed target should be read-only");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = perms.mode() & 0o777;
+        assert_eq!(mode & 0o444, 0o444, "committed target should be readable by all, got {mode:o}");
+        assert_eq!(mode & 0o222, 0, "committed target should not be writable, got {mode:o}");
+    }
+    // Rebuilding replaces a read-only output without complaint.
+    assert!(p.redo(&["m.txt"]).status.success());
+    assert_eq!(p.read("m.txt"), "hi\n");
 }
 
 /// A failing do-file fails the build, and an `ifchange` of a missing,
@@ -1323,13 +1350,18 @@ fn racy_source_rewrite_is_detected() {
         "out.txt.do",
         "args :2: out!\n['redo-msh' 'ifchange' 'src.txt']!\n\"src.txt\" readFile @out writeFile\n",
     );
+    // Pin the source's mtime a minute ahead, so redo's hash of it can never
+    // be safely older than that mtime, however long the first build takes
+    // on a loaded machine. (A real same-tick write hashes within a few
+    // milliseconds of the mtime; the rule under test is the same.)
+    let src = p.dir.join("src.txt");
+    let mtime = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
     assert!(p.redo(&["ifchange", "out.txt"]).status.success());
     assert_eq!(p.read("out.txt"), "AAAA\n");
 
-    // Same size, original mtime restored: exactly what a second write in the
-    // same timestamp tick leaves behind.
-    let src = p.dir.join("src.txt");
-    let mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+    // Same size, same mtime: exactly what a second write in the same
+    // timestamp tick leaves behind.
     std::fs::write(&src, "BBBB\n").unwrap();
     std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
 

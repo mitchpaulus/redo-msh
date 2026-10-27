@@ -459,6 +459,15 @@ pub(crate) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
         if win_posix_rename(src, dst).is_ok() {
             return Ok(());
         }
+        // MoveFileEx refuses to replace a read-only file (built outputs are
+        // read-only), so clear the attribute on the file being replaced.
+        if let Ok(meta) = fs::metadata(dst) {
+            if meta.permissions().readonly() {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(dst, perms);
+            }
+        }
     }
     let mut delay = std::time::Duration::from_millis(2);
     for attempt in 0..RENAME_RETRIES {
@@ -494,6 +503,8 @@ fn win_posix_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
     const FILE_SHARE_ALL: u32 = 0x0000_0007; // READ | WRITE | DELETE
     const REPLACE_IF_EXISTS: u32 = 0x0000_0001;
     const POSIX_SEMANTICS: u32 = 0x0000_0002;
+    // Replace the destination even if it is read-only (built outputs are).
+    const IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0040;
 
     // The handle needs DELETE access to be renamed.
     let file = fs::OpenOptions::new()
@@ -512,7 +523,7 @@ fn win_posix_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
     // within it and pass its true length as the buffer size.
     unsafe {
         let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
-        (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS;
+        (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE;
         (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength = name_bytes as u32;
         let name_dst = core::ptr::addr_of_mut!((*info).FileName) as *mut u16;
@@ -540,9 +551,45 @@ struct TempGuard {
 impl Drop for TempGuard {
     fn drop(&mut self) {
         for p in &self.paths {
-            let _ = fs::remove_file(p);
+            let _ = remove_file_forced(p);
         }
     }
+}
+
+/// Make a finished output read-only, so that editing a built file is a
+/// deliberate act (editors ask before overwriting a read-only file) rather
+/// than an accident. Regular files only: a symlink would pass the change on
+/// to the file it points at, and a read-only directory would get in the way
+/// of the do-file's own layout. Best effort: on a filesystem that ignores
+/// permissions the output simply stays writable. Nothing in redo relies on
+/// the bit; the content hash remains the only evidence of a hand edit.
+fn seal_output(path: &Path) {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_file() {
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+}
+
+/// Remove a file even if it is read-only. Unix only needs write access to
+/// the directory; Windows refuses to delete a read-only file, so clear the
+/// attribute and retry.
+fn remove_file_forced(path: &Path) -> std::io::Result<()> {
+    let first = fs::remove_file(path);
+    #[cfg(windows)]
+    if let Err(e) = &first {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            if let Ok(meta) = fs::metadata(path) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+                return fs::remove_file(path);
+            }
+        }
+    }
+    first
 }
 
 /// Remove leftover `<target>.redo-tmp.*` files (e.g. from a previously crashed
@@ -562,7 +609,7 @@ fn clean_target_temps(dodir: &Path, arg_target: &str) {
         for e in entries.flatten() {
             if let Some(name) = e.file_name().to_str() {
                 if name.starts_with(&prefix) {
-                    let _ = fs::remove_file(e.path());
+                    let _ = remove_file_forced(&e.path());
                 }
             }
         }
@@ -1266,6 +1313,7 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     }
 
     if tmp3_abs.exists() {
+        seal_output(&tmp3_abs);
         fsync_file(&tmp3_abs)?;
         // Record the output's hash as pending before installing it: if this
         // process dies between the rename and the commit, the next build
@@ -1282,7 +1330,7 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         crash_point("after-rename");
     } else {
         // No output at all: a phony/virtual target. Remove any stale file.
-        let _ = fs::remove_file(&target_abs);
+        let _ = remove_file_forced(&target_abs);
     }
 
     // Record the post-build stamp and drop the in-flight marker recorded

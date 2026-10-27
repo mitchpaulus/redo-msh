@@ -13,6 +13,7 @@ Requirements and what will be different:
 
 - It will be written in Rust
 - It will handle manually updated files with more interaction if run from tty. It will ask the user if it should be overwritten by build.
+- Built outputs are made read-only, so editing one is a deliberate act (editors ask first) rather than an accident. This is friction only: hand edits are still detected by content hash, and redo replaces its own read-only outputs freely.
 - It can use SQLite as the data store. `.redom/redo-msh.db` in the "project root".
 
 - Support both stdout and `$3` output styles. Error if both received.

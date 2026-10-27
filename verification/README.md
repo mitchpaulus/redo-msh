@@ -66,7 +66,7 @@ Out of scope by decision. No spec checks these, and no fix is planned:
   disk.
 - **Files created at a phony target's path** are deleted by the next build
   of that target.
-- **Read-only outputs** (planned) are friction against accidental edits, an
+- **Read-only outputs** are friction against accidental edits, an
   implementation detail; no verified property depends on them.
 
 ## The specs

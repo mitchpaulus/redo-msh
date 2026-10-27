@@ -7,6 +7,7 @@ Inspired by the great implementation by [`apenwarr`](https://github.com/apenwarr
 
 - Cross Platform: works on Windows, WSL within Windows, Linux, MacOS.
 - Ability to better handle when targets have been manually edited.
+- Built outputs are read-only, so editing one by accident is harder.
 - Slightly different, but robust, change detection mechanisms from the `apenwarr` implementation.
 - Written in Rust(?)
 
