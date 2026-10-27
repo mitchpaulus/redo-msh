@@ -43,10 +43,20 @@
 (* check-and-insert per edge (one SQLite write transaction in the          *)
 (* implementation).                                                        *)
 (*                                                                         *)
-(* Out-of-date evaluation: `clean` is a nondeterministically chosen        *)
-(* subset of Cleanable at Init (TLC explores every subset); only clean     *)
-(* targets with no soft failure may verify. Do-file failure is a           *)
-(* nondeterministic build outcome (BuildsCanFail).                         *)
+(* Out-of-date evaluation has two parts, as in is_ood:                     *)
+(*   - `clean`: the target's OWN inputs (sources, do-file) are unchanged   *)
+(*     -- a nondeterministically chosen subset of Cleanable at Init (TLC   *)
+(*     explores every subset), restricted to targets whose recorded deps   *)
+(*     equal their actual deps. That restriction is the determinism        *)
+(*     assumption made explicit: a do-file whose own inputs and recorded   *)
+(*     deps are all unchanged would declare the same deps again, so a      *)
+(*     stale dep list implies the target is not clean.                     *)
+(*   - deps: every recorded dep settled ok AND none was rebuilt with       *)
+(*     DIFFERENT content. `changed` is chosen nondeterministically at each *)
+(*     commit: a rebuild may reproduce identical bytes (pruning: the       *)
+(*     parent can still verify, as redo's content hashing allows) or not   *)
+(*     (the parent must rebuild).                                          *)
+(* Do-file failure is a nondeterministic build outcome (BuildsCanFail).    *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -80,12 +90,13 @@ VARIABLES
     bpending,    \* actual deps not yet processed while building
     bedges,      \* live wait edges from the running do-file's ifchange
     mustRebuild, \* soft failure noted: verify is off the table
-    clean,       \* targets whose content would verify up to date (frozen)
+    clean,       \* targets whose own inputs are unchanged (frozen at Init)
+    changed,     \* [Targets -> BOOLEAN]: the last commit changed its content
     tokens,      \* free do-file tokens
     builds       \* commit counts (history, for invariants)
 
 vars == <<st, cpending, cedges, bpending, bedges, mustRebuild, clean,
-          tokens, builds>>
+          changed, tokens, builds>>
 
 States == {"unreq", "checking", "brun", "bwait", "built", "verified", "failed"}
 DoneSt == {"built", "verified"}
@@ -99,6 +110,7 @@ TypeOK ==
                           /\ bedges[t] \subseteq Actual[t]
     /\ mustRebuild \in [Targets -> BOOLEAN]
     /\ clean \subseteq Cleanable
+    /\ changed \in [Targets -> BOOLEAN]
     /\ tokens \in 0..J
     /\ builds \in [Targets -> Nat]
 
@@ -109,7 +121,8 @@ Init ==
     /\ bpending = [t \in Targets |-> {}]
     /\ bedges = [t \in Targets |-> {}]
     /\ mustRebuild = [t \in Targets |-> FALSE]
-    /\ clean \in SUBSET Cleanable
+    /\ clean \in SUBSET {t \in Cleanable : Recorded[t] = Actual[t]}
+    /\ changed = [t \in Targets |-> FALSE]
     /\ tokens = J
     /\ builds = [t \in Targets |-> 0]
 
@@ -129,7 +142,7 @@ CanReach(x, y) == y \in Closure({x})
 CSkipDone(t, d) ==
     /\ st[t] = "checking" /\ d \in cpending[t] /\ st[d] \in DoneSt
     /\ cpending' = [cpending EXCEPT ![t] = @ \ {d}]
-    /\ UNCHANGED <<st, cedges, bpending, bedges, mustRebuild, clean, tokens,
+    /\ UNCHANGED <<st, cedges, bpending, bedges, mustRebuild, clean, changed, tokens,
                    builds>>
 
 (* Recorded dep failed: SOFT -- the parent just cannot verify. *)
@@ -137,14 +150,14 @@ CSkipFailed(t, d) ==
     /\ st[t] = "checking" /\ d \in cpending[t] /\ st[d] = "failed"
     /\ cpending' = [cpending EXCEPT ![t] = @ \ {d}]
     /\ mustRebuild' = [mustRebuild EXCEPT ![t] = TRUE]
-    /\ UNCHANGED <<st, cedges, bpending, bedges, clean, tokens, builds>>
+    /\ UNCHANGED <<st, cedges, bpending, bedges, clean, changed, tokens, builds>>
 
 CFresh(t, d) ==
     /\ st[t] = "checking" /\ d \in cpending[t] /\ st[d] = "unreq"
     /\ st' = [st EXCEPT ![d] = "checking"]
     /\ cpending' = [cpending EXCEPT ![t] = @ \ {d}, ![d] = Recorded[d]]
     /\ cedges' = [cedges EXCEPT ![t] = @ \cup {d}]
-    /\ UNCHANGED <<bpending, bedges, mustRebuild, clean, tokens, builds>>
+    /\ UNCHANGED <<bpending, bedges, mustRebuild, clean, changed, tokens, builds>>
 
 (* Wait for an in-flight recorded dep -- unless waiting would close a
    cycle, which is SOFT here: skip the wait, force the rebuild path (the
@@ -159,26 +172,30 @@ CWait(t, d) ==
          ELSE /\ cpending' = [cpending EXCEPT ![t] = @ \ {d}]
               /\ cedges' = [cedges EXCEPT ![t] = @ \cup {d}]
               /\ UNCHANGED mustRebuild
-    /\ UNCHANGED <<st, bpending, bedges, clean, tokens, builds>>
+    /\ UNCHANGED <<st, bpending, bedges, clean, changed, tokens, builds>>
 
 (* A dep we were waiting on failed after the edge went in: SOFT. *)
 CDropFailed(t, d) ==
     /\ st[t] = "checking" /\ d \in cedges[t] /\ st[d] = "failed"
     /\ cedges' = [cedges EXCEPT ![t] = @ \ {d}]
     /\ mustRebuild' = [mustRebuild EXCEPT ![t] = TRUE]
-    /\ UNCHANGED <<st, cpending, bpending, bedges, clean, tokens, builds>>
+    /\ UNCHANGED <<st, cpending, bpending, bedges, clean, changed, tokens, builds>>
 
 CheckSettled(t) ==
     /\ cpending[t] = {}
     /\ \A d \in cedges[t] : st[d] \in DoneSt
 
-(* Up to date: only if every recorded dep settled ok, nothing soft-failed,
-   and the content verdict is clean. *)
+(* A recorded dep whose rebuild produced different content. *)
+DepChanged(t) == \E d \in Recorded[t] : st[d] = "built" /\ changed[d]
+
+(* Up to date: only if every recorded dep settled ok, none changed content,
+   nothing soft-failed, and the target's own inputs are clean. *)
 Verify(t) ==
     /\ st[t] = "checking" /\ CheckSettled(t) /\ ~mustRebuild[t] /\ t \in clean
+    /\ ~DepChanged(t)
     /\ st' = [st EXCEPT ![t] = "verified"]
     /\ cedges' = [cedges EXCEPT ![t] = {}]
-    /\ UNCHANGED <<cpending, bpending, bedges, mustRebuild, clean, tokens,
+    /\ UNCHANGED <<cpending, bpending, bedges, mustRebuild, clean, changed, tokens,
                    builds>>
 
 (* Run the do-file. mustRebuild lets the build start WITHOUT waiting for
@@ -193,7 +210,7 @@ BeginBuild(t) ==
     /\ cpending' = [cpending EXCEPT ![t] = {}]
     /\ cedges' = [cedges EXCEPT ![t] = {}]
     /\ bpending' = [bpending EXCEPT ![t] = Actual[t]]
-    /\ UNCHANGED <<bedges, mustRebuild, clean, builds>>
+    /\ UNCHANGED <<bedges, mustRebuild, clean, changed, builds>>
 
 ----------------------------------------------------------------------------
 (* Build phase: the do-file runs and redo-ifchanges its ACTUAL deps.      *)
@@ -201,7 +218,7 @@ BeginBuild(t) ==
 BSkipDone(t, d) ==
     /\ st[t] = "brun" /\ d \in bpending[t] /\ st[d] \in DoneSt
     /\ bpending' = [bpending EXCEPT ![t] = @ \ {d}]
-    /\ UNCHANGED <<st, cpending, cedges, bedges, mustRebuild, clean, tokens,
+    /\ UNCHANGED <<st, cpending, cedges, bedges, mustRebuild, clean, changed, tokens,
                    builds>>
 
 (* An actual dep failed: HARD -- the build fails, token comes back. *)
@@ -211,7 +228,7 @@ BFailDep(t, d) ==
     /\ bpending' = [bpending EXCEPT ![t] = {}]
     /\ bedges' = [bedges EXCEPT ![t] = {}]
     /\ tokens' = tokens + 1
-    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, builds>>
+    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, changed, builds>>
 
 (* Discovery: the do-file demands a target nobody has touched. *)
 BFresh(t, d) ==
@@ -220,7 +237,7 @@ BFresh(t, d) ==
     /\ cpending' = [cpending EXCEPT ![d] = Recorded[d]]
     /\ bpending' = [bpending EXCEPT ![t] = @ \ {d}]
     /\ bedges' = [bedges EXCEPT ![t] = @ \cup {d}]
-    /\ UNCHANGED <<cedges, mustRebuild, clean, tokens, builds>>
+    /\ UNCHANGED <<cedges, mustRebuild, clean, changed, tokens, builds>>
 
 (* Wait on an in-flight actual dep; a cycle here is a REAL dependency
    cycle: HARD error. Same atomic check-and-insert. *)
@@ -234,7 +251,7 @@ BWait(t, d) ==
          ELSE /\ bpending' = [bpending EXCEPT ![t] = @ \ {d}]
               /\ bedges' = [bedges EXCEPT ![t] = @ \cup {d}]
               /\ UNCHANGED <<st, tokens>>
-    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, builds>>
+    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, changed, builds>>
 
 (* Blocked in redo-ifchange: the do-file stops executing and its token
    frees a slot (justified by TokenPool's Bound: children's own tokens
@@ -244,7 +261,7 @@ Yield(t) ==
     /\ \E d \in bedges[t] : st[d] \notin DoneSt
     /\ st' = [st EXCEPT ![t] = "bwait"]
     /\ tokens' = tokens + 1
-    /\ UNCHANGED <<cpending, cedges, bpending, bedges, mustRebuild, clean,
+    /\ UNCHANGED <<cpending, cedges, bpending, bedges, mustRebuild, clean, changed,
                    builds>>
 
 (* redo-ifchange returned: the do-file resumes executing under a token. *)
@@ -254,7 +271,7 @@ Resume(t) ==
     /\ tokens > 0
     /\ tokens' = tokens - 1
     /\ st' = [st EXCEPT ![t] = "brun"]
-    /\ UNCHANGED <<cpending, cedges, bpending, bedges, mustRebuild, clean,
+    /\ UNCHANGED <<cpending, cedges, bpending, bedges, mustRebuild, clean, changed,
                    builds>>
 
 (* A waited-on actual dep failed: HARD, from either build state. *)
@@ -265,7 +282,7 @@ BObserveFailRun(t) ==
     /\ bpending' = [bpending EXCEPT ![t] = {}]
     /\ bedges' = [bedges EXCEPT ![t] = {}]
     /\ tokens' = tokens + 1
-    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, builds>>
+    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, changed, builds>>
 
 BObserveFailWait(t) ==
     /\ st[t] = "bwait"
@@ -273,7 +290,7 @@ BObserveFailWait(t) ==
     /\ st' = [st EXCEPT ![t] = "failed"]
     /\ bpending' = [bpending EXCEPT ![t] = {}]
     /\ bedges' = [bedges EXCEPT ![t] = {}]
-    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, tokens, builds>>
+    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, changed, tokens, builds>>
 
 Commit(t) ==
     /\ st[t] = "brun"
@@ -283,6 +300,7 @@ Commit(t) ==
     /\ builds' = [builds EXCEPT ![t] = @ + 1]
     /\ bedges' = [bedges EXCEPT ![t] = {}]
     /\ tokens' = tokens + 1
+    /\ \E c \in BOOLEAN : changed' = [changed EXCEPT ![t] = c]
     /\ UNCHANGED <<cpending, cedges, bpending, mustRebuild, clean>>
 
 (* The do-file itself fails: token still comes back. *)
@@ -293,7 +311,7 @@ BuildFail(t) ==
     /\ bpending' = [bpending EXCEPT ![t] = {}]
     /\ bedges' = [bedges EXCEPT ![t] = {}]
     /\ tokens' = tokens + 1
-    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, builds>>
+    /\ UNCHANGED <<cpending, cedges, mustRebuild, clean, changed, builds>>
 
 ----------------------------------------------------------------------------
 TStep(t) ==
@@ -328,13 +346,22 @@ ActualDepsFirst ==
     \A t \in Targets :
         st[t] = "built" => \A d \in Actual[t] : st[d] \in DoneSt
 
-(* A verified target really was clean and saw every RECORDED dep settle
-   ok -- verification never rides over a soft failure. *)
+(* A verified target really was clean, saw every RECORDED dep settle ok,
+   and no recorded dep changed content -- verification never rides over a
+   soft failure or a changed dep (no silent staleness). *)
 VerifiedSoundly ==
     \A t \in Targets :
         st[t] = "verified" =>
             /\ t \in clean
-            /\ \A d \in Recorded[t] : st[d] \in DoneSt
+            /\ \A d \in Recorded[t] :
+                   st[d] = "verified" \/ (st[d] = "built" /\ ~changed[d])
+
+(* Coverage, EXPECTED TO BE VIOLATED: identical-content rebuilds really do
+   let a parent verify (pruning is reachable), so VerifiedSoundly is not
+   passing on a model where every rebuilt dep forces its parent. *)
+NeverVerifiedOverRebuild ==
+    ~\E t \in Targets :
+        st[t] = "verified" /\ \E d \in Recorded[t] : st[d] = "built"
 
 EventuallyQuiescent == <>Quiescent
 

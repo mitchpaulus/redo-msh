@@ -74,6 +74,69 @@ pub fn try_lock_target(root: &Root, target_rel: &str) -> Result<Option<TargetLoc
     }
 }
 
+/// Try to acquire a target's build lock by its raw key, for sweepers that
+/// only know a file's key from its name. Holding the lock while deleting a
+/// target's temp or capture file makes the sweep atomic: no build of that
+/// target can create the file between the liveness check and the delete.
+/// A missing lock file means no build ever ran; the lock is created then.
+pub fn try_lock_key(root: &Root, key: &str) -> Option<TargetLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path_for_key(root, key))
+        .ok()?;
+    file.try_lock_exclusive().ok()?;
+    Some(TargetLock { _file: file })
+}
+
+/// Whether `path` still names the file `file` has open. A lock-file creator
+/// checks this after taking its lock: a sweeper may have unlinked the path
+/// between the creator's `create` and its `lock`, leaving it holding a lock
+/// on a file nobody can find.
+pub fn same_file(file: &File, path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), fs::metadata(path)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match (win_file_id(file), File::open(path).ok().and_then(|f| win_file_id(&f))) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, path);
+        true
+    }
+}
+
+/// (volume serial, file index): a file's identity on Windows.
+#[cfg(windows)]
+fn win_file_id(file: &File) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: a zeroed BY_HANDLE_FILE_INFORMATION is a valid out-parameter,
+    // and the handle is valid for the lifetime of `file`.
+    unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) == 0 {
+            return None;
+        }
+        let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+        Some((info.dwVolumeSerialNumber, index))
+    }
+}
+
 /// Held interactive-prompt lock; releases on drop (or when the holder dies).
 pub struct PromptLock {
     _file: File,
