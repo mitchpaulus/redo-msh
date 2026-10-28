@@ -139,6 +139,20 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// Make a file writable again, as a person does before editing a built
+/// (read-only) output.
+fn make_writable(path: &Path) {
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    perms.set_readonly(false);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
 // ---- ported scenarios -------------------------------------------------------
 
 /// Basic build from sources, then incremental: no-op rebuild, edit a source.
@@ -445,7 +459,11 @@ fn manual_edit_protected() {
     );
     assert!(p.redo(&["out.txt"]).status.success());
 
-    std::fs::write(p.dir.join("out.txt"), "HAND\n").unwrap();
+    // Built outputs are read-only; editing one starts by making it writable.
+    let out_path = p.dir.join("out.txt");
+    assert!(std::fs::metadata(&out_path).unwrap().permissions().readonly());
+    make_writable(&out_path);
+    std::fs::write(&out_path, "HAND\n").unwrap();
     // Non-tty, no --yes: must refuse and preserve the edit.
     let out = p.redo(&["out.txt"]);
     assert!(!out.status.success());
@@ -631,20 +649,29 @@ fn default_does_not_cross_dirs() {
     assert!(!out.status.success(), "inner/default.do must not build x/foo");
 }
 
-/// The committed target gets normal (0644) permissions, not the private mode of
-/// the temp file. (ports t/130-mode)
-#[cfg(unix)]
+/// Committed targets are read-only, so editing a built output is a deliberate
+/// act; on Unix they are readable by everyone (not the private mode of the
+/// temp file) and writable by no one. (ports t/130-mode)
 #[test]
-fn output_mode_is_644() {
-    use std::os::unix::fs::PermissionsExt;
+fn built_outputs_are_read_only() {
     if skip() {
         return;
     }
     let p = Project::new();
     p.write("m.txt.do", "\"hi\" wl\n");
     assert!(p.redo(&["m.txt"]).status.success());
-    let mode = std::fs::metadata(p.dir.join("m.txt")).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o644, "committed target should be 0644, got {mode:o}");
+    let perms = std::fs::metadata(p.dir.join("m.txt")).unwrap().permissions();
+    assert!(perms.readonly(), "committed target should be read-only");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = perms.mode() & 0o777;
+        assert_eq!(mode & 0o444, 0o444, "committed target should be readable by all, got {mode:o}");
+        assert_eq!(mode & 0o222, 0, "committed target should not be writable, got {mode:o}");
+    }
+    // Rebuilding replaces a read-only output without complaint.
+    assert!(p.redo(&["m.txt"]).status.success());
+    assert_eq!(p.read("m.txt"), "hi\n");
 }
 
 /// A failing do-file fails the build, and an `ifchange` of a missing,
@@ -1261,4 +1288,191 @@ fn explicit_redo_of_forgotten_target_refuses_then_heals_with_yes() {
     p.write("use.txt.do", "args :2: out!\n['redo-msh' 'ifchange' 'sub/gen.txt']!\n\"sub/gen.txt\" readFile @out writeFile\n");
     assert!(p.redo(&["use.txt"]).status.success());
     assert_eq!(p.read("use.txt"), "built\n");
+}
+
+// ---- concurrency and crash-safety ------------------------------------------
+//
+// Each test below reproduces a failure found by the TLA+ specs in
+// `verification/` (and reproduced against the binary) and checks its fix.
+
+/// A project whose do-files run under `sh -e` on every platform, for tests
+/// that need `sleep` or byte-level control of their output. `None` (the test
+/// skips) when `sh` is unavailable.
+fn sh_project() -> Option<Project> {
+    if !sh_available() {
+        eprintln!("SKIP: `sh` not found on PATH");
+        return None;
+    }
+    let p = Project::new();
+    p.write("redo.toml", "[interpreter]\ndefault = [\"sh\", \"-e\"]\n");
+    Some(p)
+}
+
+/// Start `redo-msh <args>` in the background, its stderr going to `err_file`
+/// in the project (a file, not a pipe, so it can never block the child).
+fn spawn_redo(p: &Project, args: &[&str], err_file: &str) -> std::process::Child {
+    let err = std::fs::File::create(p.dir.join(err_file)).unwrap();
+    p.redo_cmd(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(err)
+        .spawn()
+        .expect("spawn redo-msh")
+}
+
+/// Wait for `child`, failing the test if it runs longer than `secs`: a hang.
+fn wait_or_fail(child: &mut std::process::Child, secs: u64, what: &str) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} hung for {secs} s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A source rewritten within the timestamp tick in which redo hashed it
+/// keeps its mtime and size. redo must not trust its cached hash for such a
+/// "racily clean" file: the rebuild has to see the new contents
+/// (verification/LockSession_RacyStamp).
+#[test]
+fn racy_source_rewrite_is_detected() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("src.txt", "AAAA\n");
+    p.write(
+        "out.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'src.txt']!\n\"src.txt\" readFile @out writeFile\n",
+    );
+    // Pin the source's mtime a minute ahead, so redo's hash of it can never
+    // be safely older than that mtime, however long the first build takes
+    // on a loaded machine. (A real same-tick write hashes within a few
+    // milliseconds of the mtime; the rule under test is the same.)
+    let src = p.dir.join("src.txt");
+    let mtime = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
+    assert!(p.redo(&["ifchange", "out.txt"]).status.success());
+    assert_eq!(p.read("out.txt"), "AAAA\n");
+
+    // Same size, same mtime: exactly what a second write in the same
+    // timestamp tick leaves behind.
+    std::fs::write(&src, "BBBB\n").unwrap();
+    std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
+
+    let out = p.redo(&["ifchange", "out.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(p.read("out.txt"), "BBBB\n", "a racily clean cached hash was trusted");
+}
+
+/// Another redo run starting up must not delete a running build's stdout
+/// capture. It used to: the build then committed its target as "no output"
+/// and deleted it (verification/SharedPaths_TempGc).
+#[test]
+fn concurrent_run_does_not_delete_stdout_output() {
+    let Some(p) = sh_project() else { return };
+    p.write("slow.do", "sleep 2\necho hello\n");
+    p.write("other.do", "echo other\n");
+    let mut slow = spawn_redo(&p, &["slow"], "slow.err");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let out = p.redo(&["other"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status = wait_or_fail(&mut slow, 60, "redo slow");
+    assert!(status.success(), "{}", p.read("slow.err"));
+    assert_eq!(p.read("slow"), "hello\n");
+}
+
+/// redo dies between installing a new output and committing it. Every later
+/// build used to refuse redo's own output as "modified outside redo"; now the
+/// next build recognizes it by its pending hash (verification/
+/// LockSession_CommitWindow).
+#[test]
+fn crash_between_install_and_commit_is_recovered() {
+    let Some(p) = sh_project() else { return };
+    // Different output on every build, so the crashed build's output really
+    // differs from the recorded one.
+    p.write("t.do", "echo x >> count.log\nwc -l < count.log > \"$3\"\n");
+    assert!(p.redo(&["t"]).status.success());
+
+    let out = p.redo_cmd(&["t"]).env("REDO_TEST_CRASH", "after-rename").output().unwrap();
+    assert!(!out.status.success(), "the crash hook must fire");
+
+    // Non-interactive, so a refusal would fail the build.
+    let out = p.redo(&["t"]);
+    assert!(out.status.success(), "redo refused its own output after a crash: {}", stderr(&out));
+    assert_eq!(p.read("t").trim(), "3");
+}
+
+/// The same crash on a target's first build, when only a default*.do matches:
+/// the leftover output used to be recorded as a hand-written source, forever
+/// (verification/LockSession_StaticAdopt).
+#[test]
+fn crash_on_first_build_does_not_create_a_source() {
+    let Some(p) = sh_project() else { return };
+    p.write("default.out.do", "echo x >> count.log\nwc -l < count.log > \"$3\"\n");
+    p.write("top.do", "redo-ifchange x.out\ncat x.out > \"$3\"\n");
+
+    let out = p.redo_cmd(&["x.out"]).env("REDO_TEST_CRASH", "after-rename").output().unwrap();
+    assert!(!out.status.success(), "the crash hook must fire");
+    assert!(p.exists("x.out"));
+
+    let out = p.redo(&["top"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sources = p.stdout_of(&["sources"]);
+    assert!(!sources.lines().any(|l| l == "x.out"), "redo's output became a source: {sources}");
+    let targets = p.stdout_of(&["targets"]);
+    assert!(targets.lines().any(|l| l == "x.out"), "x.out must be a target: {targets}");
+}
+
+/// Two concurrent runs entering a dependency cycle from opposite sides used
+/// to deadlock, each blocked on the other's lock forever
+/// (verification/CycleLock_CycleParallel). Now both fail with a cycle error.
+#[test]
+fn concurrent_cycle_errors_instead_of_deadlocking() {
+    let Some(p) = sh_project() else { return };
+    p.write("a.do", "sleep 1\nredo-ifchange b\necho a > \"$3\"\n");
+    p.write("b.do", "sleep 1\nredo-ifchange a\necho b > \"$3\"\n");
+    let mut ra = spawn_redo(&p, &["a"], "a.err");
+    let mut rb = spawn_redo(&p, &["b"], "b.err");
+    let sa = wait_or_fail(&mut ra, 60, "redo a");
+    let sb = wait_or_fail(&mut rb, 60, "redo b");
+    let errs = p.read("a.err") + &p.read("b.err");
+    assert!(!sa.success() && !sb.success(), "both runs must fail: {errs}");
+    assert!(errs.contains("cycle"), "expected a cycle error: {errs}");
+}
+
+/// Two concurrent runs needing the same out-of-date dependency build it once:
+/// the second, on getting the lock, finds the first already brought it up to
+/// date (verification/LockSession_TwoSessions). Neither run's live log shows
+/// a false "(crashed)" or "(log missing)" (verification/SharedPaths_LogRace).
+#[test]
+fn concurrent_runs_build_shared_dependency_once() {
+    let Some(p) = sh_project() else { return };
+    p.write("src.txt", "v1\n");
+    p.write("c.do", "redo-ifchange src.txt\necho built >> count.log\nsleep 1\ncat src.txt > \"$3\"\n");
+    p.write("x.do", "redo-ifchange c\ncat c > \"$3\"\n");
+    p.write("y.do", "redo-ifchange c\ncat c > \"$3\"\n");
+    assert!(p.redo(&["x", "y"]).status.success());
+    std::fs::remove_file(p.dir.join("count.log")).unwrap();
+    p.write("src.txt", "v2\n");
+
+    let mut rx = spawn_redo(&p, &["x"], "x.err");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut ry = spawn_redo(&p, &["y"], "y.err");
+    let sx = wait_or_fail(&mut rx, 60, "redo x");
+    let sy = wait_or_fail(&mut ry, 60, "redo y");
+    assert!(sx.success(), "{}", p.read("x.err"));
+    assert!(sy.success(), "{}", p.read("y.err"));
+    assert_eq!(p.lines("count.log"), 1, "c was rebuilt by both runs");
+    assert_eq!(p.read("x"), "v2\n");
+    assert_eq!(p.read("y"), "v2\n");
+    for f in ["x.err", "y.err"] {
+        let e = p.read(f);
+        assert!(!e.contains("(crashed)") && !e.contains("(log missing)"), "{f}: {e}");
+    }
 }

@@ -1,15 +1,16 @@
 //! File stamps for change detection.
 //!
-//! A stamp is `(mtime, size, csum)`. Equality is **always** decided by `csum`
-//! (blake3 content hash); `mtime`/`size` are only fast-path accelerators used
-//! by the out-of-date engine (M3) to decide whether a re-hash is needed. In M2
-//! we always hash; the guarded fast path is layered on in M3.
+//! A stamp is `(mtime, size, csum, hashed_at)`. Equality is **always** decided
+//! by `csum` (blake3 content hash); `mtime`/`size` are only fast-path
+//! accelerators the out-of-date engine uses to decide whether a re-hash is
+//! needed, and `hashed_at` says whether that fast path may be trusted at all
+//! (see `build::stamp_is_racy`).
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sentinel csum for a path that is a directory (we do not hash directories).
 pub const DIR_CSUM: &str = "<dir>";
@@ -22,6 +23,19 @@ pub struct Stamp {
     pub size: i64,
     /// blake3 content hash, hex. The equality basis.
     pub csum: String,
+    /// When the hash was taken (unix nanoseconds), sampled before the file
+    /// was read. A later write in the same timestamp tick as `mtime` would
+    /// leave mtime and size unchanged; comparing `hashed_at` with `mtime`
+    /// tells whether such a write is possible.
+    pub hashed_at: i64,
+}
+
+/// The current time as unix nanoseconds.
+pub fn now_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 /// Modification time of `meta` as unix nanoseconds.
@@ -44,6 +58,7 @@ pub fn hash_file(path: &Path) -> Result<String> {
 /// Full stamp of `path`. Returns `Ok(None)` if the path does not exist.
 /// Follows symlinks (the resolved file's content is what matters).
 pub fn stamp_file(path: &Path) -> Result<Option<Stamp>> {
+    let hashed_at = now_nanos();
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -55,11 +70,13 @@ pub fn stamp_file(path: &Path) -> Result<Option<Stamp>> {
             mtime,
             size: 0,
             csum: DIR_CSUM.to_string(),
+            hashed_at,
         }));
     }
     Ok(Some(Stamp {
         mtime,
         size: meta.len() as i64,
         csum: hash_file(path)?,
+        hashed_at,
     }))
 }
