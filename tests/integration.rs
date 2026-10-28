@@ -1476,3 +1476,188 @@ fn concurrent_runs_build_shared_dependency_once() {
         assert!(!e.contains("(crashed)") && !e.contains("(log missing)"), "{f}: {e}");
     }
 }
+
+// ---- watch mode -------------------------------------------------------------
+
+/// Printed by the watcher each time it settles into waiting for changes.
+const WATCHING: &str = "redo-msh: watch: watching";
+
+/// A running `redo-msh --watch`, its stderr collected on a thread so a test can
+/// wait for progress lines. Killed on drop; tests drop it only while it is
+/// waiting for changes, so no build is cut short (a killed build would leave
+/// a stray do-file holding locks).
+struct Watching {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl Watching {
+    fn start(p: &Project, args: &[&str]) -> Watching {
+        use std::io::BufRead;
+        let mut child = p
+            .redo_cmd(args)
+            .env("REDO_WATCH_INTERVAL_MS", "50")
+            .env_remove("REDO_YES")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn redo-msh --watch");
+        let err = child.stderr.take().expect("stderr piped");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(err).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Watching {
+            child,
+            lines: rx,
+            seen: Vec::new(),
+        }
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.seen.iter().filter(|l| l.contains(needle)).count()
+    }
+
+    /// Block until `n` stderr lines in total have contained `needle`.
+    fn wait_for(&mut self, needle: &str, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.count(needle) < n {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => self.seen.push(line),
+                Err(_) => panic!(
+                    "timed out waiting for {n}x {needle:?}; stderr so far:\n{}",
+                    self.seen.join("\n")
+                ),
+            }
+        }
+    }
+
+    /// Collect whatever arrives for `ms` milliseconds, to show that nothing
+    /// else happens.
+    fn idle_for(&mut self, ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match self.lines.recv_timeout(left) {
+                Ok(line) => self.seen.push(line),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+const COPY_A_DO: &str = "args :2: out!\n\"r\\n\" \"out.log\" appendFile\n['redo-msh' 'ifchange' 'a.txt']!\n\"a.txt\" readFile @out writeFile\n";
+
+/// Editing a source rebuilds; rewriting it with identical bytes does not.
+#[test]
+fn watch_rebuilds_on_change_not_on_touch() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "alpha\n");
+    p.write("out.txt.do", COPY_A_DO);
+    let mut w = Watching::start(&p, &["--watch", "out.txt"]);
+    w.wait_for(WATCHING, 1);
+    assert_eq!(p.read("out.txt"), "alpha\n");
+
+    p.write("a.txt", "changed\n");
+    w.wait_for(WATCHING, 2);
+    assert_eq!(p.read("out.txt"), "changed\n");
+    assert_eq!(p.lines("out.log"), 2);
+
+    p.write("a.txt", "changed\n"); // identical content, new mtime
+    w.idle_for(500);
+    assert_eq!(p.lines("out.log"), 2, "identical content must not rebuild");
+    assert_eq!(w.count("rebuilding"), 1, "stderr:\n{}", w.seen.join("\n"));
+}
+
+/// A hand-edited output is refused, not prompted for, and the refusal does not
+/// rebuild in a loop. Deleting the output lets the next build replace it.
+#[test]
+fn watch_refuses_hand_edit_without_looping() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "v1\n");
+    p.write("out.txt.do", COPY_A_DO);
+    let mut w = Watching::start(&p, &["--watch", "out.txt"]);
+    w.wait_for(WATCHING, 1);
+
+    let out_path = p.dir.join("out.txt");
+    make_writable(&out_path);
+    std::fs::write(&out_path, "HAND\n").unwrap();
+    p.write("a.txt", "v2\n");
+    w.wait_for("Refusing to overwrite", 1);
+    w.wait_for(WATCHING, 2);
+    w.idle_for(500);
+    assert_eq!(w.count("rebuilding"), 1, "refusal must not loop:\n{}", w.seen.join("\n"));
+    assert_eq!(p.read("out.txt"), "HAND\n");
+
+    std::fs::remove_file(&out_path).unwrap();
+    w.wait_for(WATCHING, 3);
+    assert_eq!(p.read("out.txt"), "v2\n");
+}
+
+/// A failing dependency drops out of the recorded graph (its parent records
+/// no edge to it); the watcher must still see the edit that fixes it.
+#[test]
+fn watch_retries_failed_dependency_after_fix() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'b.txt']!\n\"b.txt\" readFile @out writeFile\n",
+    );
+    p.write("b.txt.do", "['redo-msh' 'ifchange' 'no-such-dep']!\n");
+    let mut w = Watching::start(&p, &["--watch", "a.txt"]);
+    w.wait_for("build failed", 1);
+    w.wait_for(WATCHING, 1);
+    assert!(!p.exists("a.txt"));
+
+    p.write("b.txt.do", "args :2: out!\n\"fixed\\n\" @out writeFile\n");
+    w.wait_for("build succeeded", 1);
+    assert_eq!(p.read("a.txt"), "fixed\n");
+}
+
+/// A target with no do-file is built once one appears.
+#[test]
+fn watch_builds_when_dofile_appears() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    let mut w = Watching::start(&p, &["--watch"]);
+    w.wait_for("build failed", 1);
+    w.wait_for(WATCHING, 1);
+
+    p.write("all.do", "\"built\\n\" \"all.log\" appendFile\n");
+    w.wait_for("build succeeded", 1);
+    assert_eq!(p.lines("all.log"), 1);
+}
+
+#[test]
+fn watch_rejects_non_build_commands() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    let out = p.redo(&["--watch", "ood"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--watch applies to building targets"), "{}", stderr(&out));
+}

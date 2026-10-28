@@ -17,6 +17,7 @@ pub mod logs;
 pub mod paths;
 pub mod root;
 pub mod stamp;
+pub mod watch;
 pub mod winjob;
 
 use anyhow::{Context, Result};
@@ -39,12 +40,22 @@ pub fn run(raw_args: &[String]) -> Result<()> {
         println!("redo-msh {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let (jobs, args) = extract_jobs(raw_args)?;
+    let (watch, raw_args) = extract_watch(raw_args);
+    let (jobs, args) = extract_jobs(&raw_args)?;
     let (verb, rest) = match args.split_first() {
         Some((v, r)) => (v.as_str(), r.to_vec()),
         // No arguments: build the default target `all`.
-        None => return build_targets(&[], jobs),
+        None => return build_targets(&[], jobs, watch),
     };
+    if watch
+        && matches!(
+            verb,
+            "root" | "ifchange" | "ifcreate" | "always" | "stamp" | "sources" | "targets"
+                | "ood" | "tree" | "help"
+        )
+    {
+        anyhow::bail!("--watch applies to building targets, not to `{verb}`");
+    }
 
     match verb {
         "root" => cmd_root(&rest),
@@ -61,7 +72,7 @@ pub fn run(raw_args: &[String]) -> Result<()> {
             Ok(())
         }
         // No recognized verb: treat all args as targets to build.
-        _ => build::redo(&args, jobs),
+        _ => build_targets(&args, jobs, watch),
     }
 }
 
@@ -117,6 +128,9 @@ USAGE:
 OPTIONS:
     -j N, --jobs N   build up to N targets in parallel (default 1)
     -y, --yes        overwrite hand-edited targets without asking
+    -w, --watch      after building, rebuild whenever a dependency changes
+                     (hand-edited targets are refused, not prompted for,
+                     unless --yes is given)
     -v, --verbose    explain every rebuild/up-to-date decision as it is made
     --debug-jobs     trace jobserver tokens and parallel target groups
     -h, --help       show this help
@@ -182,8 +196,9 @@ fn run_forward(verb: Option<&str>, raw: &[String]) -> Result<()> {
     match verb {
         // `redo [opts] [targets...]`; no targets builds `all`.
         None => {
-            let (jobs, targets) = extract_jobs(raw)?;
-            build_targets(&targets, jobs)
+            let (watch, raw) = extract_watch(raw);
+            let (jobs, targets) = extract_jobs(&raw)?;
+            build_targets(&targets, jobs, watch)
         }
         Some("ifchange") => build::ifchange(&Ctx::from_env()?, &extract_verbose(raw)),
         Some("ifcreate") => build::ifcreate(&Ctx::from_env()?, raw),
@@ -193,9 +208,12 @@ fn run_forward(verb: Option<&str>, raw: &[String]) -> Result<()> {
     }
 }
 
-/// Build the requested targets, defaulting to `all` when none are given.
-fn build_targets(targets: &[String], jobs: usize) -> Result<()> {
-    if targets.is_empty() {
+/// Build the requested targets, defaulting to `all` when none are given; with
+/// `watch`, keep rebuilding them as their dependencies change.
+fn build_targets(targets: &[String], jobs: usize, watch: bool) -> Result<()> {
+    if watch {
+        watch::watch(targets, jobs)
+    } else if targets.is_empty() {
         build::redo(&["all".to_string()], jobs)
     } else {
         build::redo(targets, jobs)
@@ -218,6 +236,21 @@ pub fn extract_verbose(args: &[String]) -> Vec<String> {
         }
     }
     rest
+}
+
+/// Extract `-w` / `--watch` from the argument list. Not inherited by child
+/// processes: the watcher runs each build as an ordinary `redo`.
+pub fn extract_watch(args: &[String]) -> (bool, Vec<String>) {
+    let mut watch = false;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "-w" || a == "--watch" {
+            watch = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (watch, rest)
 }
 
 /// Extract `-j N` / `-jN` / `--jobs N` / `--jobs=N` from the argument list,
@@ -294,6 +327,10 @@ which existing do-files call directly.
 OPTIONS:
     -j N, --jobs N                build up to N targets in parallel (default 1)
     -y, --yes                     overwrite hand-edited targets without asking
+    -w, --watch                   after building, rebuild whenever a dependency
+                                  changes; Ctrl-C to stop. Hand-edited targets
+                                  are refused, not prompted for, unless --yes
+                                  (polls every 500ms; REDO_WATCH_INTERVAL_MS)
     -v, --verbose                 explain every rebuild/up-to-date decision as
                                   it is made (also: REDO_VERBOSE=1)
     --debug-jobs                  trace jobserver tokens and parallel target
