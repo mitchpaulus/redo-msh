@@ -1538,6 +1538,26 @@ impl Watching {
         }
     }
 
+    /// Block until the watcher exits on its own; return its status, with all
+    /// of its stderr collected.
+    fn exit(&mut self) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("watcher did not exit; stderr so far:\n{}", self.seen.join("\n"));
+            }
+            self.idle_for(50);
+        };
+        // The reader thread ends at EOF, dropping its sender.
+        while let Ok(line) = self.lines.recv_timeout(std::time::Duration::from_secs(5)) {
+            self.seen.push(line);
+        }
+        status
+    }
+
     /// Collect whatever arrives for `ms` milliseconds, to show that nothing
     /// else happens.
     fn idle_for(&mut self, ms: u64) {
@@ -1635,19 +1655,37 @@ fn watch_retries_failed_dependency_after_fix() {
     assert_eq!(p.read("a.txt"), "fixed\n");
 }
 
-/// A target with no do-file is built once one appears.
+/// A target with no do-file fails at once instead of waiting for one; so
+/// does a source file, which has nothing to rebuild.
 #[test]
-fn watch_builds_when_dofile_appears() {
+fn watch_fails_without_dofile() {
     if skip() {
         return;
     }
     let p = Project::new();
+    p.write("a.txt", "alpha\n");
+    for args in [&["--watch"][..], &["--watch", "a.txt"], &["--watch", "nope"]] {
+        let mut w = Watching::start(&p, args);
+        assert!(!w.exit().success(), "{args:?}");
+        assert_eq!(w.count("no .do file found"), 1, "{args:?}:\n{}", w.seen.join("\n"));
+        assert_eq!(w.count(WATCHING), 0, "{args:?}:\n{}", w.seen.join("\n"));
+    }
+}
+
+/// Deleting a watched target's do-file ends the watch with an error.
+#[test]
+fn watch_stops_when_dofile_removed() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("all.do", "\"built\\n\" \"all.log\" appendFile\n");
     let mut w = Watching::start(&p, &["--watch"]);
-    w.wait_for("build failed", 1);
     w.wait_for(WATCHING, 1);
 
-    p.write("all.do", "\"built\\n\" \"all.log\" appendFile\n");
-    w.wait_for("build succeeded", 1);
+    std::fs::remove_file(p.dir.join("all.do")).unwrap();
+    assert!(!w.exit().success());
+    assert_eq!(w.count("no .do file found"), 1, "{}", w.seen.join("\n"));
     assert_eq!(p.lines("all.log"), 1);
 }
 

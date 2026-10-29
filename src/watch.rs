@@ -19,6 +19,10 @@
 //! items dirty. Only a dirty item that *changed* since the last build started
 //! triggers a rebuild, so such a state waits for the next edit instead of
 //! rebuilding in a loop.
+//!
+//! Every requested target must have a do-file, checked before each build: a
+//! target redo cannot build (a typo, a do-file deleted mid-watch, a plain
+//! source file) is an error that ends the watch, not a state to wait out.
 
 use crate::db::DepKind;
 use crate::root::Root;
@@ -128,6 +132,7 @@ pub fn watch(targets: &[String], jobs: usize) -> Result<()> {
     let mut roots = requested.clone();
     let mut set = w.load(&roots, &requested)?;
     loop {
+        ensure_buildable(&w.root, &requested)?;
         // What the build is about to see, for the retry guard.
         let before = w.snapshot(&set);
         let started = stamp::now_nanos();
@@ -180,8 +185,7 @@ impl Watcher {
 
     /// Collect the watch set: every recorded dependency reachable from
     /// `roots`, plus the do-file candidates of any requested target redo has
-    /// never recorded (a build with no do-file fails before recording
-    /// anything).
+    /// never recorded (a failed build may stop before reaching it).
     fn load(&self, roots: &[String], requested: &[String]) -> Result<WatchSet> {
         let conn = self.root.open_db()?;
         let mut items = Vec::new();
@@ -197,8 +201,9 @@ impl Watcher {
             }
         };
 
-        // A requested target redo has no record of is waiting for a do-file
-        // to appear. One that just did is reported as such (dirty), not
+        // A requested target redo has no record of has no edges to watch, so
+        // watch its do-file and the more specific candidates instead. A
+        // candidate that just appeared is reported as such (dirty), not
         // silently dropped from the set before the change can be compared.
         for t in requested {
             if is_target(&conn, t)? {
@@ -375,6 +380,18 @@ impl Watcher {
             last = now;
         }
     }
+}
+
+/// Fail unless every requested target has a do-file. Watching a target redo
+/// cannot build would wait forever on nothing, and an existing file with no
+/// do-file is a source: there is nothing to rebuild.
+fn ensure_buildable(root: &Root, requested: &[String]) -> Result<()> {
+    for t in requested {
+        if crate::dofile::find(root, t).0.is_none() {
+            anyhow::bail!("watch: no .do file found to build target {t:?}");
+        }
+    }
+    Ok(())
 }
 
 /// Run one ordinary top-level build of `targets` as a child process.
