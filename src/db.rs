@@ -15,12 +15,13 @@
 //!     basis for change detection; `mtime`/`size` are fast-path accelerators.
 //!
 //! A `meta` table holds the schema version and the monotonic `runid` build
-//! counter (clock-independent). A `waits` table is the waits-for graph that
-//! turns a lock cycle between concurrent builds into an error instead of a
-//! deadlock (see `build::WaitEdge`).
+//! counter (clock-independent), and the session-wide overwrite decisions. A
+//! `waits` table is the shared waits-for graph that turns a dependency cycle
+//! between concurrent builds into an error instead of a deadlock (see
+//! `waits.rs`).
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -34,8 +35,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 /// outputs that only a `default*.do` matches become static sources, and ones
 /// with an exact `.do` are refused as "never built". So additive changes
 /// (a nullable column, a new table) migrate in place instead of bumping this
-/// (see `migrate_additive`).
-pub const SCHEMA_VERSION: i64 = 2;
+/// (see `migrate_additive`), and a bump whose incompatibility is confined to
+/// transient state upgrades in place too (see `upgrade_in_place`).
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Dependency edge kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +81,13 @@ pub fn open(db_path: &Path) -> Result<Connection> {
         convert_from_wal_if_needed(db_path)?;
     }
     if let Some(found) = incompatible_version(db_path)? {
-        eprintln!(
-            "redo-msh: .redom database schema v{found} != v{SCHEMA_VERSION}; \
-             rebuilding build state"
-        );
-        wipe(db_path);
+        if !upgrade_in_place(db_path, found)? {
+            eprintln!(
+                "redo-msh: .redom database schema v{found} != v{SCHEMA_VERSION}; \
+                 rebuilding build state"
+            );
+            wipe(db_path);
+        }
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("opening database {}", db_path.display()))?;
@@ -117,8 +121,11 @@ fn choose_journal_mode(db_path: &Path) -> JournalMode {
             ),
         }
     }
+    // Cached per process: every task thread opens its own connection, and
+    // the filesystem under one database does not change mid-run.
+    static KIND: std::sync::OnceLock<crate::fsguard::FsKind> = std::sync::OnceLock::new();
     let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    match crate::fsguard::classify(dir) {
+    match KIND.get_or_init(|| crate::fsguard::classify(dir)) {
         crate::fsguard::FsKind::MmapUnsafe => JournalMode::Persist,
         _ => JournalMode::Wal,
     }
@@ -198,6 +205,37 @@ fn incompatible_version(db_path: &Path) -> Result<Option<i64>> {
     })
 }
 
+/// Upgrade a database of an older schema in place, where that loses nothing
+/// worth keeping; `Ok(false)` means it must be wiped instead.
+///
+/// v2 -> v4: the only incompatible change is the `waits` table, whose v2
+/// layout (lock-wait edges keyed by holder) the v4 waits-for graph replaces.
+/// Its rows are transient wait edges, so dropping it is free; `init_schema`
+/// then creates the v4 layout. Racing processes serialize on the immediate
+/// transaction, and the version re-check inside it makes the loser a no-op
+/// (it must not drop a v4 table the winner may already be using).
+fn upgrade_in_place(db_path: &Path, found: i64) -> Result<bool> {
+    if found != 2 {
+        return Ok(false);
+    }
+    let mut conn = Connection::open(db_path)
+        .with_context(|| format!("opening database {} for upgrade", db_path.display()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let txn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let version: Option<i64> = txn
+        .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
+        .optional()?;
+    if version == Some(2) {
+        txn.execute_batch("DROP TABLE IF EXISTS waits;")?;
+        txn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            [SCHEMA_VERSION],
+        )?;
+    }
+    txn.commit()?;
+    Ok(true)
+}
+
 /// Remove the database and its sidecar files (both journal modes).
 fn wipe(db_path: &Path) {
     let _ = std::fs::remove_file(db_path);
@@ -213,9 +251,17 @@ fn sidecar(db_path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn apply_pragmas(conn: &Connection, mode: JournalMode) -> Result<()> {
-    // busy_timeout must be set before journal_mode: the mode change itself
-    // takes locks and can contend with concurrent peers.
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // The busy handler must be set before journal_mode: the mode change
+    // itself takes locks and can contend with concurrent peers. A custom
+    // handler with a short fixed sleep replaces SQLite's default
+    // millisecond-scale backoff: under the parallel engine many short
+    // write transactions collide constantly, and paying 1-25ms per
+    // collision serializes the build far below the database's actual
+    // throughput. 200µs x 300k retries preserves the 60s overall budget.
+    conn.busy_handler(Some(|count| {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        (count as u64) < BUSY_TIMEOUT.as_micros() as u64 / 200
+    }))?;
     match mode {
         JournalMode::Wal => {
             // WAL: many readers + one writer; preferred for the parallel peer
@@ -289,15 +335,35 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS deps_by_target ON deps(target);
 
-        -- Waits-for graph: "the build holding `holder`'s lock is waiting for
-        -- `wanted`'s lock". Inserted only while blocked on a contended lock;
-        -- an edge counts only while `holder`'s lock is still held.
+        -- The shared waits-for graph (see waits.rs), implementing the
+        -- machine verified in verification/SpeculationMP.tla: one row per
+        -- live wait edge "some traversal of `waiter` is blocked until
+        -- `dep` settles". Every settle-wait is here (rule R1) — checker
+        -- waits, speculative-spawn creation edges (which make drain waits
+        -- visible), and running-do-file demands — and cycle detection is a
+        -- reachability query run atomically with the insert. `kind` types
+        -- the edge (rule R2): 0 = hard demand (a running do-file's
+        -- redo-ifchange), 1 = soft checker wait, 2 = soft creation edge.
+        -- Cycles that ride a soft edge are resolved by evicting the
+        -- speculation, never by failing the demand (rule R3). Paths are
+        -- stored pre-lowercased (the graph only needs identity, and BINARY
+        -- comparison keeps the recursive CTE collation-exact). `owner`
+        -- identifies the inserting process and is tied to a kernel
+        -- liveness lock, so edges from dead processes can be
+        -- garbage-collected. Edges are transient state, deliberately not
+        -- scoped to a session: two concurrent redo invocations share the
+        -- same target locks, so a cross-session wait cycle is a real
+        -- deadlock and must be visible in one graph.
         CREATE TABLE IF NOT EXISTS waits (
-            holder TEXT NOT NULL COLLATE NOCASE,
-            wanted TEXT NOT NULL COLLATE NOCASE,
-            pid    INTEGER NOT NULL,
-            PRIMARY KEY (holder, wanted, pid)
+            waiter  TEXT NOT NULL,
+            dep     TEXT NOT NULL,
+            owner   TEXT NOT NULL,
+            kind    INTEGER NOT NULL,
+            PRIMARY KEY (waiter, dep, owner)
         );
+
+        CREATE INDEX IF NOT EXISTS waits_by_owner ON waits(owner);
+        CREATE INDEX IF NOT EXISTS waits_by_dep ON waits(dep);
         "#,
     )
     .context("initializing schema")?;
@@ -332,6 +398,41 @@ fn migrate_additive(conn: &Connection) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// The session-wide overwrite decision ("all" / "quit" at a prompt), shared
+/// by EVERY process of the session through the database — the in-process
+/// atomic and the child environment only reach this process and children
+/// spawned later; a sibling redo already running would otherwise ask the
+/// same question again. Stored in `meta` under `overwrite:<session>`; the
+/// value is the caller's mode code. `None`: no decision yet.
+pub fn overwrite_mode(conn: &Connection, session: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![format!("overwrite:{session}")],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?)
+}
+
+pub fn set_overwrite_mode(conn: &Connection, session: i64, mode: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+        params![format!("overwrite:{session}"), mode],
+    )?;
+    Ok(())
+}
+
+/// Forget every session's overwrite decision but `keep`'s. Called at
+/// top-level session start; a concurrent top-level session that had
+/// answered "all" is at worst asked once more.
+pub fn forget_overwrite_modes(conn: &Connection, keep: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key LIKE 'overwrite:%' AND key <> ?1",
+        params![format!("overwrite:{keep}")],
+    )?;
     Ok(())
 }
 
@@ -482,6 +583,16 @@ mod tests {
         assert_eq!(next_runid(&conn).unwrap(), 1);
         assert_eq!(next_runid(&conn).unwrap(), 2);
 
+        // Session-wide overwrite decisions: per session, forgotten at the
+        // next session start.
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), None);
+        set_overwrite_mode(&conn, 2, 1).unwrap();
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), Some(1));
+        set_overwrite_mode(&conn, 2, 2).unwrap();
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), Some(2));
+        forget_overwrite_modes(&conn, 3).unwrap();
+        assert_eq!(overwrite_mode(&conn, 2).unwrap(), None);
+
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -517,6 +628,50 @@ mod tests {
         // Reopening is a no-op.
         drop(conn);
         open(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_database_with_lock_wait_table_is_upgraded_in_place() {
+        let dir = std::env::temp_dir().join(format!("redo-msh-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        // A v2 database with v2's `waits` layout (and a stale edge in it).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', 2), ('runid', 7);
+                 CREATE TABLE files (path TEXT PRIMARY KEY COLLATE NOCASE, dofile TEXT,
+                     built_at INTEGER, mtime INTEGER, size INTEGER, csum TEXT, runid INTEGER,
+                     hashed_at INTEGER);
+                 INSERT INTO files(path, dofile, csum) VALUES ('out.txt', 'out.txt.do', 'abc');
+                 CREATE TABLE waits (holder TEXT NOT NULL COLLATE NOCASE,
+                     wanted TEXT NOT NULL COLLATE NOCASE, pid INTEGER NOT NULL,
+                     PRIMARY KEY (holder, wanted, pid));
+                 INSERT INTO waits VALUES ('a', 'b', 1);",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let dofile: String = conn
+            .query_row("SELECT dofile FROM files WHERE path = 'out.txt'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dofile, "out.txt.do");
+        let version: i64 = conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let has_waiter = conn
+            .prepare("SELECT 1 FROM pragma_table_info('waits') WHERE name = 'waiter'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has_waiter, "waits must have the current layout");
+        let edges: i64 = conn.query_row("SELECT COUNT(*) FROM waits", [], |r| r.get(0)).unwrap();
+        assert_eq!(edges, 0);
+        assert_eq!(next_runid(&conn).unwrap(), 8);
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

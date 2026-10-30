@@ -68,6 +68,11 @@ run TokenPool.tla TokenPool_PromptDeadlock.cfg deadlock
 run TokenPool.tla TokenPool_PromptHold.cfg ok
 run TokenPool.tla TokenPool_PromptSource.cfg ok
 run TokenPool.tla TokenPool_PromptSourceJ3.cfg ok
+# The same prompt fix under contention on the prompter's target lock (lock
+# waiters keep their tokens; the release-and-spin alternative deadlocks).
+run TokenPoolPromptLock.tla TokenPoolPromptLock_J2.cfg ok
+run TokenPoolPromptLock.tla TokenPoolPromptLock_J3.cfg ok
+run TokenPoolPromptLock.tla TokenPoolPromptLock_PromptHold.cfg ok
 run LockSession.tla LockSession_OneSession.cfg ok
 run LockSession.tla LockSession_Always.cfg ok
 run LockSession.tla LockSession_CommitWindow.cfg violation:NoFalseRefusal
@@ -105,6 +110,49 @@ run Speculation.tla Speculation_Stale.cfg ok
 run Speculation.tla Speculation_StaleCycle.cfg ok
 run Speculation.tla Speculation_TrueCycle.cfg ok
 run Speculation.tla Speculation_Coverage.cfg violation:NeverVerifiedOverRebuild
+# Documented gap in the single-claim design: a reversed dependency edge
+# makes BWait hard-fail through a speculative cedge. Must keep failing
+# until nobody implements this design (SpeculationMP is the replacement).
+run Speculation.tla Speculation_Reversed.cfg violation:NoFailure
+
+# The corrected multi-process machine (per-process registries, kernel
+# locks, drain — with typed edges, creation edges, and soft eviction).
+# This is the design the implementation must be rebuilt to match.
+run SpeculationMP.tla SpeculationMP_Reversed.cfg ok
+run SpeculationMP.tla SpeculationMP_CrossStale.cfg ok
+run SpeculationMP.tla SpeculationMP_TrueCycle.cfg ok
+run SpeculationMP.tla SpeculationMP_Stale.cfg ok
+run SpeculationMP.tla SpeculationMP_SpecAbort.cfg ok
+# R6: hand-edited targets prompt only on demanded lineages; elsewhere the
+# lineage aborts (sfail) so an upgrade can never report an unasked refusal.
+run SpeculationMP.tla SpeculationMP_HandEditSpec.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditYes.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditNo.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditLinDrop.cfg ok
+run SpeculationMP.tla SpeculationMP_HandEditLinKeep.cfg ok
+
+# The double-check under the lock, with content and edits: main's shallow
+# re-check verifies over a stale dep; the merged condition (deps settled in
+# this session) does not, at the price of an occasional redundant build;
+# "await" (modeled, not implemented) has neither failure.
+run ShallowRecheck.tla ShallowRecheck_Shallow.cfg violation:NoStaleRun
+run ShallowRecheck.tla ShallowRecheck_ShallowSpec.cfg violation:NoStaleRun
+run ShallowRecheck.tla ShallowRecheck_Settled.cfg ok
+run ShallowRecheck.tla ShallowRecheck_SettledMain.cfg ok
+run ShallowRecheck.tla ShallowRecheck_SettledChain.cfg ok
+run ShallowRecheck.tla ShallowRecheck_SettledRedundant.cfg violation:NoRedundantBuild
+run ShallowRecheck.tla ShallowRecheck_Coverage.cfg violation:NeverSkipAtRecheck
+run ShallowRecheck.tla ShallowRecheck_None.cfg violation:NoRedundantBuild
+run ShallowRecheck.tla ShallowRecheck_Await.cfg ok
+run ShallowRecheck.tla ShallowRecheck_AwaitChain.cfg ok
+# Three concurrent runs: about 10 minutes, so opt-in.
+if [ -n "${REDO_TLC_LONG:-}" ]; then
+    run ShallowRecheck.tla ShallowRecheck_Settled3.cfg ok
+fi
+
+# The lock-wait edge graph of main's WaitEdge, superseded in the code by
+# SpeculationMP's shared waits graph (src/waits.rs); kept as the record of
+# the cross-session cycle and stale-edge findings.
 run WaitGraph.tla WaitGraph_StaleEdge.cfg violation:NoFalseCycle
 run WaitGraph.tla WaitGraph_StaleEdgeGc.cfg ok
 run WaitGraph.tla WaitGraph_LiveCross.cfg ok
