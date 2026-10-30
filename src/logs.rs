@@ -95,10 +95,14 @@ pub fn run_lock_path(root: &Root, session: i64) -> PathBuf {
     logs_dir(root).join(format!("run.{session}.lock"))
 }
 
-pub fn target_log_path(root: &Root, target_rel: &str) -> PathBuf {
-    // Hash-derived name: shared with the lock file (same key), collision
-    // resistant, and immune to path traversal by construction.
-    logs_dir(root).join(format!("t.{}.log", crate::lock::target_key(target_rel)))
+/// A target's log for one run. Hash-derived name: the key is shared with the
+/// lock file, collision resistant, and immune to path traversal by
+/// construction. The session makes the path unique to one run, so a run's
+/// follower only ever opens and deletes its own run's logs: with one path per
+/// target, a lagging follower could delete (or tail) a log a later run had
+/// already replaced (verification/SharedPaths_LogRace, _Foreign).
+pub fn target_log_path(root: &Root, target_rel: &str, session: i64) -> PathBuf {
+    logs_dir(root).join(format!("t.{}.{session}.log", crate::lock::target_key(target_rel)))
 }
 
 // ---- events -------------------------------------------------------------
@@ -435,7 +439,7 @@ fn handle_event(
     let top = stack.last_mut().expect("stack is non-empty");
     let child_indent = if top.target == RUN_TARGET { 0 } else { top.indent + 1 };
     match ev {
-        Event::Do { target, .. } => {
+        Event::Do { session: do_session, target } => {
             print_note(child_indent, &format!("redo  {target}"));
             top.interrupted = true;
             let key = target.to_ascii_lowercase();
@@ -445,7 +449,7 @@ fn handle_event(
                 // delete now: this `do` was appended after the log's creation
                 // (I3) by the build whose `done` that frame already replayed.
                 if walk.wait_consumed.remove(&key) && !keep_logs() {
-                    let _ = fs::remove_file(target_log_path(root, &target));
+                    let _ = fs::remove_file(target_log_path(root, &target, do_session));
                 }
                 return;
             }
@@ -453,7 +457,7 @@ fn handle_event(
                 print_note(child_indent, &format!("redo  {target}  (too deep to trace)"));
                 return;
             }
-            let path = target_log_path(root, &target);
+            let path = target_log_path(root, &target, do_session);
             let reader = match open_with_retry(&path) {
                 Some(r) => r,
                 None => {
@@ -502,7 +506,7 @@ fn handle_event(
             }
             mark_interrupted(stack);
         }
-        Event::Waiting { target, .. } => {
+        Event::Waiting { session: wait_session, target } => {
             // Follow the builder we are blocked on, as apenwarr's redo-log
             // does: the holder's `do` event sits in some other log (an
             // ancestor's, or another run's) that this DFS may not reach for
@@ -517,7 +521,9 @@ fn handle_event(
             if walk.visited.contains(&key) || stack.len() > DEPTH_MAX {
                 return;
             }
-            let path = target_log_path(root, &target);
+            // The waiter's own session: a holder in this run shares it, and
+            // another run's log is not ours to open (SharedPaths_Foreign).
+            let path = target_log_path(root, &target, wait_session);
             let reader = match open_with_retry(&path) {
                 Some(r) => r,
                 None => return,
@@ -575,48 +581,92 @@ fn print_note(indent: usize, text: &str) {
 // ---- startup GC ---------------------------------------------------------
 
 /// Sweep log files left behind by crashed or killed runs. Liveness is decided
-/// by lock probes, never by age: a run log is deletable iff no live top-level
-/// holds its flock; a target log is deletable iff no builder holds the
-/// target's build lock (the log name *is* the lock key). Deleting a finished
-/// target's log out from under a concurrent run's follower costs that run a
-/// "(log missing)" note — display-only, accepted, and rare.
+/// by lock probes, never by age:
+///
+///   * a run is dead when its `run.<s>.lock` sentinel is gone or nobody holds
+///     its kernel lock. Its run log and sentinel are deleted while holding
+///     that lock, so a run can never come back to life between the check and
+///     the delete. (A live run keeps its sentinel locked from creation to
+///     exit and verifies, after locking, that the sentinel is still on disk —
+///     `acquire_run_lock` — so "sentinel gone" really means "run gone".)
+///   * a target log `t.<key>.<s>.log` belongs to run `s` and is deleted once
+///     that run is dead;
+///   * a temp `t.<key>.<s>.log.<pid>.tmp` is deleted only while holding the
+///     target's build lock, which its creator holds until it renames it.
+///
+/// Files in older formats (one log per target, no session) are swept the
+/// same way by their target's lock.
 pub fn gc_logs(root: &Root, current_session: i64) {
     if keep_logs() {
         return;
     }
-    let own_prefix = format!("run.{current_session}.");
     let dir = logs_dir(root);
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
+    let names: Vec<String> = match fs::read_dir(&dir) {
+        Ok(e) => e.flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect(),
         Err(_) => return, // No logs directory yet: nothing to sweep.
     };
-    for entry in entries.flatten() {
-        let name_os = entry.file_name();
-        let name = match name_os.to_str() {
-            Some(n) => n,
-            None => continue,
-        };
-        if name.starts_with(&own_prefix) {
-            continue; // Our own run log and lock sentinel.
+    let run_dead = |s: i64| -> bool {
+        s != current_session && lock_file_is_free(&dir.join(format!("run.{s}.lock")))
+    };
+    let parse_run = |name: &str| -> Option<i64> {
+        let rest = name.strip_prefix("run.")?;
+        rest.strip_suffix(".lock").or_else(|| rest.strip_suffix(".log"))?.parse().ok()
+    };
+
+    // Runs: delete each dead run's log and sentinel while holding its lock.
+    let mut runs: Vec<i64> = names.iter().filter_map(|n| parse_run(n)).collect();
+    runs.sort_unstable();
+    runs.dedup();
+    for s in runs {
+        if s == current_session {
+            continue;
         }
-        let stale = if name.ends_with(".tmp") {
-            true // Crashed between temp-create and rename.
-        } else if let Some(session) = name
-            .strip_prefix("run.")
-            .and_then(|n| n.strip_suffix(".log").or_else(|| n.strip_suffix(".lock")))
-        {
-            // A run's log and lock sentinel are stale together, iff no live
-            // top-level holds the sentinel's kernel lock.
-            lock_file_is_free(&dir.join(format!("run.{session}.lock")))
-        } else if let Some(key) =
-            name.strip_prefix("t.").and_then(|n| n.strip_suffix(".log"))
-        {
-            crate::lock::probe_key_unlocked(root, key)
-        } else {
-            false // Not ours to judge.
-        };
-        if stale {
-            let _ = fs::remove_file(entry.path());
+        let lock_path = dir.join(format!("run.{s}.lock"));
+        match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(f) => {
+                if f.try_lock_exclusive().is_ok() {
+                    let _ = fs::remove_file(run_log_path(root, s));
+                    let _ = fs::remove_file(&lock_path);
+                    let _ = FileExt::unlock(&f);
+                }
+            }
+            // No sentinel: the run is gone (it exited, or crashed after a
+            // sweep took its sentinel); its run log is stale.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(run_log_path(root, s));
+            }
+            Err(_) => {} // Can't tell: keep it.
+        }
+    }
+
+    for name in &names {
+        if let Some(stem) = name.strip_suffix(".tmp") {
+            // t.<key>.<session>.log.<pid>.tmp (or an older t.<key>.log.<pid>.tmp)
+            match stem.strip_prefix("t.").and_then(|r| r.split('.').next()) {
+                Some(key) if key.len() == 32 => {
+                    if let Some(_held) = crate::lock::try_lock_key(root, key) {
+                        let _ = fs::remove_file(dir.join(name));
+                    }
+                }
+                _ => {
+                    let _ = fs::remove_file(dir.join(name));
+                }
+            }
+        } else if let Some(stem) = name.strip_prefix("t.").and_then(|r| r.strip_suffix(".log")) {
+            match stem.split_once('.') {
+                // t.<key>.<session>.log: the run's own log.
+                Some((_key, s)) => {
+                    if s.parse::<i64>().map(run_dead).unwrap_or(false) {
+                        let _ = fs::remove_file(dir.join(name));
+                    }
+                }
+                // t.<key>.log: an older format; its target's lock decides.
+                None => {
+                    if let Some(_held) = crate::lock::try_lock_key(root, stem) {
+                        let _ = fs::remove_file(dir.join(name));
+                    }
+                }
+            }
         }
     }
 }
@@ -688,11 +738,11 @@ mod tests {
         // would open is hash-derived inside logs/ — traversal is impossible.
         let ev = event_parse(b"@REDOM1:do:5@ ../../etc/passwd").unwrap();
         let root = Root { dir: PathBuf::from("/proj") };
-        let p = target_log_path(&root, ev.target());
+        let p = target_log_path(&root, ev.target(), 5);
         assert!(p.starts_with(logs_dir(&root)));
         let name = p.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("t.") && name.ends_with(".log"));
-        assert_eq!(name.len(), "t.".len() + 32 + ".log".len());
+        assert_eq!(name.len(), "t.".len() + 32 + ".5.log".len());
     }
 
     /// The run liveness lock must never block the run log's readers or
@@ -735,12 +785,12 @@ mod tests {
         // The follower probes the lock for the log it is tailing; the two
         // artifacts must never disagree about which target they name.
         let root = Root { dir: PathBuf::from("/proj") };
-        let log = target_log_path(&root, "Sub/Out.txt");
+        let log = target_log_path(&root, "Sub/Out.txt", 7);
         let lock = crate::lock::lock_path(&root, "sub/out.txt");
         let log_key = log.file_name().unwrap().to_str().unwrap();
         let lock_key = lock.file_name().unwrap().to_str().unwrap();
         assert_eq!(
-            log_key.trim_start_matches("t.").trim_end_matches(".log"),
+            log_key.trim_start_matches("t.").trim_end_matches(".7.log"),
             lock_key.trim_end_matches(".lock")
         );
     }

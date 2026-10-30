@@ -334,8 +334,8 @@ fn upsert_file(
     runid: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO files(path, dofile, built_at, mtime, size, csum, runid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO files(path, dofile, built_at, mtime, size, csum, runid, hashed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             path,
             dofile,
@@ -344,6 +344,7 @@ fn upsert_file(
             stamp.map(|s| s.size),
             stamp.map(|s| s.csum.as_str()),
             runid,
+            stamp.map(|s| s.hashed_at),
         ],
     )?;
     Ok(())
@@ -381,7 +382,10 @@ fn exact_dofile_exists(root: &Root, target_rel: &str) -> bool {
 pub(crate) fn is_target(ctx: &Ctx, path_rel: &str) -> Result<bool> {
     let abs = ctx.root.dir.join(path_rel);
     let exists_as_file = fs::metadata(&abs).map(|m| !m.is_dir()).unwrap_or(false);
-    if exists_as_file && !is_generated(&ctx.conn, path_rel)? {
+    if exists_as_file
+        && !is_generated(&ctx.conn, path_rel)?
+        && !pending_vouches(&ctx.conn, path_rel, &abs)?
+    {
         let exact = exact_dofile_exists(&ctx.root, path_rel);
         vlog(ctx, || {
             if exact {
@@ -405,6 +409,55 @@ pub(crate) fn is_target(ctx: &Ctx, path_rel: &str) -> Result<bool> {
         None => format!("{path_rel}: not buildable: no do-file matches"),
     });
     Ok(found.is_some())
+}
+
+/// The pending hash of a build in flight: the hash of the output it was about
+/// to install, recorded on its `Uncommitted` marker just before the rename.
+/// If that build crashed between the rename and the commit, the file on disk
+/// matches this hash, not the recorded one.
+fn pending_csum(conn: &Connection, target: &str) -> Result<Option<String>> {
+    let r = conn
+        .query_row(
+            "SELECT csum FROM deps WHERE target = ?1 AND kind = ?2",
+            params![target, DepKind::Uncommitted as i64],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(r.flatten())
+}
+
+/// Record the hash of the output about to be installed on the target's
+/// `Uncommitted` marker (see `pending_csum`).
+fn record_pending(conn: &Connection, target: &str, stamp: &Stamp) -> Result<()> {
+    conn.execute(
+        "UPDATE deps SET csum = ?1, mtime = ?2, size = ?3 WHERE target = ?4 AND kind = ?5",
+        params![stamp.csum, stamp.mtime, stamp.size, target, DepKind::Uncommitted as i64],
+    )?;
+    Ok(())
+}
+
+/// Whether the file at `abs` is redo's own output from a build that crashed
+/// between installing it and committing it (it matches the pending hash).
+fn pending_vouches(conn: &Connection, target: &str, abs: &Path) -> Result<bool> {
+    match pending_csum(conn, target)? {
+        Some(p) => Ok(abs.is_file() && stamp::hash_file(abs)? == p),
+        None => Ok(false),
+    }
+}
+
+/// Record a file the overwrite check accepted by its pending hash as the
+/// target's output, keeping the target's other bookkeeping. Runs inside the
+/// marker transaction, which replaces the marker (and its pending hash); a
+/// second crash before the next commit must still find the file vouched for.
+fn adopt_pending(conn: &Connection, target: &str, dofile: &str, stamp: &Stamp) -> Result<()> {
+    conn.execute(
+        "INSERT INTO files(path, dofile, built_at, mtime, size, csum, runid, hashed_at)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, ?6)
+         ON CONFLICT(path) DO UPDATE SET dofile = excluded.dofile, mtime = excluded.mtime,
+             size = excluded.size, csum = excluded.csum, hashed_at = excluded.hashed_at",
+        params![target, dofile, stamp.mtime, stamp.size, stamp.csum, stamp.hashed_at],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn file_runid(conn: &Connection, path: &str) -> Result<Option<i64>> {
@@ -460,6 +513,15 @@ pub(crate) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
         if win_posix_rename(src, dst).is_ok() {
             return Ok(());
         }
+        // MoveFileEx refuses to replace a read-only file (built outputs are
+        // read-only), so clear the attribute on the file being replaced.
+        if let Ok(meta) = fs::metadata(dst) {
+            if meta.permissions().readonly() {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(dst, perms);
+            }
+        }
     }
     let mut delay = std::time::Duration::from_millis(2);
     for attempt in 0..RENAME_RETRIES {
@@ -495,6 +557,8 @@ fn win_posix_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
     const FILE_SHARE_ALL: u32 = 0x0000_0007; // READ | WRITE | DELETE
     const REPLACE_IF_EXISTS: u32 = 0x0000_0001;
     const POSIX_SEMANTICS: u32 = 0x0000_0002;
+    // Replace the destination even if it is read-only (built outputs are).
+    const IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0040;
 
     // The handle needs DELETE access to be renamed.
     let file = fs::OpenOptions::new()
@@ -513,7 +577,7 @@ fn win_posix_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
     // within it and pass its true length as the buffer size.
     unsafe {
         let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
-        (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS;
+        (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE;
         (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength = name_bytes as u32;
         let name_dst = core::ptr::addr_of_mut!((*info).FileName) as *mut u16;
@@ -541,9 +605,45 @@ struct TempGuard {
 impl Drop for TempGuard {
     fn drop(&mut self) {
         for p in &self.paths {
-            let _ = fs::remove_file(p);
+            let _ = remove_file_forced(p);
         }
     }
+}
+
+/// Make a finished output read-only, so that editing a built file is a
+/// deliberate act (editors ask before overwriting a read-only file) rather
+/// than an accident. Regular files only: a symlink would pass the change on
+/// to the file it points at, and a read-only directory would get in the way
+/// of the do-file's own layout. Best effort: on a filesystem that ignores
+/// permissions the output simply stays writable. Nothing in redo relies on
+/// the bit; the content hash remains the only evidence of a hand edit.
+fn seal_output(path: &Path) {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_file() {
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+}
+
+/// Remove a file even if it is read-only. Unix only needs write access to
+/// the directory; Windows refuses to delete a read-only file, so clear the
+/// attribute and retry.
+fn remove_file_forced(path: &Path) -> std::io::Result<()> {
+    let first = fs::remove_file(path);
+    #[cfg(windows)]
+    if let Err(e) = &first {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            if let Ok(meta) = fs::metadata(path) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+                return fs::remove_file(path);
+            }
+        }
+    }
+    first
 }
 
 /// Remove leftover `<target>.redo-tmp.*` files (e.g. from a previously crashed
@@ -563,20 +663,52 @@ fn clean_target_temps(dodir: &Path, arg_target: &str) {
         for e in entries.flatten() {
             if let Some(name) = e.file_name().to_str() {
                 if name.starts_with(&prefix) {
-                    let _ = fs::remove_file(e.path());
+                    let _ = remove_file_forced(&e.path());
                 }
             }
         }
     }
 }
 
-/// Sweep stale stdout-capture temp files left by crashed builds.
+/// The stdout capture file for a target's build. Named by the target's lock
+/// key, so the sweeper can tell which build owns it.
+fn capture_path(root: &Root, target_rel: &str) -> PathBuf {
+    root.redo_dir()
+        .join("tmp")
+        .join(format!("stdout.{}", crate::lock::target_key(target_rel)))
+}
+
+/// Sweep stdout captures left by crashed builds. A capture is deleted only
+/// while holding its target's build lock: a live build holds that lock for
+/// as long as its capture exists, so the sweep can never delete one in use
+/// (another run's startup used to delete them unconditionally, and the
+/// build then committed its target as "no output" and deleted it). Names in
+/// any other format come from older versions of redo-msh and are removed.
 fn gc_temps(root: &Root) {
     let tmp = root.redo_dir().join("tmp");
-    if let Ok(entries) = fs::read_dir(&tmp) {
-        for e in entries.flatten() {
-            let _ = fs::remove_file(e.path());
+    let Ok(entries) = fs::read_dir(&tmp) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        match name.strip_prefix("stdout.") {
+            Some(key) if key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                if let Some(_held) = crate::lock::try_lock_key(root, key) {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+            _ => {
+                let _ = fs::remove_file(e.path());
+            }
         }
+    }
+}
+
+/// Test hook: abort the process at a named point when `REDO_TEST_CRASH`
+/// names it, so tests can crash a build inside a specific window. Never set
+/// outside tests.
+fn crash_point(name: &str) {
+    if std::env::var("REDO_TEST_CRASH").as_deref() == Ok(name) {
+        std::process::abort();
     }
 }
 
@@ -591,13 +723,27 @@ fn gc_temps(root: &Root) {
 /// how to resolve it. An `all`/`quit` answer settles the question for the
 /// rest of the run: this process via `OVERWRITE_MODE`, child redo processes
 /// via `REDO_YES`/`REDO_NO` in the do-file environment.
-fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Result<()> {
+///
+/// Returns the file's stamp when the file is redo's own output from a build
+/// that crashed between installing and committing it (it matches the pending
+/// hash): the caller adopts it as the recorded output.
+fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Result<Option<Stamp>> {
     if !target_abs.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let problem = match overwrite_problem(ctx, target_rel, target_abs)? {
-        Some(p) => p,
-        None => return Ok(()),
+        Verdict::Ours => return Ok(None),
+        Verdict::Pending(stamp) => {
+            vlog(ctx, || {
+                format!(
+                    "{target_rel}: on disk is the output of an earlier build that \
+                     crashed before committing it (it matches that build's pending \
+                     hash); adopting it"
+                )
+            });
+            return Ok(Some(stamp));
+        }
+        Verdict::Problem(p) => p,
     };
     // A decision made at an earlier prompt anywhere in the session (another
     // thread, a child, a sibling process) settles this one.
@@ -613,17 +759,17 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
             "answered 'all'"
         };
         eprintln!("redo-msh: {problem}\nredo-msh: overwriting {target_rel} ({why})");
-        return Ok(());
+        return Ok(None);
     }
     // Rule R6: only work that is DEMANDED, all the way up, may ask.
     abort_unless_lineage_demanded(ctx, target_rel)?;
     if !overwrite_none() && user_present() {
         match prompt_overwrite(ctx, target_rel, &problem)? {
-            Answer::Yes => return Ok(()),
+            Answer::Yes => return Ok(None),
             Answer::All => {
                 OVERWRITE_MODE.store(OW_ALL, Ordering::Relaxed);
                 db::set_overwrite_mode(&ctx.conn, ctx.session, OW_ALL as i64)?;
-                return Ok(());
+                return Ok(None);
             }
             Answer::Quit => {
                 OVERWRITE_MODE.store(OW_NONE, Ordering::Relaxed);
@@ -731,33 +877,48 @@ fn probe_user_present() -> bool {
     std::io::stdin().is_terminal() || std::io::stderr().is_terminal()
 }
 
-/// Why the on-disk file is not redo's to overwrite (None: it is ours).
-/// States the evidence, not just the verdict: what redo recorded, what is on
-/// disk now, and the timestamps that support the conclusion.
-fn overwrite_problem(
-    ctx: &Ctx,
-    target_rel: &str,
-    target_abs: &Path,
-) -> Result<Option<String>> {
+/// Whether the on-disk file is redo's to overwrite.
+enum Verdict {
+    /// It is redo's recorded output (or a generated phony target's path).
+    Ours,
+    /// It is the output of a build that crashed between installing it and
+    /// committing it: it matches that build's pending hash.
+    Pending(Stamp),
+    /// It is not redo's: the explanation, with evidence.
+    Problem(String),
+}
+
+/// Whether the on-disk file is redo's to overwrite. A problem states the
+/// evidence, not just the verdict: what redo recorded, what is on disk now,
+/// and the timestamps that support the conclusion.
+fn overwrite_problem(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Result<Verdict> {
     let mtime_ago = fs::metadata(target_abs)
         .map(|m| ago(stamp::mtime_nanos(&m)))
         .unwrap_or_else(|_| "at an unknown time".to_string());
+    let pending = pending_csum(&ctx.conn, target_rel)?;
     if is_generated(&ctx.conn, target_rel)? {
         // Generated: only a content mismatch against the recorded post-build
         // hash is a problem; phony targets (no recorded hash) are exempt.
         let recorded = match files_row(&ctx.conn, target_rel)? {
             Some(Some(csum)) => csum,
-            _ => return Ok(None),
+            _ => return Ok(Verdict::Ours),
         };
-        let current = stamp::hash_file(target_abs)?;
-        if current == recorded {
-            return Ok(None);
+        let current = match stamp::stamp_file(target_abs)? {
+            Some(st) => st,
+            None => return Ok(Verdict::Ours),
+        };
+        if current.csum == recorded {
+            return Ok(Verdict::Ours);
         }
+        if pending.as_deref() == Some(current.csum.as_str()) {
+            return Ok(Verdict::Pending(current));
+        }
+        let current = current.csum;
         let built = match files_built_at(&ctx.conn, target_rel)? {
             Some(t) => ago(t),
             None => "previously".to_string(),
         };
-        Ok(Some(format!(
+        Ok(Verdict::Problem(format!(
             "{target_rel} was modified outside redo since redo last built it:\n\
              - redo built it {built} and recorded content hash {}...\n\
              - the file on disk hashes {}... and was last modified {mtime_ago}",
@@ -765,7 +926,16 @@ fn overwrite_problem(
             &current[..current.len().min(8)],
         )))
     } else {
-        Ok(Some(format!(
+        // A first build that crashed between installing its output and
+        // committing it left no files row, only its pending hash.
+        if pending.is_some() {
+            if let Some(current) = stamp::stamp_file(target_abs)? {
+                if pending.as_deref() == Some(current.csum.as_str()) {
+                    return Ok(Verdict::Pending(current));
+                }
+            }
+        }
+        Ok(Verdict::Problem(format!(
             "{target_rel} exists (last modified {mtime_ago}) but redo has no record \
              of ever building it:\n\
              there is no entry for this path in .redom/redo-msh.db, so either it \
@@ -842,13 +1012,15 @@ fn open_console() -> std::io::Result<(fs::File, fs::File)> {
 /// on screen is always the one the next keystroke answers.
 ///
 /// The worker KEEPS its jobserver token while blocked on the human. It is
-/// tempting to lend the token out so the build stays saturated, but this
-/// prompt runs with the target's kernel lock held, and lock waiters keep
-/// their tokens: the lent token is taken by a job that then blocks on this
-/// very lock, and once every token is parked there the prompter can never
-/// get one back (verification/TokenPool_PromptRelease.cfg finds that
-/// deadlock in ten steps at -j2; TokenPool_PromptHold.cfg verifies this
-/// version). One idle slot while the user thinks is the price.
+/// tempting to lend the token out so the build stays saturated, but that
+/// deadlocks two ways. This prompt runs with the target's kernel lock held,
+/// and lock waiters keep their tokens: the lent token is taken by a job that
+/// then blocks on this very lock, and once every token is parked there the
+/// prompter can never get one back (TokenPoolPromptLock.tla, ten steps at
+/// -j2). And in a nested build, two answered prompts can leave the pool's
+/// only token with a blocked ancestor that is waiting for this very worker
+/// (TokenPool_PromptDeadlock). One idle slot while the user thinks is the
+/// price; the prompt lock already allows only one open question at a time.
 fn prompt_overwrite(ctx: &Ctx, target_rel: &str, problem: &str) -> Result<Answer> {
     use std::io::{BufRead, Write};
     let (rin, mut wout) = match open_console() {
@@ -998,17 +1170,83 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
             }
         }
     };
-    if !force && file_runid(&ctx.conn, target_rel)? == Some(ctx.session) {
-        // Built by another process while we waited for the lock.
-        vlog(ctx, || {
-            format!(
-                "{target_rel}: skipping: another process built it while we waited \
-                 for its lock"
-            )
-        });
-        return Ok(());
+    if !force {
+        if file_runid(&ctx.conn, target_rel)? == Some(ctx.session) {
+            // Built by another process of this run while we waited.
+            vlog(ctx, || {
+                format!(
+                    "{target_rel}: skipping: another process built it while we waited \
+                     for its lock"
+                )
+            });
+            return Ok(());
+        }
+        // Another redo run may have built it since we decided it was out of
+        // date. A shallow re-check (no further locking) is enough.
+        if !is_ood_shallow(ctx, target_rel)? {
+            vlog(ctx, || {
+                format!(
+                    "{target_rel}: skipping: another redo run brought it up to date \
+                     while we waited for its lock"
+                )
+            });
+            return mark_verified(ctx, target_rel);
+        }
     }
     build_inner(ctx, target_rel, force)
+}
+
+/// Whether `target` is out of date judged only by its recorded edges against
+/// the files as they are now, without bringing anything up to date or taking
+/// any lock. Used under the target's lock to notice that another redo run
+/// rebuilt it while we waited.
+///
+/// That run settled the dependencies in ITS session, not ours. A buildable
+/// dependency this session has not settled yet may still be about to change
+/// (a speculative task of ours may be rebuilding it right now, or waiting on
+/// a demand that waits on us), so it counts as out of date here: the build
+/// path's do-file then waits for it properly. Skipping therefore needs the
+/// same evidence `parallel::check_recorded` verifies on: every buildable dep
+/// settled successfully this session, every recorded check passing. Without
+/// that condition a run can end "up to date" over a stale dep
+/// (verification/ShallowRecheck_Shallow). The runid column holds only the
+/// last session, so a concurrent run's `mark_verified` can erase our
+/// evidence; that costs a redundant build, never a stale skip
+/// (ShallowRecheck_SettledRedundant).
+fn is_ood_shallow(ctx: &Ctx, target: &str) -> Result<bool> {
+    let built_csum = match files_row(&ctx.conn, target)? {
+        Some(c) => c,
+        None => return Ok(true),
+    };
+    // Missing or hand-edited output (phony targets have no recorded csum).
+    if let Some(recorded) = &built_csum {
+        if current_csum(ctx, target)?.as_ref() != Some(recorded) {
+            return Ok(true);
+        }
+    }
+    for (kind, dep, edge_csum) in read_deps(&ctx.conn, target)? {
+        match kind {
+            DepKind::Always | DepKind::Uncommitted => return Ok(true),
+            DepKind::IfCreate => {
+                if ctx.root.dir.join(dep.expect("ifcreate dep has a path")).exists() {
+                    return Ok(true);
+                }
+            }
+            DepKind::DoFile | DepKind::IfChange => {
+                let dep = dep.expect("dofile/ifchange dep has a path");
+                if kind == DepKind::IfChange
+                    && is_target(ctx, &dep)?
+                    && file_runid(&ctx.conn, &dep)? != Some(ctx.session)
+                {
+                    return Ok(true);
+                }
+                if current_csum(ctx, &dep)? != edge_csum {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Run the target's do-file and commit its output. Assumes the per-target lock
@@ -1032,6 +1270,7 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
         && !force
         && !is_generated(&ctx.conn, target_rel)?
         && !exact_dofile_exists(&ctx.root, target_rel)
+        && !pending_vouches(&ctx.conn, target_rel, &target_abs)?
     {
         vlog(ctx, || {
             format!(
@@ -1076,7 +1315,7 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     // Refuse to silently clobber a target that was modified by hand since we
     // last built it (or that redo never generated at all). Checked before any
     // database mutation, so a refusal leaves no trace of an attempted build.
-    check_not_hand_edited(ctx, target_rel, &target_abs)?;
+    let adopt = check_not_hand_edited(ctx, target_rel, &target_abs)?;
 
     // Reset dependency edges (the do-file re-declares them as it runs) and
     // mark the build as in flight, atomically. The marker is removed only
@@ -1089,6 +1328,9 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     // file hashing while holding the write lock.)
     let df_stamp = stamp::stamp_file(&df.dofile_abs)?;
     db::write_txn(&ctx.conn, |conn| {
+        if let Some(st) = &adopt {
+            adopt_pending(conn, target_rel, &df.dofile_rel, st)?;
+        }
         clear_deps(conn, target_rel)?;
         record_dep(conn, target_rel, DepKind::Uncommitted, None, None)?;
         record_dep(conn, target_rel, DepKind::DoFile, Some(&df.dofile_rel), df_stamp.as_ref())?;
@@ -1109,9 +1351,8 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
 
     // Capture file for the do-file's stdout (output detection). Its stderr
     // goes to the target's log, streamed live by the top-level's follower.
-    let tmp_dir = ctx.root.redo_dir().join("tmp");
-    fs::create_dir_all(&tmp_dir)?;
-    let capture_path = tmp_dir.join(format!("stdout.{}.{}", pid, sanitize(target_rel)));
+    let capture_path = capture_path(&ctx.root, target_rel);
+    fs::create_dir_all(capture_path.parent().expect("capture path has a parent"))?;
 
     // All temps are removed on every exit path (return, `?`, panic).
     let _guard = TempGuard {
@@ -1129,7 +1370,7 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     // simply inherit our stderr.
     let (errlog, mut done_guard, log_path) = match &ctx.log_sink {
         Some(sink) => {
-            let log_path = crate::logs::target_log_path(&ctx.root, target_rel);
+            let log_path = crate::logs::target_log_path(&ctx.root, target_rel, ctx.session);
             crate::logs::create_log(&log_path)?;
             crate::logs::event_append(sink, &crate::logs::Event::Do {
                 session: ctx.session,
@@ -1290,14 +1531,24 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     }
 
     if tmp3_abs.exists() {
+        seal_output(&tmp3_abs);
         fsync_file(&tmp3_abs)?;
+        // Record the output's hash as pending before installing it: if this
+        // process dies between the rename and the commit, the next build
+        // recognizes the file as redo's own instead of refusing it (or, on a
+        // first build with only a default*.do, adopting it as a source).
+        if let Some(out) = stamp::stamp_file(&tmp3_abs)? {
+            record_pending(&ctx.conn, target_rel, &out)?;
+        }
+        crash_point("before-rename");
         atomic_rename(&tmp3_abs, &target_abs)?;
         if let Some(parent) = target_abs.parent() {
             fsync_dir(parent);
         }
+        crash_point("after-rename");
     } else {
         // No output at all: a phony/virtual target. Remove any stale file.
-        let _ = fs::remove_file(&target_abs);
+        let _ = remove_file_forced(&target_abs);
     }
 
     // Record the post-build stamp and drop the in-flight marker recorded
@@ -1512,12 +1763,12 @@ pub(crate) fn mark_verified(ctx: &Ctx, target: &str) -> Result<()> {
 }
 
 /// The current content hash of a file, using the **guarded fast path**:
-/// if `(mtime, size)` match the cached row and the mtime carries sub-second
-/// precision (proving a fine-resolution filesystem, so same-second collisions
-/// are nanosecond-width), reuse the cached hash without re-reading the file.
-/// Otherwise re-hash and refresh the cache. On a coarse filesystem (FAT: whole-
-/// second mtimes) the sub-second test fails, so we always hash — exactly the
-/// "always-hash on coarse FS" rule, derived from the data itself.
+/// if `(mtime, size)` match the cached row, the mtime carries sub-second
+/// precision, and the cached hash is not racily clean (`stamp_is_racy`),
+/// reuse the cached hash without re-reading the file. Otherwise re-hash and
+/// refresh the cache. On a coarse filesystem (FAT: whole-second mtimes) the
+/// sub-second test fails, so we always hash — the "always-hash on coarse FS"
+/// rule, derived from the data itself.
 ///
 /// Returns `Ok(None)` if the file does not exist.
 pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
@@ -1531,12 +1782,14 @@ pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> 
     let size = if meta.is_dir() { 0 } else { meta.len() as i64 };
 
     let cached = files_stamp(&ctx.conn, path_rel)?;
-    if let Some((rm, rs, rc)) = &cached {
-        if *rm == mtime && *rs == size && stat_is_trustworthy(mtime) {
+    if let Some((rm, rs, rc, rh)) = &cached {
+        if *rm == mtime && *rs == size && stat_is_trustworthy(mtime) && !stamp_is_racy(mtime, *rh)
+        {
             vlog(ctx, || {
                 format!(
-                    "{path_rel}: mtime and size match the cache and the mtime has \
-                     sub-second precision; trusting cached hash {} without re-reading",
+                    "{path_rel}: mtime and size match the cache, the mtime has \
+                     sub-second precision, and the hash was taken well after that \
+                     mtime; trusting cached hash {} without re-reading",
                     hash8(Some(rc))
                 )
             });
@@ -1544,6 +1797,7 @@ pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> 
         }
     }
 
+    let hashed_at = stamp::now_nanos();
     let csum = if meta.is_dir() {
         stamp::DIR_CSUM.to_string()
     } else {
@@ -1552,22 +1806,28 @@ pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> 
     vlog(ctx, || {
         let why = match &cached {
             None => "no cached stamp".to_string(),
-            Some((rm, _, _)) if *rm != mtime => "mtime changed".to_string(),
-            Some((_, rs, _)) if *rs != size => "size changed".to_string(),
-            Some(_) => "whole-second mtime cannot be trusted".to_string(),
+            Some((rm, _, _, _)) if *rm != mtime => "mtime changed".to_string(),
+            Some((_, rs, _, _)) if *rs != size => "size changed".to_string(),
+            Some(_) if !stat_is_trustworthy(mtime) => {
+                "whole-second mtime cannot be trusted".to_string()
+            }
+            Some(_) => "cached hash is racily clean (taken too soon after the mtime)".to_string(),
         };
         format!("{path_rel}: hashed the file contents ({why}): {}", hash8(Some(&csum)))
     });
-    // Refresh the cache for an existing SOURCE row (do not invent rows here).
-    // A generated target's row is not a cache: its stamp and csum are what
-    // redo produced when it last built the file, and the overwrite guard
-    // compares the file on disk against exactly that. Writing an observed
-    // hash there — as a consumer's check of a hand-edited target would —
-    // rewrites the evidence and lets the next build clobber the edit.
+    // Refresh the cache for an existing row (do not invent rows here). A
+    // generated target's csum is not a cache: it is what redo produced when
+    // it last built the file, and the overwrite guard compares the file on
+    // disk against exactly that. Writing an observed hash there — as a
+    // consumer's check of a hand-edited target would — rewrites the evidence
+    // and lets the next build clobber the edit. So a generated row is only
+    // refreshed while its content still matches the record: that leaves the
+    // evidence as it was, and it is what lets a freshly built output (hashed
+    // within the racy margin of its own mtime) earn the fast path at all.
     ctx.conn.execute(
-        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3
-         WHERE path = ?4 AND dofile IS NULL",
-        params![mtime, size, csum, path_rel],
+        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3, hashed_at = ?4
+         WHERE path = ?5 AND (dofile IS NULL OR csum = ?3)",
+        params![mtime, size, csum, hashed_at, path_rel],
     )?;
     Ok(Some(csum))
 }
@@ -1578,23 +1838,46 @@ fn stat_is_trustworthy(mtime_nanos: i64) -> bool {
     mtime_nanos % 1_000_000_000 != 0
 }
 
-/// Fetch `(mtime, size, csum)` for a file row, only if all are present.
-fn files_stamp(conn: &Connection, path: &str) -> Result<Option<(i64, i64, String)>> {
+/// How long after a file's mtime its hash must have been taken before a
+/// matching `(mtime, size)` may stand in for re-hashing. File timestamps are
+/// coarse (kernel timestamp granularity is a few milliseconds on Linux), so a
+/// write landing in the same tick as the previous one leaves mtime and size
+/// unchanged. A hash taken within this margin of the mtime may predate such a
+/// write, so it is "racily clean" and must be re-checked; this is git's rule
+/// for its index. The margin also absorbs modest clock offsets between this
+/// machine and a network filesystem's server.
+const RACY_MARGIN_NANOS: i64 = 2_000_000_000;
+
+/// Whether a cached hash is racily clean: taken too soon after the file's
+/// mtime to rule out a later same-tick write (or of unknown age).
+fn stamp_is_racy(mtime_nanos: i64, hashed_at: Option<i64>) -> bool {
+    match hashed_at {
+        Some(h) => h - mtime_nanos < RACY_MARGIN_NANOS,
+        None => true,
+    }
+}
+
+/// A file row's cached stamp: `(mtime, size, csum, hashed_at)`.
+type CachedStamp = (i64, i64, String, Option<i64>);
+
+/// Fetch a file row's cached stamp, only if mtime, size and csum are present.
+fn files_stamp(conn: &Connection, path: &str) -> Result<Option<CachedStamp>> {
     let row = conn
         .query_row(
-            "SELECT mtime, size, csum FROM files WHERE path = ?1",
+            "SELECT mtime, size, csum, hashed_at FROM files WHERE path = ?1",
             params![path],
             |r| {
                 Ok((
                     r.get::<_, Option<i64>>(0)?,
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
                 ))
             },
         )
         .optional()?;
     Ok(match row {
-        Some((Some(m), Some(s), Some(c))) => Some((m, s, c)),
+        Some((Some(m), Some(s), Some(c), h)) => Some((m, s, c, h)),
         _ => None,
     })
 }
@@ -1696,10 +1979,7 @@ pub fn redo(targets: &[String], j: usize) -> Result<()> {
     let run_log = crate::logs::run_log_path(&ctx.root, ctx.session);
     let run_lock_path = crate::logs::run_lock_path(&ctx.root, ctx.session);
     fs::create_dir_all(crate::logs::logs_dir(&ctx.root))?;
-    let run_lock = fs::File::create(&run_lock_path)
-        .with_context(|| format!("creating run lock {}", run_lock_path.display()))?;
-    fs2::FileExt::lock_exclusive(&run_lock)
-        .with_context(|| format!("locking run lock {}", run_lock_path.display()))?;
+    let run_lock = acquire_run_lock(&run_lock_path)?;
     fs::File::create(&run_log)
         .with_context(|| format!("creating run log {}", run_log.display()))?;
     crate::logs::gc_logs(&ctx.root, ctx.session);
@@ -1717,13 +1997,43 @@ pub fn redo(targets: &[String], j: usize) -> Result<()> {
         target: crate::logs::RUN_TARGET.to_string(),
     });
     follower.join();
-    drop(run_lock);
-    // The lock sentinel is bookkeeping, not a log: remove it regardless.
-    let _ = fs::remove_file(&run_lock_path);
+    // Remove our files while still holding the lock, the run log first: a
+    // sweeper treats a missing sentinel as a dead run, so the sentinel must
+    // be the last thing to go. (With REDO_KEEP_LOGS the run log stays; the
+    // next run's sweep collects it, its sentinel being gone.)
     if !crate::logs::keep_logs() {
         let _ = fs::remove_file(&run_log);
     }
+    let _ = fs::remove_file(&run_lock_path);
+    drop(run_lock);
     result
+}
+
+/// Create and lock this run's liveness sentinel. A concurrent run's sweep may
+/// delete the sentinel between our create and our lock (it was not locked
+/// yet, so it looked dead); we would then hold a lock on a file nobody can
+/// find, the next sweep would judge this live run dead and delete its run
+/// trace, and the run would hang at exit waiting for a `done` that can no
+/// longer be written (verification/SharedPaths_RunLockRace). So after
+/// locking, check that the path still names the locked file, and retry if
+/// not.
+fn acquire_run_lock(path: &Path) -> Result<fs::File> {
+    for _ in 0..32 {
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("creating run lock {}", path.display()))?;
+        fs2::FileExt::lock_exclusive(&f)
+            .with_context(|| format!("locking run lock {}", path.display()))?;
+        if crate::lock::same_file(&f, path) {
+            return Ok(f);
+        }
+        drop(f); // swept between create and lock: start over
+    }
+    bail!("could not establish the run lock {}", path.display())
 }
 
 /// The build phase of a top-level `redo`, separated so `redo()` can run its
@@ -2082,16 +2392,24 @@ pub fn stamp() -> Result<()> {
     Ok(())
 }
 
-/// Make a path safe to embed in a temp filename.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn racily_clean_stamps_are_not_trusted() {
+        let m = 1_700_000_000_123_456_789;
+        // Hashed in the same instant as the write, or shortly after: racy.
+        assert!(stamp_is_racy(m, Some(m)));
+        assert!(stamp_is_racy(m, Some(m + RACY_MARGIN_NANOS - 1)));
+        // Unknown age (rows from before the column existed): racy.
+        assert!(stamp_is_racy(m, None));
+        // An mtime in the future (clock skew): racy.
+        assert!(stamp_is_racy(m, Some(m - 1)));
+        // Hashed well after the write: trustworthy.
+        assert!(!stamp_is_racy(m, Some(m + RACY_MARGIN_NANOS)));
+    }
 
     #[test]
     fn coarse_mtime_is_never_trusted() {

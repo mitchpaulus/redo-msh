@@ -1,319 +1,292 @@
 ---------------------------- MODULE TokenPool ----------------------------
 (***************************************************************************)
 (* The jobserver token protocol of redo-msh (src/jobserver.rs,             *)
-(* run_parallel in src/build.rs), abstracted:                              *)
+(* run_parallel and prompt_overwrite in src/build.rs) over a job TREE of   *)
+(* arbitrary depth:                                                        *)
 (*                                                                         *)
 (*   - A build has J total tokens: every process holds one implicit "own"  *)
 (*     token, and a shared pool starts with J-1 extra tokens.              *)
-(*   - The top-level process runs NTop top jobs in parallel (own token     *)
-(*     first, then pool tokens, never blocking on the pool).               *)
-(*   - Each top job's do-file executes ("pre"), then calls redo-ifchange,  *)
-(*     which blocks it ("waiting") while a child process runs NSub sub     *)
-(*     jobs under the same discipline (its own fresh own token + pool),    *)
-(*     then resumes ("post") and finishes, returning its token.            *)
-(*                                                                         *)
-(* Sub jobs are leaves; the model is two levels deep.                      *)
+(*   - Jobs form a tree: FanOut[k] is the number of children of each job   *)
+(*     at depth k-1 (the top-level process runs FanOut[1] jobs). A job's   *)
+(*     do-file runs ("pre"), and a non-leaf job then calls redo-ifchange   *)
+(*     and blocks ("waiting") while a CHILD PROCESS runs its children,     *)
+(*     resumes ("post") when they are all done, and finishes.              *)
+(*   - Each process launches its jobs in order, own token first, then pool *)
+(*     tokens, never blocking on the pool. With Lazy (today's              *)
+(*     run_parallel), a process that finds the pool empty sleeps until one *)
+(*     of ITS OWN jobs completes (it blocks in rx.recv()); without Lazy it *)
+(*     launches whenever a token is available (the eager scheduler the     *)
+(*     implementation contract requires).                                  *)
+(*   - Overwrite prompt (Prompts): a job about to run its do-file may stop *)
+(*     to ask on the terminal. PromptMode:                                 *)
+(*       "pool"   - today: release one token to the POOL, then spin on     *)
+(*                  pool try-acquire to resume;                            *)
+(*       "hold"   - keep the token while waiting;                          *)
+(*       "source" - give the token back to where it came from (own token   *)
+(*                  -> the process's own slot, waking its scheduler; pool  *)
+(*                  token -> the pool) and resume on the process's own     *)
+(*                  token if free, else a pool token.                      *)
 (*                                                                         *)
 (* Checked properties:                                                     *)
-(*   TokenConservation - pool tokens are never lost or duplicated, on any  *)
-(*                       interleaving (including the error-free paths      *)
-(*                       modeled here).                                    *)
-(*   Bound             - at most J do-file bodies EXECUTE simultaneously   *)
-(*                       ("pre"/"post" tops + running subs). Blocked       *)
-(*                       ancestors hold tokens but are not executing; each *)
-(*                       child process's fresh own token compensates.      *)
-(*                       This is the precise statement of the concurrency  *)
-(*                       limit -- the naive "at most J tokens exist" is    *)
-(*                       false by design.                                  *)
-(*   Termination       - every job eventually completes (deadlock-freedom  *)
-(*                       of the try-acquire discipline).                   *)
+(*   TokenConservation - pool tokens are never lost or duplicated (a       *)
+(*                       prompting job in "pool" mode accounts for the one *)
+(*                       extra token it released).                         *)
+(*   OwnConsistent     - a process's own token is free iff none of its     *)
+(*                       jobs holds it (so at most one does).              *)
+(*   ChildrenOnlyWhileWaiting - a child process's jobs are live only while *)
+(*                       their parent job is blocked in redo-ifchange.     *)
+(*   Bound             - at most J jobs execute at once.                   *)
+(*   ExactBound        - executing jobs + free pool tokens <= J.           *)
+(*   SemaphoreMax      - the pool never exceeds J (on Windows the pool is  *)
+(*                       a semaphore with maximum count J, and releasing   *)
+(*                       past it fails silently).                          *)
+(*   Termination       - every job completes.                              *)
+(*   WorkConserving    - no process sleeps with a launchable job while a   *)
+(*                       pool token is free (EXPECTED VIOLATED with Lazy:  *)
+(*                       today's under-utilization, made precise).         *)
+(*                                                                         *)
+(* OwnUnique, TokenHeld, ChildrenOnlyWhileWaiting and TokenConservation   *)
+(* are the lemmas of the depth-independent argument for ExactBound in      *)
+(* README.md: each relates one process to its parent job and the pool, so  *)
+(* checking them at depths 2 and 3 exercises every step shape the          *)
+(* argument uses.                                                          *)
 (*                                                                         *)
 (* Assumption made explicit by the "waiting" state: a do-file blocks for   *)
-(* the whole redo-ifchange call.  A do-file that backgrounds redo-ifchange *)
+(* the whole redo-ifchange call. A do-file that backgrounds redo-ifchange  *)
 (* and keeps computing violates Bound (but not TokenConservation).         *)
-(*                                                                         *)
-(* THE OVERWRITE PROMPT (prompt_overwrite in src/build.rs). A top job may  *)
-(* stop before running its do-file to ask the human whether a hand-edited  *)
-(* target may be overwritten. Facts the model keeps from the code:         *)
-(*   - the prompt happens AFTER the per-target kernel lock is taken, so    *)
-(*     any other job that needs that target blocks on the lock until the   *)
-(*     prompter's whole build is over ("lockw"); lock waiters keep their   *)
-(*     token (build() blocks outright; no release);                        *)
-(*   - PromptMode = "release": the prompter writes one token to the POOL   *)
-(*     whatever its own token's source was (Jobserver::release does not    *)
-(*     know), and afterwards spins on try_acquire against the POOL only    *)
-(*     ("reacq"). This was the shipping code until 2026-09-03; the model   *)
-(*     deadlocks it in ten steps at J=2: every other token ends up held by *)
-(*     a job blocked on the prompter's lock, and the prompter spins        *)
-(*     forever. No .cfg runs it any more; the mode stays as the record.   *)
-(*   - PromptMode = "hold": the prompter keeps its token while blocked on  *)
-(*     the human. One slot idles while the user thinks; nothing can        *)
-(*     deadlock. TokenPool_PromptHold.cfg verifies it.                     *)
-(*   - PromptMode = "none": the original model (regression).               *)
-(* Prompts are modeled at the top level only; a nested process's prompt   *)
-(* is the same shape one level down.                                       *)
 (***************************************************************************)
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS J, NTop, NSub, PromptMode
+CONSTANTS J, FanOut, Lazy, Prompts, PromptMode
 
 ASSUME /\ J \in Nat \ {0}
-       /\ NTop \in Nat \ {0}
-       /\ NSub \in Nat \ {0}
-       /\ PromptMode \in {"none", "release", "hold"}
+       /\ FanOut \in Seq(Nat \ {0}) /\ Len(FanOut) >= 1
+       /\ Lazy \in BOOLEAN /\ Prompts \in BOOLEAN
+       /\ PromptMode \in {"pool", "hold", "source"}
 
-TopJobs == 1..NTop
-SubJobs == TopJobs \X (1..NSub)
+\* --- tree shapes, selected from the .cfg files via <- ---------------------
+Tree22 == <<2, 2>>       \* the original NTop=2, NSub=2
+Tree32 == <<3, 2>>       \* the original NTop=3, NSub=2
+Tree122 == <<1, 2, 2>>   \* depth 3, branching at every level below the top
+Tree222 == <<2, 2, 2>>
+
+D == Len(FanOut)
+
+RECURSIVE JobsAt(_)
+JobsAt(k) ==
+    IF k = 1 THEN {<<i>> : i \in 1..FanOut[1]}
+    ELSE {Append(j, i) : j \in JobsAt(k - 1), i \in 1..FanOut[k]}
+
+Jobs == UNION {JobsAt(k) : k \in 1..D}
+Parent(j) == SubSeq(j, 1, Len(j) - 1)
+Leaf(j) == Len(j) = D
+Children(j) == {c \in Jobs : Len(c) = Len(j) + 1 /\ Parent(c) = j}
+
+\* A process: the top level (<<>>) or the child process of a non-leaf job.
+ProcSet == {<<>>} \cup {j \in Jobs : ~Leaf(j)}
+InProc(p) == {j \in Jobs : Parent(j) = p}
+Earlier(j) == {c \in InProc(Parent(j)) : c[Len(c)] < j[Len(j)]}
+
+States == {"queued", "start", "prompt", "pre", "waiting", "post", "done"}
+Holding == {"start", "prompt", "pre", "waiting", "post"}   \* launched, unfinished
+Executing == {"start", "pre", "post"}                      \* not blocked
 
 VARIABLES
-    pool,       \* extra tokens currently free in the shared pool
-    topState,   \* [TopJobs -> {"queued","pre","waiting","post","done"}]
-    topSrc,     \* token source of each top job: "own" | "pool" | "none"
-    topOwnFree, \* top-level process's own token is unused
-    subState,   \* [SubJobs -> {"queued","running","done"}]
-    subSrc,     \* token source of each sub job
-    subOwnFree, \* [TopJobs -> BOOLEAN]: child process t's own token unused
-    prompted,   \* [TopJobs -> BOOLEAN]: this job already asked its question
-    topWait,    \* [TopJobs -> TopJobs \cup {0}]: lock held by which prompter
-    subWait     \* [SubJobs -> TopJobs \cup {0}]
+    pool,      \* free tokens in the shared pool
+    st,        \* [Jobs -> States]
+    src,       \* [Jobs -> {"own", "pool", "none"}]: the token a job holds
+    ownFree,   \* [ProcSet -> BOOLEAN]: the process's own token is unused
+    asleep     \* [ProcSet -> BOOLEAN]: blocked in rx.recv() (Lazy only)
 
-vars == <<pool, topState, topSrc, topOwnFree, subState, subSrc, subOwnFree,
-          prompted, topWait, subWait>>
-
-(* "prompt": blocked on the human. "reacq": answered, spinning for a pool  *)
-(* token (release mode only). "lockw": blocked on a prompter's kernel lock. *)
-TopStates == {"queued", "pre", "prompt", "reacq", "lockw", "waiting", "post",
-              "done"}
-SubStates == {"queued", "running", "lockw", "done"}
-Prompting == {t \in TopJobs : topState[t] \in {"prompt", "reacq"}}
-Srcs == {"own", "pool", "none"}
+vars == <<pool, st, src, ownFree, asleep>>
 
 TypeOK ==
-    \* release mode lends own tokens into the pool: it can hold J for a while
-    /\ pool \in 0..(IF PromptMode = "release" THEN J ELSE J - 1)
-    /\ topState \in [TopJobs -> TopStates]
-    /\ topSrc \in [TopJobs -> Srcs]
-    /\ topOwnFree \in BOOLEAN
-    /\ subState \in [SubJobs -> SubStates]
-    /\ subSrc \in [SubJobs -> Srcs]
-    /\ subOwnFree \in [TopJobs -> BOOLEAN]
-    /\ prompted \in [TopJobs -> BOOLEAN]
-    /\ topWait \in [TopJobs -> TopJobs \cup {0}]
-    /\ subWait \in [SubJobs -> TopJobs \cup {0}]
+    /\ pool \in Nat
+    /\ st \in [Jobs -> States]
+    /\ src \in [Jobs -> {"own", "pool", "none"}]
+    /\ ownFree \in [ProcSet -> BOOLEAN]
+    /\ asleep \in [ProcSet -> BOOLEAN]
 
 Init ==
     /\ pool = J - 1
-    /\ topState = [t \in TopJobs |-> "queued"]
-    /\ topSrc = [t \in TopJobs |-> "none"]
-    /\ topOwnFree = TRUE
-    /\ subState = [u \in SubJobs |-> "queued"]
-    /\ subSrc = [u \in SubJobs |-> "none"]
-    /\ subOwnFree = [t \in TopJobs |-> TRUE]
-    /\ prompted = [t \in TopJobs |-> FALSE]
-    /\ topWait = [t \in TopJobs |-> 0]
-    /\ subWait = [u \in SubJobs |-> 0]
+    /\ st = [j \in Jobs |-> "queued"]
+    /\ src = [j \in Jobs |-> "none"]
+    /\ ownFree = [p \in ProcSet |-> TRUE]
+    /\ asleep = [p \in ProcSet |-> FALSE]
 
-(* Launch a top job on the process's own token (own-first, as in the code). *)
-LaunchTopOwn(t) ==
-    /\ topState[t] = "queued"
-    /\ topOwnFree
-    /\ topOwnFree' = FALSE
-    /\ topState' = [topState EXCEPT ![t] = "pre"]
-    /\ topSrc' = [topSrc EXCEPT ![t] = "own"]
-    /\ UNCHANGED <<pool, subState, subSrc, subOwnFree, prompted, topWait, subWait>>
+(* A process runs while it is the top level or its parent job is blocked.
+   (An IF, not a disjunction: TLC evaluates both disjuncts inside actions,
+   and st has no entry for the top level.) *)
+ProcActive(p) == IF p = <<>> THEN TRUE ELSE st[p] = "waiting"
 
-(* Launch a top job on a try-acquired pool token. *)
-LaunchTopPool(t) ==
-    /\ topState[t] = "queued"
-    /\ ~topOwnFree
+(* j is the next job its process would launch. *)
+Next1(j) ==
+    /\ st[j] = "queued"
+    /\ \A c \in Earlier(j) : st[c] # "queued"
+    /\ ProcActive(Parent(j))
+    /\ ~asleep[Parent(j)]
+
+HasNext(p) == \E j \in InProc(p) : Next1(j)
+
+----------------------------------------------------------------------------
+LaunchOwn(j) ==
+    /\ Next1(j)
+    /\ ownFree[Parent(j)]
+    /\ ownFree' = [ownFree EXCEPT ![Parent(j)] = FALSE]
+    /\ st' = [st EXCEPT ![j] = "start"]
+    /\ src' = [src EXCEPT ![j] = "own"]
+    /\ UNCHANGED <<pool, asleep>>
+
+LaunchPool(j) ==
+    /\ Next1(j)
+    /\ ~ownFree[Parent(j)]
     /\ pool > 0
     /\ pool' = pool - 1
-    /\ topState' = [topState EXCEPT ![t] = "pre"]
-    /\ topSrc' = [topSrc EXCEPT ![t] = "pool"]
-    /\ UNCHANGED <<topOwnFree, subState, subSrc, subOwnFree, prompted, topWait, subWait>>
+    /\ st' = [st EXCEPT ![j] = "start"]
+    /\ src' = [src EXCEPT ![j] = "pool"]
+    /\ UNCHANGED <<ownFree, asleep>>
+
+(* run_parallel found no token: block until one of its own jobs finishes. *)
+Sleep(p) ==
+    /\ Lazy
+    /\ HasNext(p)
+    /\ ~ownFree[p]
+    /\ pool = 0
+    /\ asleep' = [asleep EXCEPT ![p] = TRUE]
+    /\ UNCHANGED <<pool, st, src, ownFree>>
+
+(* No prompt needed: the do-file starts. *)
+Begin(j) ==
+    /\ st[j] = "start"
+    /\ st' = [st EXCEPT ![j] = "pre"]
+    /\ UNCHANGED <<pool, src, ownFree, asleep>>
+
+(* prompt_overwrite: block on the human. *)
+Prompt(j) ==
+    /\ Prompts
+    /\ st[j] = "start"
+    /\ st' = [st EXCEPT ![j] = "prompt"]
+    /\ CASE PromptMode = "pool" ->
+              /\ pool' = pool + 1
+              /\ UNCHANGED <<src, ownFree, asleep>>
+         [] PromptMode = "hold" ->
+              UNCHANGED <<pool, src, ownFree, asleep>>
+         [] PromptMode = "source" ->
+              /\ src' = [src EXCEPT ![j] = "none"]
+              /\ IF src[j] = "own"
+                   THEN /\ ownFree' = [ownFree EXCEPT ![Parent(j)] = TRUE]
+                        /\ asleep' = [asleep EXCEPT ![Parent(j)] = FALSE]
+                        /\ UNCHANGED pool
+                   ELSE /\ pool' = pool + 1
+                        /\ UNCHANGED <<ownFree, asleep>>
+
+(* Answered: take a token back, then run. *)
+Reacquire(j) ==
+    /\ st[j] = "prompt"
+    /\ st' = [st EXCEPT ![j] = "pre"]
+    /\ CASE PromptMode = "pool" ->
+              /\ pool > 0
+              /\ pool' = pool - 1
+              /\ UNCHANGED <<src, ownFree, asleep>>
+         [] PromptMode = "hold" ->
+              UNCHANGED <<pool, src, ownFree, asleep>>
+         [] PromptMode = "source" ->
+              \/ /\ ownFree[Parent(j)]
+                 /\ ownFree' = [ownFree EXCEPT ![Parent(j)] = FALSE]
+                 /\ src' = [src EXCEPT ![j] = "own"]
+                 /\ UNCHANGED <<pool, asleep>>
+              \/ /\ ~ownFree[Parent(j)]
+                 /\ pool > 0
+                 /\ pool' = pool - 1
+                 /\ src' = [src EXCEPT ![j] = "pool"]
+                 /\ UNCHANGED <<ownFree, asleep>>
 
 (* The do-file calls redo-ifchange: it blocks, its child process starts. *)
-SpawnChild(t) ==
-    /\ topState[t] = "pre"
-    /\ topState' = [topState EXCEPT ![t] = "waiting"]
-    /\ UNCHANGED <<pool, topSrc, topOwnFree, subState, subSrc, subOwnFree, prompted, topWait, subWait>>
+Spawn(j) ==
+    /\ st[j] = "pre"
+    /\ ~Leaf(j)
+    /\ st' = [st EXCEPT ![j] = "waiting"]
+    /\ UNCHANGED <<pool, src, ownFree, asleep>>
 
-LaunchSubOwn(t, s) ==
-    /\ topState[t] = "waiting"
-    /\ subState[<<t, s>>] = "queued"
-    /\ subOwnFree[t]
-    /\ subOwnFree' = [subOwnFree EXCEPT ![t] = FALSE]
-    /\ subState' = [subState EXCEPT ![<<t, s>>] = "running"]
-    /\ subSrc' = [subSrc EXCEPT ![<<t, s>>] = "own"]
-    /\ UNCHANGED <<pool, topState, topSrc, topOwnFree, prompted, topWait, subWait>>
+(* redo-ifchange returned: the do-file resumes. *)
+Resume(j) ==
+    /\ st[j] = "waiting"
+    /\ \A c \in Children(j) : st[c] = "done"
+    /\ st' = [st EXCEPT ![j] = "post"]
+    /\ UNCHANGED <<pool, src, ownFree, asleep>>
 
-LaunchSubPool(t, s) ==
-    /\ topState[t] = "waiting"
-    /\ subState[<<t, s>>] = "queued"
-    /\ ~subOwnFree[t]
-    /\ pool > 0
-    /\ pool' = pool - 1
-    /\ subState' = [subState EXCEPT ![<<t, s>>] = "running"]
-    /\ subSrc' = [subSrc EXCEPT ![<<t, s>>] = "pool"]
-    /\ UNCHANGED <<topState, topSrc, topOwnFree, subOwnFree, prompted, topWait, subWait>>
-
-FinishSub(t, s) ==
-    /\ subState[<<t, s>>] = "running"
-    /\ subState' = [subState EXCEPT ![<<t, s>>] = "done"]
-    /\ IF subSrc[<<t, s>>] = "own"
-         THEN /\ subOwnFree' = [subOwnFree EXCEPT ![t] = TRUE]
+(* A job finishes: its token goes back where it came from, and its
+   process's scheduler wakes (the completion arrives on its channel). *)
+Finish(j) ==
+    /\ \/ st[j] = "post"
+       \/ st[j] = "pre" /\ Leaf(j)
+    /\ st' = [st EXCEPT ![j] = "done"]
+    /\ src' = [src EXCEPT ![j] = "none"]
+    /\ asleep' = [asleep EXCEPT ![Parent(j)] = FALSE]
+    /\ IF src[j] = "own"
+         THEN /\ ownFree' = [ownFree EXCEPT ![Parent(j)] = TRUE]
               /\ UNCHANGED pool
          ELSE /\ pool' = pool + 1
-              /\ UNCHANGED subOwnFree
-    /\ UNCHANGED <<topState, topSrc, topOwnFree, subSrc, prompted, topWait, subWait>>
+              /\ UNCHANGED ownFree
 
-(* redo-ifchange returns: the do-file resumes executing after its deps. *)
-ResumeTop(t) ==
-    /\ topState[t] = "waiting"
-    /\ \A s \in 1..NSub : subState[<<t, s>>] = "done"
-    /\ topState' = [topState EXCEPT ![t] = "post"]
-    /\ UNCHANGED <<pool, topSrc, topOwnFree, subState, subSrc, subOwnFree, prompted, topWait, subWait>>
-
-FinishTop(t) ==
-    /\ topState[t] = "post"
-    /\ topState' = [topState EXCEPT ![t] = "done"]
-    /\ IF topSrc[t] = "own"
-         THEN /\ topOwnFree' = TRUE
-              /\ UNCHANGED pool
-         ELSE /\ pool' = pool + 1
-              /\ UNCHANGED topOwnFree
-    /\ UNCHANGED <<topSrc, subState, subSrc, subOwnFree, prompted, topWait, subWait>>
-
-(* ---- the overwrite prompt ------------------------------------------- *)
-
-(* The job stops to ask (the hand-edit check runs before the do-file, with *)
-(* the target lock held). In release mode one token goes back to the pool  *)
-(* -- ALWAYS the pool, even if the job runs on the own token: that is what *)
-(* the code does, and it is why the pool can transiently hold J tokens.    *)
-Prompt(t) ==
-    /\ PromptMode # "none"
-    /\ topState[t] = "pre" /\ ~prompted[t]
-    /\ prompted' = [prompted EXCEPT ![t] = TRUE]
-    /\ topState' = [topState EXCEPT ![t] = "prompt"]
-    /\ pool' = IF PromptMode = "release" THEN pool + 1 ELSE pool
-    /\ UNCHANGED <<topSrc, topOwnFree, subState, subSrc, subOwnFree, topWait,
-                   subWait>>
-
-(* The human answers. Hold mode resumes at once; release mode must first   *)
-(* win a token back.                                                       *)
-Answer(t) ==
-    /\ topState[t] = "prompt"
-    /\ topState' = [topState EXCEPT ![t] =
-                      IF PromptMode = "release" THEN "reacq" ELSE "pre"]
-    /\ UNCHANGED <<pool, topSrc, topOwnFree, subState, subSrc, subOwnFree,
-                   prompted, topWait, subWait>>
-
-(* try_acquire in a loop: only the pool is consulted, never the own token, *)
-(* and there is no action at all while pool = 0 -- the spin.               *)
-Reacquire(t) ==
-    /\ topState[t] = "reacq"
-    /\ pool > 0
-    /\ pool' = pool - 1
-    /\ topState' = [topState EXCEPT ![t] = "pre"]
-    /\ UNCHANGED <<topSrc, topOwnFree, subState, subSrc, subOwnFree,
-                   prompted, topWait, subWait>>
-
-(* ---- contention on the prompter's kernel lock ------------------------ *)
-
-(* Another top job (or a sub job in a child process) turns out to need the *)
-(* target the prompter is sitting on. It blocks on the kernel lock,        *)
-(* holding its token, until the prompter's build has committed; then the   *)
-(* double-checked runid skip lets it finish without building.              *)
-LockWaitTop(u, t) ==
-    /\ u # t /\ t \in Prompting
-    /\ topState[u] = "pre"
-    /\ topState' = [topState EXCEPT ![u] = "lockw"]
-    /\ topWait' = [topWait EXCEPT ![u] = t]
-    /\ UNCHANGED <<pool, topSrc, topOwnFree, subState, subSrc, subOwnFree,
-                   prompted, subWait>>
-
-LockResumeTop(u) ==
-    /\ topState[u] = "lockw"
-    /\ topState[topWait[u]] = "done"
-    /\ topState' = [topState EXCEPT ![u] = "post"]
-    /\ topWait' = [topWait EXCEPT ![u] = 0]
-    /\ UNCHANGED <<pool, topSrc, topOwnFree, subState, subSrc, subOwnFree,
-                   prompted, subWait>>
-
-LockWaitSub(t, s, w) ==
-    /\ w # t /\ w \in Prompting
-    /\ subState[<<t, s>>] = "running"
-    /\ subState' = [subState EXCEPT ![<<t, s>>] = "lockw"]
-    /\ subWait' = [subWait EXCEPT ![<<t, s>>] = w]
-    /\ UNCHANGED <<pool, topState, topSrc, topOwnFree, subSrc, subOwnFree,
-                   prompted, topWait>>
-
-LockResumeSub(t, s) ==
-    /\ subState[<<t, s>>] = "lockw"
-    /\ topState[subWait[<<t, s>>]] = "done"
-    /\ subState' = [subState EXCEPT ![<<t, s>>] = "running"]
-    /\ subWait' = [subWait EXCEPT ![<<t, s>>] = 0]
-    /\ UNCHANGED <<pool, topState, topSrc, topOwnFree, subSrc, subOwnFree,
-                   prompted, topWait>>
-
-AllDone == \A t \in TopJobs : topState[t] = "done"
+AllDone == \A j \in Jobs : st[j] = "done"
 
 Terminating == AllDone /\ UNCHANGED vars
 
 Next ==
-    \/ \E t \in TopJobs :
-         \/ LaunchTopOwn(t)
-         \/ LaunchTopPool(t)
-         \/ SpawnChild(t)
-         \/ ResumeTop(t)
-         \/ FinishTop(t)
-         \/ Prompt(t) \/ Answer(t) \/ Reacquire(t) \/ LockResumeTop(t)
-         \/ \E w \in TopJobs : LockWaitTop(t, w)
-         \/ \E s \in 1..NSub :
-              \/ LaunchSubOwn(t, s)
-              \/ LaunchSubPool(t, s)
-              \/ FinishSub(t, s)
-              \/ LockResumeSub(t, s)
-              \/ \E w \in TopJobs : LockWaitSub(t, s, w)
+    \/ \E j \in Jobs :
+         LaunchOwn(j) \/ LaunchPool(j) \/ Begin(j) \/ Prompt(j)
+         \/ Reacquire(j) \/ Spawn(j) \/ Resume(j) \/ Finish(j)
+    \/ \E p \in ProcSet : Sleep(p)
     \/ Terminating
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 ----------------------------------------------------------------------------
-(* Pool tokens held by launched-but-unfinished jobs. A job blocked on a    *)
-(* lock or (hold mode) on the human still holds its token; in release mode *)
-(* the prompter has given its token up.                                    *)
-HoldingStates ==
-    IF PromptMode = "release"
-      THEN {"pre", "waiting", "post", "lockw"}
-      ELSE {"pre", "waiting", "post", "lockw", "prompt"}
-PoolHeldTop ==
-    Cardinality({t \in TopJobs :
-        topState[t] \in HoldingStates /\ topSrc[t] = "pool"})
-PoolHeldSub ==
-    Cardinality({u \in SubJobs :
-        subState[u] \in {"running", "lockw"} /\ subSrc[u] = "pool"})
+PoolHeld == Cardinality({j \in Jobs : st[j] \in Holding /\ src[j] = "pool"})
+Prompting == Cardinality({j \in Jobs : st[j] = "prompt"})
 
-(* Release mode lends an OWN token into the pool while its holder is       *)
-(* prompting: the pool then over-counts by exactly that many. The precise  *)
-(* conservation statement accounts for the loan; the reacquired token is  *)
-(* the loan coming back (the count is right again, the labels are not:    *)
-(* the job then runs a pool token under topSrc = "own", and FinishTop     *)
-(* frees the own flag instead of returning it -- which is the same thing  *)
-(* numerically, so the invariant holds).                                   *)
-LentOwn ==
-    IF PromptMode = "release"
-      THEN Cardinality({t \in Prompting : topSrc[t] = "own"})
-      ELSE 0
+TokenConservation ==
+    pool + PoolHeld = J - 1 + (IF PromptMode = "pool" THEN Prompting ELSE 0)
 
-TokenConservation == pool + PoolHeldTop + PoolHeldSub = J - 1 + LentOwn
+OwnConsistent ==
+    \A p \in ProcSet :
+        ownFree[p] <=> ~\E j \in InProc(p) : st[j] \in Holding /\ src[j] = "own"
 
-(* Do-file bodies actually executing (not blocked in redo-ifchange). *)
-Active ==
-    Cardinality({t \in TopJobs : topState[t] \in {"pre", "post"}})
-    + Cardinality({u \in SubJobs : subState[u] = "running"})
+OwnUnique ==
+    \A p \in ProcSet :
+        Cardinality({j \in InProc(p) : st[j] \in Holding /\ src[j] = "own"}) <= 1
+
+(* Every launched, unfinished job holds a token -- except a job waiting at
+   a prompt in "source" mode, which gave its token back. *)
+TokenHeld ==
+    \A j \in Jobs :
+        (st[j] \in Holding /\ ~(st[j] = "prompt" /\ PromptMode = "source"))
+            => src[j] # "none"
+
+ChildrenOnlyWhileWaiting ==
+    \A j \in Jobs : (Len(j) > 1 /\ st[j] \notin {"queued", "done"})
+                        => st[Parent(j)] = "waiting"
+
+Active == Cardinality({j \in Jobs : st[j] \in Executing})
 
 Bound == Active <= J
+
+ExactBound == Active + pool <= J
+
+SemaphoreMax == pool <= J
+
+WorkConserving == \A p \in ProcSet : ~(asleep[p] /\ pool > 0 /\ ProcActive(p)
+                                       /\ \E j \in InProc(p) :
+                                            st[j] = "queued"
+                                            /\ \A c \in Earlier(j) : st[c] # "queued")
+
+(* Coverage, EXPECTED TO BE VIOLATED in TokenPool_DepthCoverage: jobs at
+   the deepest level, in different child processes, really do execute at
+   the same time, so the depth-3 checks are not passing on a model that
+   serializes the nesting. *)
+NeverTwoDeepExecuting ==
+    Cardinality({j \in Jobs : Len(j) = D /\ st[j] \in Executing}) <= 1
 
 Termination == <>AllDone
 
