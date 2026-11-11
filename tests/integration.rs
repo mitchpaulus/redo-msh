@@ -384,9 +384,9 @@ fn cycle_errors_without_hang() {
 
 /// A dependency cycle entered concurrently from two sides must error, not
 /// deadlock. This is the exact scenario `CycleLock_CycleParallel` proves
-/// deadlocks under path-local (chain) cycle detection, and
-/// `ParallelEnsure_Cycle` proves errors out cleanly on every interleaving
-/// under the shared waits-for graph: two parallel branches (`x`, `y`) reach
+/// deadlocks under path-local (chain) cycle detection (a retired config,
+/// see verification/README.md), and `SpeculationMP_TrueCycle` proves errors
+/// out cleanly on every interleaving under the shared waits-for graph: two parallel branches (`x`, `y`) reach
 /// the cycle `a <-> b` from different entry points, so neither branch's own
 /// chain ever contains the whole loop.
 #[test]
@@ -412,7 +412,7 @@ fn parallel_cycle_from_two_sides_errors_not_deadlocks() {
 /// A stale recorded dependency (the database says `app` needs `dropped`,
 /// the do-file no longer does) may cost speculative work but must never
 /// invent an error — even when the stale dep can no longer be built. This
-/// is Speculation.tla's soft-failure rule: speculative failures only force
+/// is SpeculationMP's soft-failure rule (R4): speculative failures only force
 /// the rebuild path, and the do-file is the ground truth.
 #[test]
 fn stale_recorded_dep_failure_is_soft() {
@@ -1831,4 +1831,106 @@ fn waiting_run_does_not_skip_over_an_unchecked_dep() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(p.read("d"), "d2\n", "run A never rebuilt d");
     assert_eq!(p.read("t"), "s2\nd2\n", "run A accepted t built from a stale d");
+}
+
+/// Killing a speculative build kills everything its do-file started, not
+/// just the interpreter (SpeculationMP R5/R6 assume the whole subtree dies;
+/// `proctree.rs`). A stale recorded edge top -> slow starts slow's do-file
+/// speculatively; it launches a background subshell that would write
+/// `leak.txt` two seconds later. top no longer needs slow, so the drain
+/// abandons and kills it — and the subshell must die with it. Killing only
+/// `sh` (the former `Child::kill`) left the subshell running: it wrote its
+/// file after redo had returned, and could write into a later attempt's
+/// output.
+#[test]
+fn abandoned_speculation_kills_the_whole_do_file_tree() {
+    let Some(p) = sh_project() else { return };
+    p.write("slow.do", "echo slow1\n");
+    p.write("top.do", "redo-ifchange slow\necho top1\n");
+    p.write("all.do", "redo-ifchange top\n");
+    let out = p.redo(&["all"]);
+    assert!(out.status.success(), "setup build failed: {}", stderr(&out));
+
+    // slow's do-file changed (so it must rebuild) and now leaves a
+    // grandchild behind; top's no longer demands slow, and takes a second,
+    // which gives the speculative slow time to start.
+    p.write(
+        "slow.do",
+        "echo started > started.txt\n( sleep 2; echo leaked > leak.txt ) &\nsleep 30\necho slow2\n",
+    );
+    p.write("top.do", "sleep 1\necho top2\n");
+    // all keeps the session alive past the leak's write time: on Windows
+    // the top-level job object kills every leftover process when redo
+    // exits, which would otherwise hide the leak there.
+    p.write("all.do", "redo-ifchange top\nsleep 4\n");
+    let mut child = spawn_redo(&p, &["-j2", "all"], "err.txt");
+    let status = wait_or_fail(&mut child, 20, "redo with an abandoned speculative build");
+    assert!(
+        status.success(),
+        "build failed: {}",
+        std::fs::read_to_string(p.dir.join("err.txt")).unwrap_or_default()
+    );
+    assert_eq!(p.read("top"), "top2\n");
+    assert!(
+        p.exists("started.txt"),
+        "the speculative build of slow never started: the test proves nothing"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(
+        !p.exists("leak.txt"),
+        "a process started by the killed speculative do-file outlived it"
+    );
+}
+
+/// A terminal signal reaches speculative do-files too
+/// (`proctree::install_forwarding`). The terminal signals its foreground
+/// process group: the redo processes and demanded do-files are in it, but
+/// a speculative do-file leads a group of its own, so the redo process
+/// that owns it must forward the signal. Here redo runs in its own group
+/// standing in for the terminal's foreground group, and the whole group is
+/// sent SIGTERM (a background subshell of a non-interactive `sh` ignores
+/// SIGINT whoever sends it, so SIGINT would prove nothing).
+#[cfg(unix)]
+#[test]
+fn signal_to_redo_reaches_speculative_process_groups() {
+    let Some(p) = sh_project() else { return };
+    p.write("slow.do", "echo slow1\n");
+    p.write("top.do", "redo-ifchange slow\necho top1\n");
+    p.write("all.do", "redo-ifchange top\n");
+    let out = p.redo(&["all"]);
+    assert!(out.status.success(), "setup build failed: {}", stderr(&out));
+
+    p.write(
+        "slow.do",
+        "echo started > started.txt\n( sleep 2; echo leaked > leak.txt ) &\nsleep 30\necho slow2\n",
+    );
+    p.write("top.do", "sleep 10\necho top2\n");
+    let err = std::fs::File::create(p.dir.join("err.txt")).unwrap();
+    let mut child = {
+        use std::os::unix::process::CommandExt;
+        p.redo_cmd(&["-j2", "all"])
+            .stdout(std::process::Stdio::null())
+            .stderr(err)
+            .process_group(0)
+            .spawn()
+            .expect("spawn redo-msh")
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !p.exists("started.txt") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the speculative build of slow never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: signalling the process group our child leads.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM);
+    }
+    let _ = wait_or_fail(&mut child, 10, "redo after SIGTERM");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        !p.exists("leak.txt"),
+        "a speculative do-file's process survived the signal that killed redo"
+    );
 }

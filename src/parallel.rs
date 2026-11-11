@@ -521,12 +521,23 @@ enum WatchedOutcome {
 /// lineage abort. Errors only for real faults (I/O) or an aborted
 /// speculative lineage (which fails this task, quarantined by grade).
 fn wait_task_watched(ctx: &Ctx, task: &Task, edge: &EdgeRef) -> Result<WatchedOutcome> {
-    // This task's result is now on our critical path: it may use the own
-    // token even while speculative (and if it was parked waiting for one,
-    // wake it).
-    if !task.wanted.swap(true, Ordering::AcqRel) {
-        ctx.tasks.token_cv.notify_all();
-    }
+    // If THIS checker is on a critical path (its own task is demanded, or
+    // is itself wanted by a critical checker), the dep's result is too: it
+    // may then use the own token even while speculative (and if it was
+    // parked waiting for one, wake it). A purely speculative checker never
+    // promotes its deps — otherwise a chain of speculation could take the
+    // own token ahead of demanded work. Re-evaluated on every poll, so an
+    // upgrade of this checker while it waits propagates down.
+    let mut promoted = false;
+    let mut promote = |ctx: &Ctx| {
+        if !promoted && on_critical_path(ctx) {
+            promoted = true;
+            if !task.wanted.swap(true, Ordering::AcqRel) {
+                ctx.tasks.token_cv.notify_all();
+            }
+        }
+    };
+    promote(ctx);
     loop {
         {
             let mut st = task.state.lock().unwrap();
@@ -547,6 +558,7 @@ fn wait_task_watched(ctx: &Ctx, task: &Task, edge: &EdgeRef) -> Result<WatchedOu
             }
         }
         // Timed out while the dep still runs: poll our edge and our watch.
+        promote(ctx);
         if !waits::edge_alive(&ctx.conn, edge)? {
             return Ok(WatchedOutcome::Evicted);
         }
@@ -602,7 +614,23 @@ fn settle(task: &Task, res: Result<()>) {
 
 fn run_task(ctx: Ctx, task: Arc<Task>, force: bool) {
     let mut edges_inserted = false;
-    let res = task_body(&ctx, &task.target, force, &mut edges_inserted);
+    // A panic anywhere below must still settle the task: its waiters
+    // (`wait_task`, `drain`) block without a timeout, so an unsettled task
+    // hangs the whole build. The token is returned by `TokenGuard`'s drop
+    // during the unwind; here the panic becomes an ordinary failure.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        task_body(&ctx, &task.target, force, &mut edges_inserted)
+    }))
+    .unwrap_or_else(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        // Edges may have been inserted before the panic; clear defensively.
+        edges_inserted = true;
+        Err(anyhow!("internal error while handling {}: {msg}", task.target))
+    });
     // A settled target no longer blocks: its wait edges leave the shared
     // graph on every outcome (verified, built, failed), including error
     // paths that broke out of the checking loop early. Skipped when this
@@ -644,10 +672,24 @@ fn task_body(
         let _ = waits::clear_waiter(&ctx.conn, target);
         *edges_inserted = false;
     }
-    let src = acquire_token(ctx, target)?;
-    let r = build::build(ctx, target, force);
-    release_token(ctx, src);
-    r
+    let _token = TokenGuard {
+        ctx,
+        src: acquire_token(ctx, target)?,
+    };
+    build::build(ctx, target, force)
+}
+
+/// Returns a held token on every exit from the build, including a panic's
+/// unwind (TokenPool's `TokenConservation` on the error paths).
+struct TokenGuard<'a> {
+    ctx: &'a Ctx,
+    src: TokenSrc,
+}
+
+impl Drop for TokenGuard<'_> {
+    fn drop(&mut self) {
+        release_token(self.ctx, self.src);
+    }
 }
 
 /// The checking phase: decide whether `target` must rebuild, speculating
@@ -938,15 +980,21 @@ fn check_recorded(ctx: &Ctx, target: &str, edges_inserted: &mut bool) -> Result<
 /// `build::build` locks after the token is held — which is the discipline
 /// TokenPool.tla's deadlock-freedom rests on. A speculative lineage checks
 /// its abort watch while it waits.
+/// Whether this task's result is needed by demanded work: it is demanded
+/// (or is not a registry task at all), or a checker on such a path is
+/// waiting for it.
+fn on_critical_path(ctx: &Ctx) -> bool {
+    ctx.demanded.as_ref().is_none_or(|d| d.load(Ordering::Acquire))
+        || ctx.wanted.as_ref().is_some_and(|w| w.load(Ordering::Acquire))
+}
+
 fn acquire_token(ctx: &Ctx, target: &str) -> Result<TokenSrc> {
     // Speculation only consumes SURPLUS parallelism: a still-speculative
     // task may take pool tokens but never the process's own token (which
-    // the demanded pipeline needs for forward progress). The gate is
-    // re-read every attempt — an upgrade mid-wait unlocks the own token.
-    let own_ok = |ctx: &Ctx| {
-        ctx.demanded.as_ref().map_or(true, |d| d.load(Ordering::Acquire))
-            || ctx.wanted.as_ref().map_or(false, |w| w.load(Ordering::Acquire))
-    };
+    // the demanded pipeline needs for forward progress) unless demanded
+    // work is waiting on it. The gate is re-read every attempt — an
+    // upgrade mid-wait unlocks the own token.
+    let own_ok = on_critical_path;
     if own_ok(ctx) && !ctx.tasks.own_busy.swap(true, Ordering::AcqRel) {
         build::jlog(ctx, || format!("{target}: build slot: own token"));
         return Ok(TokenSrc::Own);
@@ -987,8 +1035,19 @@ fn acquire_token(ctx: &Ctx, target: &str) -> Result<TokenSrc> {
 
 fn release_token(ctx: &Ctx, src: TokenSrc) {
     match src {
-        TokenSrc::Own => ctx.tasks.own_busy.store(false, Ordering::Release),
-        TokenSrc::Pool => ctx.jobs.release(),
+        TokenSrc::Own => {
+            ctx.tasks.own_busy.store(false, Ordering::Release);
+            // Not every parked waiter may take the own token (speculation
+            // that nobody is waiting on is gated off it), so waking just one
+            // could wake an ineligible one and leave demanded work asleep
+            // until its timeout. Wake them all; the own token is released
+            // at most once per build, so this is not a hot path.
+            ctx.tasks.token_cv.notify_all();
+        }
+        TokenSrc::Pool => {
+            ctx.jobs.release();
+            // Any waiter may take a pool token: one wakeup per token.
+            ctx.tasks.token_cv.notify_one();
+        }
     }
-    ctx.tasks.token_cv.notify_one();
 }

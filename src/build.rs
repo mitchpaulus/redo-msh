@@ -101,7 +101,13 @@ impl Ctx {
         let root = Root::discover(&cwd)?;
         let conn = root.open_db()?;
         let session = db::next_runid(&conn)?;
-        db::forget_overwrite_modes(&conn, session)?;
+        // A `redo` run from inside a do-file is a new session nested in a
+        // live one: forgetting "every other session's" answers there would
+        // erase the enclosing run's [a]ll / [q]uit and ask the user again.
+        // Only a genuinely top-level start sweeps them.
+        if std::env::var_os(E_SESSION).is_none() {
+            db::forget_overwrite_modes(&conn, session)?;
+        }
         let config = crate::config::Config::load(&root.dir)?;
         // Decide interactivity here, where the standard streams still say
         // something, and publish it to the whole process tree.
@@ -670,12 +676,24 @@ fn clean_target_temps(dodir: &Path, arg_target: &str) {
     }
 }
 
-/// The stdout capture file for a target's build. Named by the target's lock
-/// key, so the sweeper can tell which build owns it.
-fn capture_path(root: &Root, target_rel: &str) -> PathBuf {
-    root.redo_dir()
-        .join("tmp")
-        .join(format!("stdout.{}", crate::lock::target_key(target_rel)))
+/// The stdout capture file for one build attempt of a target:
+/// `stdout.<lock key>.<pid>.<attempt>`. The lock key tells the sweeper
+/// which build owns it; the pid and attempt keep a killed attempt's
+/// stragglers from writing into a later attempt's capture (a fresh
+/// `File::create` at a shared path would reopen the very inode they hold).
+fn capture_path(root: &Root, target_rel: &str, attempt: u64) -> PathBuf {
+    root.redo_dir().join("tmp").join(format!(
+        "stdout.{}.{}.{}",
+        crate::lock::target_key(target_rel),
+        std::process::id(),
+        attempt
+    ))
+}
+
+/// A process-wide build-attempt counter, for temp names.
+fn next_attempt() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Sweep stdout captures left by crashed builds. A capture is deleted only
@@ -690,7 +708,11 @@ fn gc_temps(root: &Root) {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        match name.strip_prefix("stdout.") {
+        // `stdout.<key>.<pid>.<attempt>` (or the older `stdout.<key>`).
+        let key = name
+            .strip_prefix("stdout.")
+            .map(|rest| rest.split('.').next().unwrap_or(rest));
+        match key {
             Some(key) if key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 if let Some(_held) = crate::lock::try_lock_key(root, key) {
                     let _ = fs::remove_file(e.path());
@@ -1016,8 +1038,9 @@ fn open_console() -> std::io::Result<(fs::File, fs::File)> {
 /// deadlocks two ways. This prompt runs with the target's kernel lock held,
 /// and lock waiters keep their tokens: the lent token is taken by a job that
 /// then blocks on this very lock, and once every token is parked there the
-/// prompter can never get one back (TokenPoolPromptLock.tla, ten steps at
-/// -j2). And in a nested build, two answered prompts can leave the pool's
+/// prompter can never get one back (TokenPool_PromptReleaseLock; returning
+/// the token to its source deadlocks the same way, TokenPool_PromptSourceLock).
+/// And in a nested build, two answered prompts can leave the pool's
 /// only token with a blocked ancestor that is waiting for this very worker
 /// (TokenPool_PromptDeadlock). One idle slot while the user thinks is the
 /// price; the prompt lock already allows only one open question at a time.
@@ -1061,7 +1084,9 @@ fn prompt_overwrite(ctx: &Ctx, target_rel: &str, problem: &str) -> Result<Answer
 /// switch happens, because `tcsetpgrp` from a background group would itself
 /// stop the process. While a question is open, Ctrl-C reaches the
 /// prompting process rather than the top-level one; its build then fails
-/// upward like any other, which is what the user meant anyway.
+/// upward like any other, which is what the user meant anyway — and its
+/// signal handler (`proctree.rs`) restores the terminal's foreground group
+/// before it dies.
 #[cfg(unix)]
 struct ConsoleForeground {
     fd: std::os::unix::io::RawFd,
@@ -1090,6 +1115,10 @@ impl ConsoleForeground {
                 libc::signal(libc::SIGTTOU, prev_ttou);
                 return None;
             }
+            // Ctrl-C now reaches US (we are the foreground group): if it
+            // kills us mid-question, the signal handler hands the terminal
+            // back first instead of leaving it to a dead group.
+            crate::proctree::prompt_opened(fd, prev);
             Some(ConsoleForeground { fd, prev, prev_ttou })
         }
     }
@@ -1100,6 +1129,7 @@ impl Drop for ConsoleForeground {
     fn drop(&mut self) {
         // SAFETY: as in `take`.
         unsafe {
+            crate::proctree::prompt_closed();
             libc::tcsetpgrp(self.fd, self.prev);
             libc::signal(libc::SIGTTOU, self.prev_ttou);
         }
@@ -1345,13 +1375,18 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     // Temp output ($3), beside the target for same-volume atomic rename. Sweep
     // any stale temps for this target from a previously crashed build.
     clean_target_temps(&df.dodir_abs, &df.arg_target);
+    // Unique per ATTEMPT, not just per process: a killed speculative
+    // attempt's stragglers (anything that escaped its process tree) must
+    // never write into the temp of a later attempt at the same target in
+    // the same process (a reclaim re-runs it here).
+    let attempt = next_attempt();
     let pid = std::process::id();
-    let tmp3_rel = format!("{}.redo-tmp.{}", df.arg_target, pid);
+    let tmp3_rel = format!("{}.redo-tmp.{}.{}", df.arg_target, pid, attempt);
     let tmp3_abs = df.dodir_abs.join(&tmp3_rel);
 
     // Capture file for the do-file's stdout (output detection). Its stderr
     // goes to the target's log, streamed live by the top-level's follower.
-    let capture_path = capture_path(&ctx.root, target_rel);
+    let capture_path = capture_path(&ctx.root, target_rel, attempt);
     fs::create_dir_all(capture_path.parent().expect("capture path has a parent"))?;
 
     // All temps are removed on every exit path (return, `?`, panic).
@@ -1470,8 +1505,15 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     // design (Uncommitted marker recorded above, temps swept by the guard
     // and the startup GC, kernel-released locks); any nested redo
     // processes watching our lineage unwind via REDO_SPEC_WATCH.
-    let mut child = command
-        .spawn()
+    //
+    // A task speculative in THIS process (it has an abandon flag) runs its
+    // do-file as a tree of its own — a process group on Unix, a job object
+    // on Windows — so the kill reaches everything the do-file started, not
+    // just its interpreter (`proctree.rs`). A demanded task inside a
+    // speculative lineage stays in its parent's tree, which the lineage's
+    // owner kills as a whole.
+    let own_tree = ctx.abandon.is_some();
+    let mut child = crate::proctree::spawn(&mut command, own_tree)
         .map_err(|e| interpreter_spawn_error(e, &interp, &df.dofile_abs, child_path.as_deref()))?;
     let speculative = ctx.abandon.is_some() || !ctx.spec_watch.is_empty();
     let status = if !speculative {
@@ -1482,8 +1524,7 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
                 break st;
             }
             if crate::parallel::speculation_dead(ctx)? {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.kill_tree();
                 if let Some(g) = done_guard.as_mut() {
                     g.record_exit(1);
                 }

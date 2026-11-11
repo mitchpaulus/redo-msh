@@ -401,15 +401,15 @@ pub fn try_demand(
         match cand {
             None => Ok(DemandOutcome::RealCycle), // defensive: no soft edge on any path
             Some((rowid, _ew, edep, kind)) => {
+                let owner: String = c.query_row(
+                    "SELECT owner FROM waits WHERE rowid = ?1",
+                    params![rowid],
+                    |r| r.get(0),
+                )?;
                 c.execute("DELETE FROM waits WHERE rowid = ?1", params![rowid])?;
                 let aborted = kind == EdgeKind::Creation as i64;
                 if aborted {
-                    // Aborting the speculative instance `edep`: drop its own
-                    // outgoing waits too, cutting every residual path through
-                    // it at once. Its processes notice via their watch/edge
-                    // polls and unwind; anything they still hold dissolves as
-                    // they exit.
-                    c.execute("DELETE FROM waits WHERE waiter = ?1", params![edep])?;
+                    drop_aborted_instance(c, &owner, &edep)?;
                 }
                 Ok(DemandOutcome::Evicted {
                     aborted_lineage: aborted,
@@ -417,6 +417,29 @@ pub fn try_demand(
             }
         }
     })
+}
+
+/// Drop the checker waits of the speculative instance of `dep` that the
+/// process `owner` spawned (and whose creation edge was just deleted).
+///
+/// Only THAT owner's edges go (SpeculationMP's `DropInstance`). Edges keyed
+/// `dep` but owned by another process belong to someone else: in
+/// particular, a demanded build of `dep` elsewhere — which the aborted
+/// instance may merely have been queued behind on the kernel lock — keeps
+/// its hard demand edges. Deleting those (the former `WHERE waiter = dep`)
+/// erased real waits the demander never re-inserts, and a later cycle check
+/// could then approve a wait that closes a cycle: a deadlock on an acyclic
+/// project (`SpeculationMP_EvictForeign`). If the aborted instance was the
+/// one building, its do-file's child processes own their edges under their
+/// own ids; they see the abort through `REDO_SPEC_WATCH` and clear them as
+/// they unwind (the `RealCycle` stabilization window in
+/// `build::demand_edge` covers that interval).
+fn drop_aborted_instance(c: &Connection, owner: &str, dep: &str) -> Result<()> {
+    c.execute(
+        "DELETE FROM waits WHERE waiter = ?1 AND owner = ?2",
+        params![dep, owner],
+    )?;
+    Ok(())
 }
 
 /// Abort a speculative lineage from BELOW (SpeculationMP rule R6): delete
@@ -437,7 +460,7 @@ pub fn abort_creation(root: &Root, conn: &Connection, e: &EdgeRef) -> Result<boo
             return Ok(false);
         }
         // Same as the eviction: the aborted instance's own waits go too.
-        c.execute("DELETE FROM waits WHERE waiter = ?1", params![e.dep])?;
+        drop_aborted_instance(c, &e.owner, &e.dep)?;
         Ok(true)
     })
 }
@@ -705,6 +728,57 @@ mod tests {
         assert_eq!(
             try_demand(&root, &conn, "x", "ctx").unwrap(),
             DemandOutcome::Inserted
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
+    /// SpeculationMP_EvictForeign: the aborted speculative instance of s was
+    /// only queued on s's lock; ANOTHER process is building s and has
+    /// hard-demanded x. Evicting the creation edge must not erase that
+    /// builder's s -> x edge (it is never re-inserted, and losing it lets a
+    /// later wait close a real cycle unseen).
+    #[test]
+    fn evicting_creation_edge_keeps_foreign_builders_demands() {
+        let root = test_root("evictforeign");
+        let conn = db::open(&root.db_path()).unwrap();
+
+        // Another (live) process builds s and demands x.
+        conn.execute(
+            "INSERT INTO waits(waiter, dep, owner, kind) VALUES ('s', 'x', 'builder-1', 0)",
+            [],
+        )
+        .unwrap();
+        // We speculatively spawned s (its instance waits on s's lock).
+        assert_eq!(
+            try_soft(&root, &conn, "a", "s", EdgeKind::Creation).unwrap(),
+            SoftOutcome::Inserted
+        );
+        // x demands a: the cycle a -> s -> x -> a rides our creation edge.
+        assert_eq!(
+            try_demand(&root, &conn, "x", "a").unwrap(),
+            DemandOutcome::Evicted {
+                aborted_lineage: true
+            }
+        );
+        let foreign = EdgeRef {
+            owner: "builder-1".into(),
+            waiter: "s".into(),
+            dep: "x".into(),
+        };
+        assert!(
+            edge_alive(&conn, &foreign).unwrap(),
+            "the foreign builder's demand edge must survive the abort"
+        );
+        assert_eq!(
+            try_demand(&root, &conn, "x", "a").unwrap(),
+            DemandOutcome::Inserted
+        );
+        // A later demand that closes the real cycle is still seen.
+        assert_eq!(
+            try_demand(&root, &conn, "a", "s").unwrap(),
+            DemandOutcome::RealCycle
         );
 
         drop(conn);
