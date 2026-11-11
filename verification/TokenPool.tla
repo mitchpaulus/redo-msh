@@ -1,8 +1,8 @@
 ---------------------------- MODULE TokenPool ----------------------------
 (***************************************************************************)
-(* The jobserver token protocol of redo-msh (src/jobserver.rs,             *)
-(* run_parallel and prompt_overwrite in src/build.rs) over a job TREE of   *)
-(* arbitrary depth:                                                        *)
+(* The jobserver token protocol of redo-msh (src/jobserver.rs, the        *)
+(* scheduler in src/parallel.rs, prompt_overwrite in src/build.rs) over a  *)
+(* job TREE of arbitrary depth:                                            *)
 (*                                                                         *)
 (*   - A build has J total tokens: every process holds one implicit "own"  *)
 (*     token, and a shared pool starts with J-1 extra tokens.              *)
@@ -12,20 +12,27 @@
 (*     and blocks ("waiting") while a CHILD PROCESS runs its children,     *)
 (*     resumes ("post") when they are all done, and finishes.              *)
 (*   - Each process launches its jobs in order, own token first, then pool *)
-(*     tokens, never blocking on the pool. With Lazy (today's              *)
+(*     tokens, never blocking on the pool. With Lazy (the former           *)
 (*     run_parallel), a process that finds the pool empty sleeps until one *)
 (*     of ITS OWN jobs completes (it blocks in rx.recv()); without Lazy it *)
 (*     launches whenever a token is available (the eager scheduler the     *)
-(*     implementation contract requires).                                  *)
+(*     implementation contract requires and src/parallel.rs implements).   *)
 (*   - Overwrite prompt (Prompts): a job about to run its do-file may stop *)
-(*     to ask on the terminal. PromptMode:                                 *)
-(*       "pool"   - today: release one token to the POOL, then spin on     *)
-(*                  pool try-acquire to resume;                            *)
-(*       "hold"   - keep the token while waiting;                          *)
+(*     to ask on the terminal, at any depth (nested redo processes really  *)
+(*     prompt). It asks with its target's kernel lock held. PromptMode:    *)
+(*       "pool"   - the former code: release one token to the POOL, then   *)
+(*                  spin on pool try-acquire to resume;                    *)
+(*       "hold"   - keep the token while waiting (the code since           *)
+(*                  2026-09-03);                                           *)
 (*       "source" - give the token back to where it came from (own token   *)
 (*                  -> the process's own slot, waking its scheduler; pool  *)
 (*                  token -> the pool) and resume on the process's own     *)
 (*                  token if free, else a pool token.                      *)
+(*   - Lock waiters (LockWaits): a launched job whose target is the one a  *)
+(*     prompter is sitting on blocks on that kernel lock ("lockw") HOLDING *)
+(*     its token (build() blocks outright), until the prompter's build is  *)
+(*     over; the double-checked runid skip then finishes it without        *)
+(*     building (its subtree never runs).                                  *)
 (*                                                                         *)
 (* Checked properties:                                                     *)
 (*   TokenConservation - pool tokens are never lost or duplicated (a       *)
@@ -57,18 +64,20 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS J, FanOut, Lazy, Prompts, PromptMode
+CONSTANTS J, FanOut, Lazy, Prompts, PromptMode, LockWaits
 
 ASSUME /\ J \in Nat \ {0}
        /\ FanOut \in Seq(Nat \ {0}) /\ Len(FanOut) >= 1
        /\ Lazy \in BOOLEAN /\ Prompts \in BOOLEAN
        /\ PromptMode \in {"pool", "hold", "source"}
+       /\ LockWaits \in BOOLEAN
 
 \* --- tree shapes, selected from the .cfg files via <- ---------------------
 Tree22 == <<2, 2>>       \* the original NTop=2, NSub=2
 Tree32 == <<3, 2>>       \* the original NTop=3, NSub=2
 Tree122 == <<1, 2, 2>>   \* depth 3, branching at every level below the top
 Tree222 == <<2, 2, 2>>
+Tree3 == <<3>>           \* one process, three jobs: no nesting at all
 
 D == Len(FanOut)
 
@@ -81,14 +90,17 @@ Jobs == UNION {JobsAt(k) : k \in 1..D}
 Parent(j) == SubSeq(j, 1, Len(j) - 1)
 Leaf(j) == Len(j) = D
 Children(j) == {c \in Jobs : Len(c) = Len(j) + 1 /\ Parent(c) = j}
+Below(j) == {c \in Jobs : Len(c) > Len(j) /\ SubSeq(c, 1, Len(j)) = j}
 
 \* A process: the top level (<<>>) or the child process of a non-leaf job.
 ProcSet == {<<>>} \cup {j \in Jobs : ~Leaf(j)}
 InProc(p) == {j \in Jobs : Parent(j) = p}
 Earlier(j) == {c \in InProc(Parent(j)) : c[Len(c)] < j[Len(j)]}
 
-States == {"queued", "start", "prompt", "pre", "waiting", "post", "done"}
-Holding == {"start", "prompt", "pre", "waiting", "post"}   \* launched, unfinished
+States == {"queued", "start", "prompt", "lockw", "pre", "waiting", "post",
+           "done"}
+\* launched, unfinished
+Holding == {"start", "prompt", "lockw", "pre", "waiting", "post"}
 Executing == {"start", "pre", "post"}                      \* not blocked
 
 VARIABLES
@@ -96,9 +108,10 @@ VARIABLES
     st,        \* [Jobs -> States]
     src,       \* [Jobs -> {"own", "pool", "none"}]: the token a job holds
     ownFree,   \* [ProcSet -> BOOLEAN]: the process's own token is unused
-    asleep     \* [ProcSet -> BOOLEAN]: blocked in rx.recv() (Lazy only)
+    asleep,    \* [ProcSet -> BOOLEAN]: blocked in rx.recv() (Lazy only)
+    waitOn     \* [Jobs -> Jobs \cup {<<>>}]: the prompter a lockw job waits on
 
-vars == <<pool, st, src, ownFree, asleep>>
+vars == <<pool, st, src, ownFree, asleep, waitOn>>
 
 TypeOK ==
     /\ pool \in Nat
@@ -106,6 +119,7 @@ TypeOK ==
     /\ src \in [Jobs -> {"own", "pool", "none"}]
     /\ ownFree \in [ProcSet -> BOOLEAN]
     /\ asleep \in [ProcSet -> BOOLEAN]
+    /\ waitOn \in [Jobs -> Jobs \cup {<<>>}]
 
 Init ==
     /\ pool = J - 1
@@ -113,6 +127,7 @@ Init ==
     /\ src = [j \in Jobs |-> "none"]
     /\ ownFree = [p \in ProcSet |-> TRUE]
     /\ asleep = [p \in ProcSet |-> FALSE]
+    /\ waitOn = [j \in Jobs |-> <<>>]
 
 (* A process runs while it is the top level or its parent job is blocked.
    (An IF, not a disjunction: TLC evaluates both disjuncts inside actions,
@@ -135,7 +150,7 @@ LaunchOwn(j) ==
     /\ ownFree' = [ownFree EXCEPT ![Parent(j)] = FALSE]
     /\ st' = [st EXCEPT ![j] = "start"]
     /\ src' = [src EXCEPT ![j] = "own"]
-    /\ UNCHANGED <<pool, asleep>>
+    /\ UNCHANGED <<pool, asleep, waitOn>>
 
 LaunchPool(j) ==
     /\ Next1(j)
@@ -144,7 +159,7 @@ LaunchPool(j) ==
     /\ pool' = pool - 1
     /\ st' = [st EXCEPT ![j] = "start"]
     /\ src' = [src EXCEPT ![j] = "pool"]
-    /\ UNCHANGED <<ownFree, asleep>>
+    /\ UNCHANGED <<ownFree, asleep, waitOn>>
 
 (* run_parallel found no token: block until one of its own jobs finishes. *)
 Sleep(p) ==
@@ -153,13 +168,13 @@ Sleep(p) ==
     /\ ~ownFree[p]
     /\ pool = 0
     /\ asleep' = [asleep EXCEPT ![p] = TRUE]
-    /\ UNCHANGED <<pool, st, src, ownFree>>
+    /\ UNCHANGED <<pool, st, src, ownFree, waitOn>>
 
 (* No prompt needed: the do-file starts. *)
 Begin(j) ==
     /\ st[j] = "start"
     /\ st' = [st EXCEPT ![j] = "pre"]
-    /\ UNCHANGED <<pool, src, ownFree, asleep>>
+    /\ UNCHANGED <<pool, src, ownFree, asleep, waitOn>>
 
 (* prompt_overwrite: block on the human. *)
 Prompt(j) ==
@@ -179,6 +194,7 @@ Prompt(j) ==
                         /\ UNCHANGED pool
                    ELSE /\ pool' = pool + 1
                         /\ UNCHANGED <<ownFree, asleep>>
+    /\ UNCHANGED waitOn
 
 (* Answered: take a token back, then run. *)
 Reacquire(j) ==
@@ -200,20 +216,21 @@ Reacquire(j) ==
                  /\ pool' = pool - 1
                  /\ src' = [src EXCEPT ![j] = "pool"]
                  /\ UNCHANGED <<ownFree, asleep>>
+    /\ UNCHANGED waitOn
 
 (* The do-file calls redo-ifchange: it blocks, its child process starts. *)
 Spawn(j) ==
     /\ st[j] = "pre"
     /\ ~Leaf(j)
     /\ st' = [st EXCEPT ![j] = "waiting"]
-    /\ UNCHANGED <<pool, src, ownFree, asleep>>
+    /\ UNCHANGED <<pool, src, ownFree, asleep, waitOn>>
 
 (* redo-ifchange returned: the do-file resumes. *)
 Resume(j) ==
     /\ st[j] = "waiting"
     /\ \A c \in Children(j) : st[c] = "done"
     /\ st' = [st EXCEPT ![j] = "post"]
-    /\ UNCHANGED <<pool, src, ownFree, asleep>>
+    /\ UNCHANGED <<pool, src, ownFree, asleep, waitOn>>
 
 (* A job finishes: its token goes back where it came from, and its
    process's scheduler wakes (the completion arrives on its channel). *)
@@ -228,6 +245,31 @@ Finish(j) ==
               /\ UNCHANGED pool
          ELSE /\ pool' = pool + 1
               /\ UNCHANGED ownFree
+    /\ UNCHANGED waitOn
+
+(* ---- contention on a prompter's kernel lock ---------------------------- *)
+
+(* A launched job turns out to build the very target prompter w is asking *)
+(* about (w holds its kernel lock). It blocks on the lock holding its      *)
+(* token. (A prompter has no live descendants and its ancestors are        *)
+(* blocked in redo-ifchange, so neither can be the waiter.)                *)
+LockWait(j, w) ==
+    /\ LockWaits
+    /\ st[j] = "start" /\ st[w] = "prompt" /\ j # w
+    /\ st' = [st EXCEPT ![j] = "lockw"]
+    /\ waitOn' = [waitOn EXCEPT ![j] = w]
+    /\ UNCHANGED <<pool, src, ownFree, asleep>>
+
+(* The prompter's build is over and the lock is free: the double-checked   *)
+(* runid skip finishes the waiter without running its do-file, so nothing  *)
+(* below it ever runs.                                                     *)
+LockResume(j) ==
+    /\ st[j] = "lockw"
+    /\ st[waitOn[j]] = "done"
+    /\ st' = [c \in Jobs |-> IF c = j THEN "post"
+                             ELSE IF c \in Below(j) THEN "done" ELSE st[c]]
+    /\ waitOn' = [waitOn EXCEPT ![j] = <<>>]
+    /\ UNCHANGED <<pool, src, ownFree, asleep>>
 
 AllDone == \A j \in Jobs : st[j] = "done"
 
@@ -237,6 +279,7 @@ Next ==
     \/ \E j \in Jobs :
          LaunchOwn(j) \/ LaunchPool(j) \/ Begin(j) \/ Prompt(j)
          \/ Reacquire(j) \/ Spawn(j) \/ Resume(j) \/ Finish(j)
+         \/ LockResume(j) \/ \E w \in Jobs : LockWait(j, w)
     \/ \E p \in ProcSet : Sleep(p)
     \/ Terminating
 

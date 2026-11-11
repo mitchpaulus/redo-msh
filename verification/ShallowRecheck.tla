@@ -44,8 +44,10 @@
 (*                          settled in this session, then as "settled"     *)
 (*                          (an alternative; not implemented).             *)
 (*   SpawnFirst: the checker starts every recorded buildable dep before it *)
-(*   looks at any evidence, as this branch's checker does (activate_spec   *)
-(*   precedes its early return). FALSE also allows main's in-order walk.   *)
+(*   looks at any evidence. Stricter than the code (check_recorded reads   *)
+(*   the target's own evidence before starting dep tasks): its behaviors   *)
+(*   are a subset of FALSE's, which allows any order, main's in-order walk *)
+(*   and check_recorded included.                                          *)
 (*   build   - the do-file walk under the lock: for each dep in order,     *)
 (*             redo-ifchange it (a buildable dep: demand its task and wait *)
 (*             for it to settle) and read its content; then commit.        *)
@@ -55,6 +57,10 @@
 (*   NoStaleRun       - a run during which no source was edited ends with  *)
 (*                      every target it settled truly up to date. (Edits   *)
 (*                      DURING a run may be missed by any build system.)   *)
+(*                      Checked on the final runid column AND at every     *)
+(*                      settle step (history flag `staleBy`): another      *)
+(*                      run's later mark can overwrite runid and hide a    *)
+(*                      stale settle from the final state.                 *)
 (*   NoRedundantBuild - a build starts only if the target is truly out of  *)
 (*                      date at that moment (history flag `redundant`).    *)
 (*   NeverSkipAtRecheck (coverage) - the re-check never skips on content;  *)
@@ -108,23 +114,34 @@ VARIABLES
     bi,         \* [Sessions -> [Targets -> Nat]]: do-file walk position
     part,       \* [Sessions -> [Targets -> record]]: contents read so far
     redundant,  \* history: a build started on a truly up-to-date target
-    skipped     \* history: a re-check skipped on content (not on runid)
+    skipped,    \* history: a re-check skipped on content (not on runid)
+    staleBy     \* history: [Sessions -> BOOLEAN] the session settled a target
+                \* that was not truly up to date, with no edit since it began
 
 vars == <<ver, rec, inflight, lock, runid, sess, startEdits, edits, ph, ex,
-          bi, part, redundant, skipped>>
+          bi, part, redundant, skipped, staleBy>>
 
-Content(d) == IF d \in Sources THEN ver[d] ELSE rec[d]
+ContentIn(r, d) == IF d \in Sources THEN ver[d] ELSE r[d]
+Content(d) == ContentIn(rec, d)
 
 (* Under SpawnFirst, no evidence is read before every recorded buildable
    dep's task has been started. *)
 Spawned(S, t) == SpawnFirst => \A d \in Buildable(t) : ph[S][d] # "idle"
 
 \* The ground truth: built from the current content of every dependency,
-\* all the way down.
-RECURSIVE TrueUTD(_)
-TrueUTD(t) == \A d \in Deps(t) :
-                  /\ rec[t][d] = Content(d)
-                  /\ (d \in Targets => TrueUTD(d))
+\* all the way down (UTDIn: over the target records r).
+RECURSIVE UTDIn(_, _)
+UTDIn(r, t) == \A d \in Deps(t) :
+                   /\ r[t][d] = ContentIn(r, d)
+                   /\ (d \in Targets => UTDIn(r, d))
+TrueUTD(t) == UTDIn(rec, t)
+
+\* Session S settles t, leaving the target records r: record a stale settle
+\* (only one made before any edit during S counts; NoStaleRun excludes runs
+\* with edits anyway).
+NoteSettle(S, t, r) ==
+    staleBy' = [staleBy EXCEPT ![S] = @ \/ (edits = startEdits[S]
+                                             /\ ~UTDIn(r, t))]
 
 \* Every recorded edge of t matches what is on disk now (one level).
 RecMatch(t) == \A d \in Deps(t) : rec[t][d] = Content(d)
@@ -142,6 +159,7 @@ TypeOK ==
     /\ ph \in [Sessions -> [Targets -> Phases]]
     /\ edits \in 0..MaxEdits
     /\ redundant \in BOOLEAN /\ skipped \in BOOLEAN
+    /\ staleBy \in [Sessions -> BOOLEAN]
 
 Init ==
     /\ ver = [s \in Sources |-> 0]
@@ -158,6 +176,7 @@ Init ==
     /\ part = [s \in Sessions |-> [t \in Targets |-> Empty]]
     /\ redundant = FALSE
     /\ skipped = FALSE
+    /\ staleBy = [S \in Sessions |-> FALSE]
 
 SetPh(S, t, p) == ph' = [ph EXCEPT ![S][t] = p]
 
@@ -169,7 +188,7 @@ Start(S) ==
     /\ startEdits' = [startEdits EXCEPT ![S] = edits]
     /\ SetPh(S, Root, "check")
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, edits, ex, bi, part,
-                   redundant, skipped>>
+                   redundant, skipped, staleBy>>
 
 (* The run is over when its root has settled and no task of it is still
    running (redo_build drains speculative tasks before returning). *)
@@ -179,14 +198,14 @@ Finish(S) ==
     /\ \A t \in Targets : ph[S][t] \in {"idle", "done"}
     /\ sess' = [sess EXCEPT ![S] = "done"]
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, startEdits, edits, ph, ex,
-                   bi, part, redundant, skipped>>
+                   bi, part, redundant, skipped, staleBy>>
 
 Edit(s) ==
     /\ edits < MaxEdits
     /\ ver' = [ver EXCEPT ![s] = @ + 1]
     /\ edits' = edits + 1
     /\ UNCHANGED <<rec, inflight, lock, runid, sess, startEdits, ph, ex, bi,
-                   part, redundant, skipped>>
+                   part, redundant, skipped, staleBy>>
 
 (* ---- the unlocked check ------------------------------------------------ *)
 
@@ -195,7 +214,7 @@ CheckSeen(S, t) ==
     /\ runid[t] = S
     /\ SetPh(S, t, "done")
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, sess, startEdits, edits,
-                   ex, bi, part, redundant, skipped>>
+                   ex, bi, part, redundant, skipped, staleBy>>
 
 (* The Uncommitted marker of a build in flight is out-of-date evidence. *)
 CheckInflight(S, t) ==
@@ -205,7 +224,7 @@ CheckInflight(S, t) ==
     /\ inflight[t]
     /\ SetPh(S, t, "lock")
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, sess, startEdits, edits,
-                   ex, bi, part, redundant, skipped>>
+                   ex, bi, part, redundant, skipped, staleBy>>
 
 (* Start a buildable dep's task (speculation, or reaching it in order). *)
 CheckSpawn(S, t, d) ==
@@ -215,7 +234,7 @@ CheckSpawn(S, t, d) ==
     /\ ph[S][d] = "idle"
     /\ SetPh(S, d, "check")
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, sess, startEdits, edits,
-                   ex, bi, part, redundant, skipped>>
+                   ex, bi, part, redundant, skipped, staleBy>>
 
 (* Examine one dep: a source directly, a buildable dep once its task has
    settled. A mismatch sends the task to the build path; the rest of the
@@ -232,7 +251,7 @@ CheckDep(S, t, d) ==
          ELSE /\ ex' = [ex EXCEPT ![S][t] = @ \cup {d}]
               /\ UNCHANGED ph
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, sess, startEdits, edits,
-                   bi, part, redundant, skipped>>
+                   bi, part, redundant, skipped, staleBy>>
 
 (* Everything checked out (the marker is an edge too, so no build may be in
    flight): mark verified for this session, without the lock. *)
@@ -244,6 +263,7 @@ CheckClean(S, t) ==
     /\ ~inflight[t]
     /\ runid' = [runid EXCEPT ![t] = S]
     /\ SetPh(S, t, "done")
+    /\ NoteSettle(S, t, rec)
     /\ UNCHANGED <<ver, rec, inflight, lock, sess, startEdits, edits, ex, bi,
                    part, redundant, skipped>>
 
@@ -255,7 +275,7 @@ Acquire(S, t) ==
     /\ lock' = [lock EXCEPT ![t] = S]
     /\ SetPh(S, t, "recheck")
     /\ UNCHANGED <<ver, rec, inflight, runid, sess, startEdits, edits, ex, bi,
-                   part, redundant, skipped>>
+                   part, redundant, skipped, staleBy>>
 
 (* "settled" reads its evidence from the shared runid column, as the code
    does; a concurrent session's later mark_verified overwrites it, so the
@@ -279,7 +299,7 @@ RecheckSpawn(S, t, d) ==
     /\ ph[S][d] = "idle"
     /\ SetPh(S, d, "check")
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, sess, startEdits, edits,
-                   ex, bi, part, redundant, skipped>>
+                   ex, bi, part, redundant, skipped, staleBy>>
 
 RecheckSkip(S, t) ==
     /\ ph[S][t] = "recheck"
@@ -288,6 +308,7 @@ RecheckSkip(S, t) ==
     /\ runid' = [runid EXCEPT ![t] = S]
     /\ lock' = [lock EXCEPT ![t] = 0]
     /\ SetPh(S, t, "done")
+    /\ NoteSettle(S, t, rec)
     /\ UNCHANGED <<ver, rec, inflight, sess, startEdits, edits, ex, bi, part,
                    redundant>>
 
@@ -301,7 +322,7 @@ RecheckBuild(S, t) ==
     /\ part' = [part EXCEPT ![S][t] = Empty]
     /\ SetPh(S, t, "build")
     /\ UNCHANGED <<ver, rec, lock, runid, sess, startEdits, edits, ex,
-                   skipped>>
+                   skipped, staleBy>>
 
 (* The do-file's redo-ifchange of the next dep: a source is stamped and read
    (one step; LockSession covers the window between the two); a buildable
@@ -313,7 +334,7 @@ BuildDemand(S, t) ==
          /\ d \in Targets /\ ph[S][d] = "idle"
          /\ SetPh(S, d, "check")
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, sess, startEdits, edits,
-                   ex, bi, part, redundant, skipped>>
+                   ex, bi, part, redundant, skipped, staleBy>>
 
 BuildRead(S, t) ==
     /\ ph[S][t] = "build"
@@ -323,7 +344,7 @@ BuildRead(S, t) ==
          /\ part' = [part EXCEPT ![S][t] = Extend(@, d, Content(d))]
     /\ bi' = [bi EXCEPT ![S][t] = @ + 1]
     /\ UNCHANGED <<ver, rec, inflight, lock, runid, sess, startEdits, edits,
-                   ph, ex, redundant, skipped>>
+                   ph, ex, redundant, skipped, staleBy>>
 
 Commit(S, t) ==
     /\ ph[S][t] = "build"
@@ -333,6 +354,7 @@ Commit(S, t) ==
     /\ runid' = [runid EXCEPT ![t] = S]
     /\ lock' = [lock EXCEPT ![t] = 0]
     /\ SetPh(S, t, "done")
+    /\ NoteSettle(S, t, [rec EXCEPT ![t] = part[S][t]])
     /\ UNCHANGED <<ver, sess, startEdits, edits, ex, bi, part, redundant,
                    skipped>>
 
@@ -359,11 +381,15 @@ Spec == Init /\ [][Next]_vars /\ (\A S \in Sessions : WF_vars(SStep(S)))
 
 ----------------------------------------------------------------------------
 (* A run during which nothing was edited ends consistent: every target it
-   settled is built from the current content of everything below it. *)
+   settled is built from the current content of everything below it. The
+   final runid alone would miss a stale settle whose runid another run's
+   later mark overwrote, so every settle step is also checked as it happens
+   (staleBy). *)
 NoStaleRun ==
     \A S \in Sessions :
         (sess[S] = "done" /\ edits = startEdits[S])
-            => \A t \in Targets : runid[t] = S => TrueUTD(t)
+            => /\ ~staleBy[S]
+               /\ \A t \in Targets : runid[t] = S => TrueUTD(t)
 
 NoRedundantBuild == ~redundant
 

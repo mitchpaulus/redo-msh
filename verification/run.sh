@@ -65,14 +65,15 @@ run TokenPool.tla TokenPool_DepthCoverage.cfg violation:NeverTwoDeepExecuting
 run TokenPool.tla TokenPool_Eager.cfg ok
 run TokenPool.tla TokenPool_UnderUtilization.cfg violation:WorkConserving
 run TokenPool.tla TokenPool_PromptDeadlock.cfg deadlock
+# The overwrite prompt under contention on the prompter's target lock (lock
+# waiters keep their tokens), eager scheduler, prompts at every depth: only
+# "hold" survives; release-and-spin and give-back-to-source both deadlock.
 run TokenPool.tla TokenPool_PromptHold.cfg ok
+run TokenPool.tla TokenPool_PromptHoldJ3.cfg ok
+run TokenPool.tla TokenPool_PromptReleaseLock.cfg deadlock
+run TokenPool.tla TokenPool_PromptSourceLock.cfg deadlock
 run TokenPool.tla TokenPool_PromptSource.cfg ok
 run TokenPool.tla TokenPool_PromptSourceJ3.cfg ok
-# The same prompt fix under contention on the prompter's target lock (lock
-# waiters keep their tokens; the release-and-spin alternative deadlocks).
-run TokenPoolPromptLock.tla TokenPoolPromptLock_J2.cfg ok
-run TokenPoolPromptLock.tla TokenPoolPromptLock_J3.cfg ok
-run TokenPoolPromptLock.tla TokenPoolPromptLock_PromptHold.cfg ok
 run LockSession.tla LockSession_OneSession.cfg ok
 run LockSession.tla LockSession_Always.cfg ok
 run LockSession.tla LockSession_CommitWindow.cfg violation:NoFalseRefusal
@@ -99,30 +100,19 @@ run CycleLock.tla CycleLock_Diamond.cfg ok
 run CycleLock.tla CycleLock_DiamondTwoSessions.cfg violation:BuildOnce
 run CycleLock.tla CycleLock_DiamondTwoSessionsFix.cfg ok
 run CycleLock.tla CycleLock_CycleSerial.cfg ok
-run CycleLock.tla CycleLock_CycleParallel.cfg deadlock
-run ParallelEnsure.tla ParallelEnsure_Diamond.cfg ok
-run ParallelEnsure.tla ParallelEnsure_DiamondJ1.cfg ok
-run ParallelEnsure.tla ParallelEnsure_Wide.cfg ok
-run ParallelEnsure.tla ParallelEnsure_Cycle.cfg ok
-run ParallelEnsure.tla ParallelEnsure_Coverage.cfg violation:NeverTwoBuilding
-run Speculation.tla Speculation_Diamond.cfg ok
-run Speculation.tla Speculation_Stale.cfg ok
-run Speculation.tla Speculation_StaleCycle.cfg ok
-run Speculation.tla Speculation_TrueCycle.cfg ok
-run Speculation.tla Speculation_Coverage.cfg violation:NeverVerifiedOverRebuild
-# Documented gap in the single-claim design: a reversed dependency edge
-# makes BWait hard-fail through a speculative cedge. Must keep failing
-# until nobody implements this design (SpeculationMP is the replacement).
-run Speculation.tla Speculation_Reversed.cfg violation:NoFailure
 
-# The corrected multi-process machine (per-process registries, kernel
-# locks, drain — with typed edges, creation edges, and soft eviction).
-# This is the design the implementation must be rebuilt to match.
+# The multi-process ensure machine the code implements (per-process
+# registries, kernel locks, drain -- with typed edges, creation edges, soft
+# eviction), with content-hash pruning (VerifiedSoundly on every config).
 run SpeculationMP.tla SpeculationMP_Reversed.cfg ok
 run SpeculationMP.tla SpeculationMP_CrossStale.cfg ok
 run SpeculationMP.tla SpeculationMP_TrueCycle.cfg ok
 run SpeculationMP.tla SpeculationMP_Stale.cfg ok
+run SpeculationMP.tla SpeculationMP_StaleCycle.cfg ok
+run SpeculationMP.tla SpeculationMP_Content.cfg ok
+run SpeculationMP.tla SpeculationMP_Coverage.cfg violation:NeverVerifiedOverRebuild
 run SpeculationMP.tla SpeculationMP_SpecAbort.cfg ok
+run SpeculationMP.tla SpeculationMP_EvictForeign.cfg ok
 # R6: hand-edited targets prompt only on demanded lineages; elsewhere the
 # lineage aborts (sfail) so an upgrade can never report an unasked refusal.
 run SpeculationMP.tla SpeculationMP_HandEditSpec.cfg ok
@@ -138,25 +128,14 @@ run SpeculationMP.tla SpeculationMP_HandEditLinKeep.cfg ok
 run ShallowRecheck.tla ShallowRecheck_Shallow.cfg violation:NoStaleRun
 run ShallowRecheck.tla ShallowRecheck_ShallowSpec.cfg violation:NoStaleRun
 run ShallowRecheck.tla ShallowRecheck_Settled.cfg ok
-run ShallowRecheck.tla ShallowRecheck_SettledMain.cfg ok
 run ShallowRecheck.tla ShallowRecheck_SettledChain.cfg ok
 run ShallowRecheck.tla ShallowRecheck_SettledRedundant.cfg violation:NoRedundantBuild
 run ShallowRecheck.tla ShallowRecheck_Coverage.cfg violation:NeverSkipAtRecheck
-run ShallowRecheck.tla ShallowRecheck_None.cfg violation:NoRedundantBuild
 run ShallowRecheck.tla ShallowRecheck_Await.cfg ok
 run ShallowRecheck.tla ShallowRecheck_AwaitChain.cfg ok
 # Three concurrent runs: about 10 minutes, so opt-in.
 if [ -n "${REDO_TLC_LONG:-}" ]; then
     run ShallowRecheck.tla ShallowRecheck_Settled3.cfg ok
 fi
-
-# The lock-wait edge graph of main's WaitEdge, superseded in the code by
-# SpeculationMP's shared waits graph (src/waits.rs); kept as the record of
-# the cross-session cycle and stale-edge findings.
-run WaitGraph.tla WaitGraph_StaleEdge.cfg violation:NoFalseCycle
-run WaitGraph.tla WaitGraph_StaleEdgeGc.cfg ok
-run WaitGraph.tla WaitGraph_LiveCross.cfg ok
-run WaitGraph.tla WaitGraph_TrueCycle.cfg ok
-run WaitGraph.tla WaitGraph_Coverage.cfg violation:NeverFails
 
 exit "$FAILED"

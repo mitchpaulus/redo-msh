@@ -10,18 +10,18 @@ establish, with the reason each one is out of reach.
 ## Running
 
 ```
-./run.sh
+sh run.sh
 ```
 
 Requires Java 11+ and `tla2tools.jar` at `~/.local/share/java/tla2tools.jar`
 (override with `TLA_TOOLS_JAR`). TLC logs go to `/tmp/redo-msh-tlc/`; each
 run passes `-cleanup`, so TLC deletes its (sometimes multi-gigabyte) state
-files when the run ends. The suite is 77 checks and takes about
-15 minutes, most of it `SharedPaths_Fixed3`
-(53,352,011 distinct states); every other check takes seconds
-to a minute or two. `REDO_TLC_LONG=1 ./run.sh` adds
-`ShallowRecheck_Settled3` (three concurrent runs, 52,602,234 distinct
-states, about 10 more minutes).
+files when the run ends. The suite is 62 checks and takes about
+15–20 minutes, most of it `SharedPaths_Fixed3` (53,352,011 distinct states)
+and `SpeculationMP_EvictForeign` (250,483 states, 3–5 minutes); every other
+check takes seconds to a minute. `REDO_TLC_LONG=1 sh run.sh` adds
+`ShallowRecheck_Settled3` (three concurrent runs, 57,723,666 distinct
+states, 10–15 more minutes).
 
 Each spec is a `.tla` module plus `.cfg` model configurations. Most
 configurations must pass. The others document a **known gap in today's
@@ -42,7 +42,7 @@ where a deterministic test is possible.
 
 | Config | What went wrong | Evidence | Fix in the code | Test |
 |---|---|---|---|---|
-| `CycleLock_CycleParallel` | two traversals entering a cycle from different sides deadlock instead of erroring | TLC, ✔ repro | a do-file's demands enter the shared waits-for graph, cycle-checked on insert, before any lock wait (`waits::try_demand`, SpeculationMP R1–R3) | `concurrent_cycle_errors_instead_of_deadlocking` |
+| `CycleLock_CycleParallel` (retired config, see git history); the fix: `SpeculationMP_TrueCycle` | two traversals entering a cycle from different sides deadlock instead of erroring | TLC, ✔ repro | a do-file's demands enter the shared waits-for graph, cycle-checked on insert, before any lock wait (`waits::try_demand`, SpeculationMP R1–R3) | `concurrent_cycle_errors_instead_of_deadlocking` |
 | `CycleLock_DiamondTwoSessions`, `LockSession_TwoSessions` | two concurrent `redo` runs both build a shared out-of-date dep | TLC, ✔ repro | shallow out-of-date re-check under the lock (`is_ood_shallow`) | `concurrent_runs_build_shared_dependency_once` |
 | `ShallowRecheck_Shallow`, `_ShallowSpec` | that shallow re-check, after the run waiting on the lock decided to rebuild before checking a buildable dep: another run built the target over that dep, the dep's source then changed, and the waiting run skips the target and ends "up to date" with it built from a stale dep (**silent staleness**, on `main` too) | TLC, ✔ repro | skip only if every buildable dep has settled in this session (`is_ood_shallow`) | `waiting_run_does_not_skip_over_an_unchecked_dep` |
 | `LockSession_CommitWindow` | crash/failed commit between the output rename and the commit transaction ⇒ every later build refuses redo's own output as "modified outside redo" | TLC, ✔ repro | pending hash recorded before the rename; guard accepts and adopts it (`record_pending`, `Verdict::Pending`, `adopt_pending`) | `crash_between_install_and_commit_is_recovered` |
@@ -52,12 +52,13 @@ where a deterministic test is possible.
 | `SharedPaths_TmpGc` | `gc_logs` deletes a live build's log temp before its rename ⇒ build fails | TLC | log temps swept only under the target's lock (`gc_logs`) | (a few-syscall window) |
 | `SharedPaths_LogRace`, `_LogGc`, `_Foreign` | a lagging follower deletes or tails a log another run replaced ⇒ false "(crashed)", "(log missing)", a run waiting on another run's build | TLC, ✔ repro | session-scoped target logs `t.<key>.<session>.log` (`target_log_path`) | `concurrent_runs_build_shared_dependency_once` |
 | `SharedPaths_RunLockRace` | a GC unlinks another run's `run.<s>.lock` between its creation and its lock; a third run's GC then deletes the live run trace ⇒ that run **hangs** at exit | TLC | the run lock is re-checked after locking (`acquire_run_lock`); runs are swept under their own lock (`gc_logs`) | (a create-to-lock window) |
-| `TokenPool_PromptDeadlock` | two answered overwrite prompts in a nested `-j2` build: the second spins forever on the token pool | TLC | a prompting job keeps its token (`prompt_overwrite`) | (needs a terminal) |
-| `TokenPoolPromptLock` (`release` mode) | the same release-and-spin prompt deadlocks at `-j2` when other jobs block on the prompter's target lock | TLC | the same fix | (needs a terminal) |
+| `TokenPool_PromptDeadlock` | two answered overwrite prompts in a nested `-j2` build: the second spins forever on the token pool | TLC | a prompting job keeps its token (`prompt_overwrite`); verified by `TokenPool_PromptHold`, `_PromptHoldJ3` | (needs a terminal) |
+| `TokenPool_PromptReleaseLock` (formerly `TokenPoolPromptLock`, `release` mode) | the same release-and-spin prompt deadlocks at `-j2` when other jobs block on the prompter's target lock | TLC | the same fix | (needs a terminal) |
 | `TokenPool_UnderUtilization` | `run_parallel` sleeps with launchable work while a pool token is free elsewhere (throughput) | TLC | a build waiting for a token re-polls the pool every 50 ms (`acquire_token` in `src/parallel.rs`) | (throughput only) |
-| `WaitGraph_StaleEdge` | a crashed run's wait edges plus changed do-files produce a false cycle error | TLC | edges carry their owner process, tied to a kernel liveness lock; dead owners' edges are swept (`waits::gc_dead_edges`, `gc_sweep`) | (needs a crash mid-wait) |
-| `Speculation_Reversed`, `SpeculationMP_CrossStale` | a dependency reversed between runs fabricates a cycle error; crossed stale recorded deps across two parallel branches deadlock an acyclic project | TLC, ✔ repro | typed edges, creation edges, soft eviction, quarantine (SpeculationMP R1–R5; `src/waits.rs`, `src/parallel.rs`) | `crossed_stale_deps_neither_hang_nor_error`, `speculative_build_of_ancestor_dependent_aborts_quarantined` |
+| `WaitGraph_StaleEdge` (retired spec, see git history; no current spec models crashes in the waits graph) | a crashed run's wait edges plus changed do-files produce a false cycle error | TLC | edges carry their owner process, tied to a kernel liveness lock; dead owners' edges are swept (`waits::gc_dead_edges`, `gc_sweep`) | (needs a crash mid-wait) |
+| `Speculation_Reversed` (retired spec, see git history), `SpeculationMP_CrossStale`; the fix: `SpeculationMP_Reversed`, `SpeculationMP_CrossStale` | a dependency reversed between runs fabricates a cycle error; crossed stale recorded deps across two parallel branches deadlock an acyclic project | TLC, ✔ repro | typed edges, creation edges, soft eviction, quarantine (SpeculationMP R1–R5; `src/waits.rs`, `src/parallel.rs`) | `crossed_stale_deps_neither_hang_nor_error`, `speculative_build_of_ancestor_dependent_aborts_quarantined` |
 | `SpeculationMP_HandEdit*` | a speculative build interrupts the human about a hand-edited target nobody demanded, or reports a refusal nobody was asked | TLC | only fully demanded lineages ask; elsewhere the lineage aborts (R6, `abort_unless_lineage_demanded`) | `hand_edit_under_speculation_aborts_instead_of_asking` |
+| `SpeculationMP_EvictForeign` | evicting a creation edge whose speculative instance was only queued on a lock deleted *every* owner's edges for that target — including the lock holder's hard demands, which are inserted once and never re-inserted — so a later wait could close a cycle unseen: a deadlock on an acyclic project. The spec hid it (its `BDemand` re-inserted any missing edge); found once demands became insert-once (`dsent`) | TLC | an aborted instance drops only its own owner's edges (`waits::drop_aborted_instance`); its do-file's child processes clear theirs as they unwind | `evicting_creation_edge_keeps_foreign_builders_demands` (unit) |
 
 ## Accepted limitations
 
@@ -77,49 +78,68 @@ Out of scope by decision. No spec checks these, and no fix is planned:
 
 ## The specs
 
-### TokenPool.tla — the jobserver token protocol
+### TokenPool.tla — the jobserver token protocol and the overwrite prompt
 
-Models `src/jobserver.rs`, the scheduler and `prompt_overwrite` over a job
-**tree of arbitrary depth** (`FanOut[k]` children per job at depth k−1; each
-non-leaf job's do-file blocks in `redo-ifchange` while a child process runs
-its children). J total tokens: one implicit own token per process, a shared
-pool of J−1, non-blocking try-acquire, own token first. `Lazy` is the former
-`run_parallel` (a process that finds the pool empty sleeps until one of
-*its own* jobs completes); without it, the eager scheduler the contract
-requires, which `src/parallel.rs` implements. `PromptMode`: `"pool"` (the
-former code: release a token to the pool, spin on pool try-acquire), `"hold"` (keep the token), `"source"` (give the token
-back where it came from, resume on the process's own token if free, else a
-pool token).
+Models `src/jobserver.rs`, the scheduler in `src/parallel.rs` and
+`prompt_overwrite` over a job **tree of arbitrary depth** (`FanOut[k]`
+children per job at depth k−1; each non-leaf job's do-file blocks in
+`redo-ifchange` while a child process runs its children). J total tokens:
+one implicit own token per process, a shared pool of J−1, non-blocking
+try-acquire, own token first. `Lazy` is the former `run_parallel` (a process
+that finds the pool empty sleeps until one of *its own* jobs completes);
+without it, the eager scheduler the contract requires, which
+`src/parallel.rs` implements.
+
+The overwrite prompt (`Prompts`) can happen at any depth — nested `redo`
+processes really prompt (since commit 72b6a48) — and it is asked with the
+target's kernel lock already held. With `LockWaits`, a launched job that
+needs the prompter's target blocks on that lock **holding its token**
+(`build()` blocks outright) until the prompter's build is over; the
+double-checked runid skip then finishes it without building. `PromptMode`:
+`"pool"` (the code before 2026-09-03: release one token to the *pool*,
+whatever its source — `Jobserver::release` does not know — then spin on pool
+try-acquire), `"hold"` (keep the token: the code), `"source"` (give the
+token back where it came from, resume on the process's own token if free,
+else a pool token).
 
 | Config | Scenario | Result |
 |---|---|---|
-| `TokenPool_D2J2` / `_D2J3` | today's scheduler, depth 2 (2×2, J=2; 3×2, J=3) | ✅ (249 / 4,692 states) |
-| `TokenPool_D3J2` / `_D3J3` | today's scheduler, depth 3 (1×2×2: a branching process at every nested level) | ✅ (254 / 412 states) |
+| `TokenPool_D2J2` / `_D2J3` | lazy scheduler, depth 2 (2×2, J=2; 3×2, J=3) | ✅ (249 / 4,692 states) |
+| `TokenPool_D3J2` / `_D3J3` | lazy scheduler, depth 3 (1×2×2: a branching process at every nested level) | ✅ (254 / 412 states) |
 | `TokenPool_DepthCoverage` | depth 3, J=3 | ⚠️ `NeverTwoDeepExecuting` violated (predicted): nested jobs really run in parallel |
-| `TokenPool_Eager` | eager scheduler, depth 3 | ✅ incl. `WorkConserving` |
-| `TokenPool_UnderUtilization` | today's scheduler | ⚠️ `WorkConserving` violated (predicted) |
-| `TokenPool_PromptDeadlock` | today's prompt path, today's scheduler | ⚠️ **DEADLOCK** (predicted) |
-| `TokenPool_PromptHold` | prompt keeps its token, depth 3 | ✅ |
-| `TokenPool_PromptSource` / `_PromptSourceJ3` | prompt returns its token to its source | ✅ (50,233 states at J=3) |
+| `TokenPool_Eager` | eager scheduler, depth 3 | ✅ incl. `WorkConserving` (192 states) |
+| `TokenPool_UnderUtilization` | lazy scheduler | ⚠️ `WorkConserving` violated (predicted) |
+| `TokenPool_PromptDeadlock` | `"pool"` prompt, lazy scheduler, nested prompts | ⚠️ **DEADLOCK** (predicted) |
+| `TokenPool_PromptReleaseLock` | `"pool"` prompt, eager, one process with three jobs (no nesting, so not the mechanism above), lock waiters | ⚠️ **DEADLOCK** (predicted, 7 states): the released token and the other pool token go to jobs that then block on the prompter's lock; the answered prompter spins forever |
+| `TokenPool_PromptHold` | **the code**: `"hold"`, eager, prompts at every depth, lock waiters; depth 3, J=2 | ✅ (599 states) |
+| `TokenPool_PromptHoldJ3` | the same, depth 2 with three top jobs, J=3 (two questions open at once) | ✅ (42,177 states) |
+| `TokenPool_PromptSourceLock` | `"source"`, eager, nested prompts, lock waiters; depth 2, J=2 | ⚠️ **DEADLOCK** (predicted, 10 states): a top job prompts and returns its own token; a sibling takes it, and its child process's two jobs block on the prompter's lock holding the child's own token and the pool token; the answered prompter finds neither the top-level own token nor a pool token free |
+| `TokenPool_PromptSource` / `_PromptSourceJ3` | `"source"`, lazy scheduler, no lock waiters | ✅ (1,139 / 50,233 states): without lock waiters, giving the token back does fix the nested-prompt deadlock |
+
+So only `"hold"` survives lock waiters; both other modes deadlock exactly
+there, the way TokenPoolPromptLock.tla (now merged into this spec) first
+showed for `"pool"`.
 
 Properties: **TokenConservation** (pool tokens never lost or duplicated;
 a "pool"-mode prompt accounts for its extra release), **OwnConsistent** /
 **OwnUnique** (a process's own token is free iff unheld, and held by at most
-one job), **TokenHeld** (every launched, unfinished job holds a token, except
-a "source"-mode prompt), **ChildrenOnlyWhileWaiting** (a child process's jobs
-are live only while their parent job is blocked), **Bound** (at most J jobs
-execute), **ExactBound** (executing jobs + free pool tokens ≤ J),
-**SemaphoreMax** (the pool never exceeds J — on Windows a semaphore with
-maximum count J, where an over-release fails silently), **Termination**.
-All hold on every passing configuration; `TokenPool_PromptDeadlock` holds
-every safety property up to its deadlock.
+one job), **TokenHeld** (every launched, unfinished job holds a token —
+including a lock waiter — except a "source"-mode prompt),
+**ChildrenOnlyWhileWaiting** (a child process's jobs are live only while
+their parent job is blocked), **Bound** (at most J jobs execute),
+**ExactBound** (executing jobs + free pool tokens ≤ J), **SemaphoreMax**
+(the pool never exceeds J — on Windows a semaphore with maximum count J,
+where an over-release fails silently), **WorkConserving** (eager configs),
+**Termination**. All hold on every passing configuration;
+`TokenPool_PromptDeadlock` holds every safety property up to its deadlock.
 
 **ExactBound for every depth.** TLC checks depths 2 and 3; the following
 argument extends the result to any tree using only the lemmas above, each of
 which relates one process to its parent job and the pool (so depth 3
 already exercises every step shape). Call a job *anchored* if it is
 executing, or waiting at a prompt in `"pool"`/`"hold"` mode. By TokenHeld
-every anchored job holds a token. Map each anchored job to a *slot*: follow
+every anchored job holds a token (a lock waiter holds one too, but is not
+anchored, so it only loosens the count). Map each anchored job to a *slot*: follow
 its token — if it is a pool token, stop; if it is the top-level process's
 own token, stop; otherwise it is the own token of a child process p, whose
 parent job (by ChildrenOnlyWhileWaiting) is `waiting` and, by TokenHeld,
@@ -131,30 +151,6 @@ different own-token holders of q's child process, contradicting OwnUnique
 `#anchored ≤ PoolHeld + 1`. TokenConservation gives
 `PoolHeld = J − 1 − pool + (pool-mode prompts)`, and anchored jobs include
 every pool-mode prompt, so `#executing + pool ≤ J`. ∎
-
-### TokenPoolPromptLock.tla — the overwrite prompt under lock contention
-
-The same token protocol, two levels deep (`NTop` top jobs, `NSub` sub jobs
-each), with what TokenPool leaves out: the overwrite prompt
-(`prompt_overwrite` in `src/build.rs`) runs with the target's kernel lock
-already held, so other jobs that need that target block on the lock
-(holding their tokens) until the prompter's build commits. Three modes:
-
-| Config | `PromptMode` | Result |
-|---|---|---|
-| `TokenPoolPromptLock_J2`, `_J3` | `none` | ✅ the original model (regression) |
-| (`release`, not in `run.sh`) | `release` — what `prompt_overwrite` did before 2026-09-03: release one token to the pool, spin on the pool to get one back | ❌ **deadlock** (10 steps at J=2): the released token is taken by a job that then blocks on the prompter's lock; every other token ends up there too; the prompter's spin never sees a free token. Kept in the spec as the record of why the code holds its token. |
-| `TokenPoolPromptLock_PromptHold` | `hold` — the prompter keeps its token while the human thinks | ✅ conservation, `Bound`, `Termination` (J=2, NTop=3, NSub=2; 73,564 states) |
-
-Two smaller facts the release model also pins down: `Jobserver::release`
-always writes to the *pool*, even when the worker runs on the process's own
-token, so the pool transiently holds J tokens (`TypeOK` is widened for that
-mode); and the reacquired token is then run under the `own` label, which
-`FinishTop` frees as an own token — numerically a wash, so
-`TokenConservation` (stated with the loan term `LentOwn`) still holds. The
-deadlock, not the bookkeeping, is the reason to switch to `hold`. Both
-models reach the same fix from different deadlocks: TokenPool's from two
-nested prompts (`TokenPool_PromptDeadlock`), this one's from lock waiters.
 
 ### LockSession.tla — the per-target build protocol, across sessions
 
@@ -265,7 +261,10 @@ selects today's double-check or the fix.
 | `CycleLock_DiamondTwoSessions` | the same race between two `redo` invocations | ⚠️ `BuildOnce` violated (predicted) |
 | `CycleLock_DiamondTwoSessionsFix` | ditto, `RecheckFresh` | ✅ |
 | `CycleLock_CycleSerial` | 1 worker, cycle `a↔b` | ✅ clean error, no deadlock |
-| `CycleLock_CycleParallel` | 2 workers entering `a↔b` from different sides | ⚠️ **DEADLOCK** (predicted; see below). Same with two sessions. |
+
+`CycleLock_CycleParallel` (2 workers entering `a↔b` from different sides:
+**deadlock**, the same with two sessions) is retired; see "Gap found" below
+and git history.
 
 ### ShallowRecheck.tla — the double-check under the lock, with content
 
@@ -280,8 +279,11 @@ propagates and `TrueUTD` is the ground truth. Sessions start at any time and
 sources are edited at any time. Each session has a task registry (one task
 per target). The unlocked checker reads evidence in any order, stops at the
 first out-of-date sign, and may start dependency tasks at any point, which
-covers main's in-order `is_ood`; with `SpawnFirst` it starts every recorded
-buildable dep first, as this branch's checker does. Then lock, the
+covers main's in-order `is_ood` and the code's `check_recorded` (which reads
+the target's own evidence before starting dep tasks). `SpawnFirst` forces
+every recorded buildable dep to start before any evidence is read — stricter
+than the code, and its behaviors are a subset of the default's, so the
+merged-code configs that must pass use `SpawnFirst = FALSE`. Then lock, the
 re-check, and the do-file walk (each dep demanded, settled, read; commit).
 
 `Recheck` picks the double-check: `"none"` (this session's runid only; this
@@ -293,19 +295,26 @@ buildable dep to settle in this session, then compare; not implemented).
 | Config | Scenario | Result |
 |---|---|---|
 | `ShallowRecheck_Shallow` | main's re-check, main's checker | ⚠️ `NoStaleRun` violated (predicted): the reproduced trace, step for step |
-| `ShallowRecheck_ShallowSpec` | main's re-check, this branch's checker | ⚠️ `NoStaleRun` violated (predicted): starting the dep task does not help; nothing waits for it |
-| `ShallowRecheck_Settled` | the merged code, 3 edits | ✅ `NoStaleRun`, `Termination` (537,715 states) |
-| `ShallowRecheck_SettledMain` | the merged condition under main's checker | ✅ (134,925 states) |
-| `ShallowRecheck_SettledChain` | `T ← D ← E ← es`: staleness two levels down | ✅ (727,375 states) |
-| `ShallowRecheck_Settled3` | three concurrent runs (opt-in, `REDO_TLC_LONG`) | ✅ `NoStaleRun` (52,602,234 states) |
+| `ShallowRecheck_ShallowSpec` | main's re-check, a checker that starts every dep task first | ⚠️ `NoStaleRun` violated (predicted): starting the dep task does not help; nothing waits for it |
+| `ShallowRecheck_Settled` | the merged code, any checker order (`SpawnFirst = FALSE`), 3 edits | ✅ `NoStaleRun`, `Termination` (581,767 states) |
+| `ShallowRecheck_SettledChain` | `T ← D ← E ← es`: staleness two levels down, any checker order | ✅ (759,463 states) |
+| `ShallowRecheck_Settled3` | three concurrent runs, any checker order (opt-in, `REDO_TLC_LONG`) | ✅ `NoStaleRun` (57,723,666 states; was 52,602,234 with `SpawnFirst`) |
 | `ShallowRecheck_SettledRedundant` | the merged code | ⚠️ `NoRedundantBuild` violated (predicted): the cost, below |
 | `ShallowRecheck_Coverage` | the merged code | ⚠️ `NeverSkipAtRecheck` violated (predicted): it still skips on content, so main's benefit is kept |
-| `ShallowRecheck_None` | no content re-check | ⚠️ `NoRedundantBuild` violated (predicted): `LockSession_TwoSessions` again, with content; never stale |
-| `ShallowRecheck_Await` / `_AwaitChain` | the alternative | ✅ `NoStaleRun`, `NoRedundantBuild`, `Termination` |
+| `ShallowRecheck_Await` / `_AwaitChain` | the alternative | ✅ `NoStaleRun`, `NoRedundantBuild`, `Termination` (372,225 / 408,427 states) |
+
+(`Recheck = "none"`, this branch before the merge, is still in the spec;
+its config was dropped as a duplicate of `LockSession_TwoSessions`, and
+`ShallowRecheck_SettledMain`, main's in-order checker under the merged
+condition with 2 edits, as subsumed by `ShallowRecheck_Settled` now that
+it allows any checker order with 3.)
 
 Properties: **NoStaleRun** (a run during which no source was edited ends
 with every target it settled truly up to date; edits *during* a run may be
-missed by any build system, so they are excluded), **NoRedundantBuild** (a
+missed by any build system, so they are excluded — checked both on the
+final runid column and, through the history flag `staleBy`, at every settle
+step the run made before any edit, because another run's later mark can
+overwrite runid and hide a stale settle), **NoRedundantBuild** (a
 build starts only on a target that is truly out of date at that moment),
 **NeverSkipAtRecheck** (coverage), **Termination**.
 
@@ -321,68 +330,13 @@ means an in-process wait under a held target lock, which must enter the
 waits-for graph as a demand edge first (SpeculationMP R1); the model has
 an acyclic graph and no waits graph, so it does not establish that part.
 
-### ParallelEnsure.tla — the PROPOSED aggressive parallel traversal
+### SpeculationMP.tla — the multi-process ensure machine (the code)
 
-`ensure(t)` fans out over **all** of t's recorded deps at once; checking is
-unbounded, building is bounded by J tokens; a target settles only after
-every dep settles. Cycles are handled by the **waits-for graph**: before t
-waits on d, one atomic action checks whether t is reachable from d through
-live wait edges and fails t if so. Do-file failure is nondeterministic and
-propagates up the wait edges.
-
-| Config | Scenario | Result |
-|---|---|---|
-| `ParallelEnsure_Diamond` | diamond, J=2, builds may fail | ✅ |
-| `ParallelEnsure_DiamondJ1` | same, J=1 | ✅ |
-| `ParallelEnsure_Wide` | `a→{b,c,d}→e`, J=2 | ✅ |
-| `ParallelEnsure_Cycle` | `a↔b` from both sides | ✅ clean cycle error on every interleaving |
-| `ParallelEnsure_Coverage` | wide graph, J=3 | ⚠️ `NeverTwoBuilding` violated (predicted) |
-
-Properties: `BuildOnce`, `TokenBound`, `DepsSettledFirst`,
-`EventuallyQuiescent`, `Settles`, `CycleErrorsOut`. Its verify-vs-build
-verdict is unconstrained (sound for these properties, which hold for every
-verdict); staleness is checked in Speculation.
-
-### Speculation.tla — stale recorded deps vs. actual deps
-
-The authoritative model of the design: **recorded** deps drive the
-speculative fan-out; **actual** deps are what the running do-file declares,
-including mid-build discoveries and an empty database. Out-of-date
-evaluation has `is_ood`'s two parts: the target's **own inputs** are clean
-(restricted to targets whose recorded deps equal their actual deps — the
-determinism assumption made explicit) and **no recorded dep was rebuilt with
-different content** (each commit chooses nondeterministically whether its
-content changed, so content-hash pruning is explored). **Speculative
-failures are soft** (a stale recorded cycle self-heals), **actual failures
-are hard** (a real cycle errors out, never deadlocks).
-
-| Config | Scenario | Result |
-|---|---|---|
-| `Speculation_Diamond` | recorded = actual, all clean/dirty subsets, changed/unchanged rebuilds, failures | ✅ (9,955 states) |
-| `Speculation_Stale` | dropped, kept and mid-build-discovered deps | ✅ |
-| `Speculation_StaleCycle` | database records a cycle; do-files fixed | ✅ `AllDone` |
-| `Speculation_TrueCycle` | empty database; do-files cyclic | ✅ `AllFail` |
-| `Speculation_Coverage` | diamond | ⚠️ `NeverVerifiedOverRebuild` violated (predicted): pruning is reachable |
-| `Speculation_Reversed` | one edge REVERSED between runs (recorded a→b, actual b→a) | ❌ **kept failing on purpose** |
-
-Properties: `BuildOnce`, `TokenBound`, `ActualDepsFirst`, `VerifiedSoundly`
-(a verified target is clean, every recorded dep settled ok, none changed
-content), `EventuallyQuiescent`, `Settles`.
-
-**The severity rule is refuted by `Speculation_Reversed`.** The configs
-above never contained a dependency whose *direction* flips between runs — a
-routine refactor. Given that shape, `BWait`'s cycle check (which cannot
-tell hard edges from speculative `cedges`) hard-fails `b`'s real build
-through `a`'s speculative edge in 4 states, violating `NoFailure` on an
-acyclic project. "Stale edges can waste work but never invent an error" is
-therefore FALSE for this design. The config is kept failing, like
-`CycleLock_CycleParallel`, to document the hole; the corrected rules are
-specified and verified in `SpeculationMP.tla` below.
-
-### SpeculationMP.tla — the corrected multi-process machine (BUILD THIS)
-
-Speculation.tla also models one **global** claim per target; the shipped
-implementation had one claim per target **per process**, and its two
+The aggressive parallel traversal: **recorded** deps drive a speculative
+fan-out, **actual** deps are what the running do-file declares (including
+mid-build discoveries and an empty database). The retired Speculation.tla
+modeled one **global** claim per target; the shipped first implementation
+had one claim per target **per process**, and its two
 unmodeled waits — a second instance of an in-flight target blocking on the
 per-target kernel lock, and `redo-ifchange` draining every task in its
 process before returning — composed into a reproducible deadlock on an
@@ -415,16 +369,20 @@ kernel build locks, drain-before-return — under corrected rules:
   (creation edge superseded by the demand edge), making it un-abortable.
 - **R5 — drain cancellation.** A draining process may ABANDON any of its
   still-speculative instances instead of waiting for them, in any state
-  including mid-build (the implementation kills the do-file — crash-safe
-  by the LockSession argument: Uncommitted marker, kernel-released locks,
-  temp GC). Abandonment settles `sfail` like any other speculative
+  including mid-build (the implementation kills the do-file's whole
+  process tree — crash-safe by the LockSession argument: Uncommitted
+  marker, kernel-released locks, temp GC; see "Killing a do-file's tree"
+  below). Abandonment settles `sfail` like any other speculative
   outcome. This bounds ifchange return latency: undemanded speculation
   cannot hold the caller hostage (measured: a stale 5s dep no longer
   delays an unrelated 0.07s rebuild). The implementation additionally
   keeps speculation off the process's OWN jobserver token unless a
-  checker is actually waiting on its result — surplus parallelism only —
-  so speculation can never capture the last token ahead of demanded
-  work.
+  checker on a demanded path (its own task demanded, or itself waited on
+  by such a checker) is waiting on its result — surplus parallelism only —
+  so speculation can never capture the own token ahead of demanded work.
+  A purely speculative checker never promotes its deps (it used to: a
+  chain of speculation could take the own token first). This gate is not
+  modeled; TokenPool gives the own token first to any job.
 - **R6 — hand-edited targets.** The overwrite guard runs after the kernel
   lock is won, before the do-file. A target in `HandEdited` is only ever
   *asked about* (`prompt` state, lock held; `yes` → build, `no` → hard
@@ -443,47 +401,90 @@ kernel build locks, drain-before-return — under corrected rules:
   nondeterministic (`PromptAnswers`); the session-wide `all`/`quit`
   answers are refinements of that.
 
+**Content.** Out-of-date evaluation has `is_ood`'s two parts: the target's
+**own inputs** are clean (`clean`, a nondeterministic subset of `Cleanable`
+fixed at Init), and **no recorded dep was rebuilt with different content**:
+each commit chooses nondeterministically whether its content changed, so
+content-hash pruning — a parent verifying over a dep rebuilt with identical
+bytes — is explored, and a checker that sees a changed dep takes the
+rebuild path. Unlike the retired Speculation.tla, `clean` is not restricted
+to targets whose recorded deps equal their actual deps, so the model also
+explores clean targets with stale dep lists, which deterministic do-files
+never produce (an over-approximation).
+
 | Config | Scenario | Result |
 |---|---|---|
-| `SpeculationMP_CrossStale` | the reproduced implementation deadlock shape (crossed stale deps, acyclic reality) | ✅ no deadlock, `NoFailure`, all roots done |
-| `SpeculationMP_Reversed` | the `Speculation_Reversed` shape that refutes the old design | ✅ `NoFailure`, all roots done |
-| `SpeculationMP_TrueCycle` | genuinely cyclic do-files, empty database | ✅ `AllRootsFail` — clean error, never a hang |
-| `SpeculationMP_Stale` | dropped/kept/discovered deps on the multi-process machine | ✅ |
-| `SpeculationMP_SpecAbort` | a mid-do-file speculative build must abort retryably when its demand cycles into its spawning subtree | ✅ (`sfail` reachable via `brun`, verified by trace) |
-| `SpeculationMP_HandEditSpec` | the SpecAbort shape with `s` hand-edited: only ever built speculatively | ✅ `NeverPrompted`, `NoFailure`, root done |
-| `SpeculationMP_HandEditYes` | `c` (recorded+actual dep) and `d` (discovered) hand-edited, answers `yes` | ✅ root done, `PromptOnlyDemanded` |
-| `SpeculationMP_HandEditNo` | same, answers `no` | ✅ `AllRootsFail` — the refusal is a reported hard failure |
-| `SpeculationMP_HandEditLinDrop` | stale `a → b` builds `b` speculatively; `b`'s do-file demands hand-edited `x`; `a` no longer needs `b` | ✅ `NeverPrompted` — the lineage aborts, `a` rebuilds via `c` |
-| `SpeculationMP_HandEditLinKeep` | same, but `a` still needs `b`: the lineage is upgraded before or after the abort | ✅ `x` is asked about exactly on the demanded path, root done |
+| `SpeculationMP_CrossStale` | the reproduced implementation deadlock shape (crossed stale deps, acyclic reality) | ✅ no deadlock, `NoFailure`, all roots done (8,659 states) |
+| `SpeculationMP_Reversed` | the `Speculation_Reversed` shape that refuted the old design | ✅ `NoFailure`, all roots done (490 states) |
+| `SpeculationMP_TrueCycle` | genuinely cyclic do-files, empty database | ✅ `AllRootsFail` — clean error, never a hang (86 states) |
+| `SpeculationMP_Stale` | dropped/kept/discovered deps on the multi-process machine | ✅ (21,491 states) |
+| `SpeculationMP_StaleCycle` | the database records a cycle `a ↔ b` the do-files no longer have | ✅ `NoFailure`, both roots done — the stale cycle self-heals (353 states) |
+| `SpeculationMP_Content` | recorded = actual chain `a → b → c`, every subset clean, changed/identical rebuilds, do-files may fail | ✅ `VerifiedSoundly`, `EventuallyQuiescent` (104,996 states) |
+| `SpeculationMP_Coverage` | the same chain | ⚠️ `NeverVerifiedOverRebuild` violated (predicted): pruning is reachable, so `VerifiedSoundly`'s dep clause is not vacuous |
+| `SpeculationMP_SpecAbort` | a mid-do-file speculative build must abort retryably when its demand cycles into its spawning subtree | ✅ (`sfail` reachable via `brun`, verified by trace; 104 states) |
+| `SpeculationMP_EvictForeign` | evicting a creation edge aborts a speculative instance that was only *waiting* on a lock another process's build holds: the abort must drop that instance's edges only, not the lock holder's demand edges | ✅ (250,483 states, about 5 minutes); with the former `DropWaitsBoth`, `DemandEdgesPresent` is violated and the acyclic project deadlocks |
+| `SpeculationMP_HandEditSpec` | the SpecAbort shape with `s` hand-edited: only ever built speculatively | ✅ `NeverPrompted`, `NoFailure`, root done (84 states) |
+| `SpeculationMP_HandEditYes` | `c` (recorded+actual dep) and `d` (discovered) hand-edited, answers `yes` | ✅ root done, `PromptOnlyDemanded` (13,274 states) |
+| `SpeculationMP_HandEditNo` | same, answers `no` | ✅ `AllRootsFail` — the refusal is a reported hard failure (5,070 states) |
+| `SpeculationMP_HandEditLinDrop` | stale `a → b` builds `b` speculatively; `b`'s do-file demands hand-edited `x`; `a` no longer needs `b` | ✅ `NeverPrompted` — the lineage aborts, `a` rebuilds via `c` (190 states) |
+| `SpeculationMP_HandEditLinKeep` | same, but `a` still needs `b`: the lineage is upgraded before or after the abort | ✅ `x` is asked about exactly on the demanded path, root done (308 states) |
 
-Invariants on all acyclic configs: `NoFailure`, `ActualDepsFirst`,
-`CommitOnce`, `LockConsistent`; liveness: `EventuallyQuiescent` plus
-`AllRootsDone`/`AllRootsFail`. Tokens stay TokenPool's concern; the model
+The content checks use a chain because the diamond `a → {b, c} → d` is
+expensive on this machine: with recorded = actual, every subset clean and
+no build failures it passes too (2,422,801 states, about 6 minutes; checked
+once, not in `run.sh`), and with build failures it had reached 2.37
+million distinct states, still growing, when it was stopped after about
+four minutes.
+
+Invariants on every config but the coverage check: `TypeOK`, `CommitOnce`,
+`LockConsistent`, `DemandEdgesPresent` (while a build runs, the hard edge of
+each demand it has sent stays in the graph until that dep settles — demand
+edges are inserted exactly once per build, as `build_parallel` does),
+`VerifiedSoundly` (a verified target is clean, every recorded dep settled ok
+in this session, and none was rebuilt with different content); plus
+`ActualDepsFirst` on all but `TrueCycle`, and `NoFailure` on acyclic
+configs whose do-files cannot fail or be refused; liveness:
+`EventuallyQuiescent` plus `AllRootsDone`/`AllRootsFail`. Tokens stay
+TokenPool's concern; the model
 also encodes the implementation's real checker behavior of abandoning the
 check *immediately* on must-rebuild evidence, racing ahead of its own
 speculation — the interleavings where the old design died.
 
-### WaitGraph.tla — the proposed waits-for graph across sessions and crashes
+### Retired specs
 
-(Written for the lock-wait graph, `WaitEdge`, since superseded by
-SpeculationMP's settle-wait graph. The finding transfers: that graph's
-edges are deliberately shared across sessions, so they must be ignored once
-their owner is dead, which `src/waits.rs` does by owner liveness lock.)
+Removed from `run.sh` once the specs above covered their properties; the
+files are in git history (last present in commit e4612ba).
 
-The single-session specs above cannot see what a crashed run's wait edges
-do to the next run. Here the edges live in the shared database, tagged with
-their session; each session traverses the graph *its* do-files declare (do-
-files can change between runs); a session can crash, releasing its locks
-but leaving its edges; `GcByLiveness` (contract item 6) makes reachability
-ignore edges of dead sessions.
-
-| Config | Scenario | Result |
-|---|---|---|
-| `WaitGraph_StaleEdge` | s1 (`a→b`) crashes mid-wait; do-files change to `b→a`; s2 runs; no edge GC | ⚠️ `NoFalseCycle` violated (predicted) |
-| `WaitGraph_StaleEdgeGc` | the same with edge GC | ✅ `NoFalseCycle`, `Termination` |
-| `WaitGraph_LiveCross` | two live sessions whose do-files disagree, racing | ✅ a real mutual wait is reported, never hung |
-| `WaitGraph_TrueCycle` | a cyclic project | ✅ reported (`SomeoneFails`), never hung |
-| `WaitGraph_Coverage` | LiveCross | ⚠️ `NeverFails` violated (predicted): the mutual wait is reached |
+- **ParallelEnsure.tla** — the first model of the aggressive parallel
+  traversal (global claims, a waits-for graph checked before every wait, a
+  flat token counter). Found nothing wrong. Its build-once, deps-first and
+  cycles-error-out properties are SpeculationMP's `CommitOnce`,
+  `ActualDepsFirst` and `SpeculationMP_TrueCycle`; its token bound is
+  TokenPool's `ExactBound`.
+- **Speculation.tla** — stale recorded vs. actual deps under one global
+  claim per target. Found that its own severity rule was wrong
+  (`Speculation_Reversed`: a dep reversed between runs fabricates a hard
+  cycle error through a speculative edge), which led to SpeculationMP. Its
+  Stale, StaleCycle, TrueCycle and Reversed shapes are SpeculationMP configs
+  of the same names, and its content-hash pruning (`changed`,
+  `VerifiedSoundly`, the `NeverVerifiedOverRebuild` coverage check) is now
+  in SpeculationMP (`SpeculationMP_Content`, `_Coverage`).
+- **WaitGraph.tla** — main's lock-wait edge graph (`WaitEdge`) across
+  sessions and crashes. Found that a crashed run's edges plus changed
+  do-files fabricate a cycle error (`WaitGraph_StaleEdge`), hence wait edges
+  carry their owner's liveness and dead owners' edges are ignored
+  (`waits::gc_dead_edges`, contract item 6). Its live-cross and true-cycle
+  results are covered by SpeculationMP (`CrossStale`, `TrueCycle`); the
+  crash finding is **not** covered by any current spec — SpeculationMP has
+  no crashes — so contract item 6 now rests on the retired model.
+- **CycleLock_CycleParallel** (the config; CycleLock.tla stays) — the
+  chain-only cycle check deadlocks two traversals entering `a ↔ b` from
+  different sides. The fix (do-file demands enter the shared waits-for graph
+  before any lock wait, SpeculationMP R1–R3) is verified by
+  `SpeculationMP_TrueCycle`.
+- **TokenPoolPromptLock.tla** — merged into TokenPool.tla (`LockWaits`); its
+  release-mode deadlock is `TokenPool_PromptReleaseLock`, its hold-mode
+  check `TokenPool_PromptHold` (now eager, nested and depth 3).
 
 ## Mutation testing — the checks have teeth
 
@@ -492,11 +493,13 @@ check fails (not part of `run.sh`; each row names the one edit):
 
 | Mutation | Expected catch | Result |
 |---|---|---|
-| Remove the mid-build cycle check in `BWait` | deadlock | ✅ deadlock |
-| Make speculative cycles HARD instead of soft | self-healing breaks | ✅ `AllDone` violated |
-| Blocked do-file keeps its token (no `Yield` release) | chain at J=1 deadlocks | ✅ deadlock |
-| `Commit` without awaiting the do-file's deps | ordering breaks | ✅ `ActualDepsFirst` violated |
-| Speculation: old `Verify` guard (no `~DepChanged(t)`) | verifies over a changed dep | ✅ `VerifiedSoundly` violated |
+| SpeculationMP: `BDemand` inserts the hard edge with no cycle check | a real cycle hangs | ✅ deadlock (`TrueCycle`) |
+| SpeculationMP: every cycle on a hard insert is a real error (`CycHard` over all edges, soft included) | stale speculation invents an error | ✅ `NoFailure` violated (`Reversed`) |
+| SpeculationMP: `FinishDemands` without awaiting the do-file's deps | ordering breaks | ✅ `ActualDepsFirst` violated (`Stale`) |
+| SpeculationMP: `Verify` without `~DepChanged(t)` | verifies over a changed dep | ✅ `VerifiedSoundly` violated (`Content`, `Stale`) |
+| SpeculationMP: an aborted instance drops `DropWaitsBoth` instead of `DropInstance` | a foreign build's demand edges vanish | ✅ `DemandEdgesPresent` violated in 15 states (`EvictForeign`) |
+| Retired Speculation.tla: a blocked do-file keeps its token (no `Yield` release) | chain at J=1 deadlocks | ✅ deadlock (not re-run; see git history) |
+| ShallowRecheck: `NoStaleRun` reduced to its per-settle `staleBy` clause | the flag alone sees main's bug | ✅ violated (`Shallow`, `ShallowSpec`) |
 | LockSession: accept the pending hash but do not adopt it in `MarkerTxn` | a second crash re-creates the false refusal | ✅ `NoFalseRefusal` violated |
 | LockSession: the do-file reads the source *before* `redo-ifchange` stamps it | silent staleness | ✅ `UpToDateIsTrue` violated |
 | SharedPaths: GC never deletes (`JanitorDeletes = FALSE`, kept as `SharedPaths_Coverage`) | leak | ✅ `JanitorCleans` violated |
@@ -516,9 +519,14 @@ What the Rust must preserve for these results to transfer:
 4. **No redundant claim across sessions:** the double-check under the lock
    re-asks whether the target is out of date, not only whether *this*
    session built it.
-5. **A blocked do-file must not hold a job slot.**
+5. **A blocked do-file's slot is compensated exactly:** a do-file blocked
+   in `redo-ifchange` keeps its token, and the child redo process runs on
+   its own implicit token (TokenPool's `Bound`/`ExactBound`). Every token a
+   build holds is returned on every exit, including a panic's unwind
+   (`TokenGuard`); a panicking task still settles (`run_task`'s
+   `catch_unwind`), since its waiters have no timeout.
 6. **Wait edges are ignored or swept once their owner is dead**
-   (`WaitGraph_StaleEdge` shows the false cycle otherwise). The graph itself
+   (`WaitGraph_StaleEdge`, retired, showed the false cycle otherwise). The graph itself
    is shared across sessions: concurrent runs share the target locks, so a
    cross-session cycle is a real one.
 7. **Eager scheduling:** a launchable job plus a free token must eventually
@@ -539,14 +547,23 @@ What the Rust must preserve for these results to transfer:
     and run files while their session's run lock is free — probed and
     deleted under that lock, with the creator re-checking that the lock
     path still names its locked file.
-12. **Never hold-and-wait on the token pool:** a prompting job either keeps
-    its token or returns it to its source and may resume on its process's
-    own token (`PromptHold`, `PromptSource`).
+12. **A prompting job keeps its token** while the human answers
+    (`TokenPool_PromptHold`, `_PromptHoldJ3`). Releasing it — to the pool
+    (`TokenPool_PromptDeadlock`, `_PromptReleaseLock`) or back to its source
+    (`TokenPool_PromptSourceLock`) — deadlocks once other jobs block on the
+    prompter's target lock holding their tokens.
 13. **The double-check needs settled deps:** the shallow re-check of item 4
     may skip a build only when every buildable dep has already settled in
     *this* session; a dep still settling (possibly being rebuilt by this
     session's speculation) sends the target down the build path
     (`ShallowRecheck_Shallow` shows the silent staleness otherwise).
+14. **Demand edges are inserted once and never deleted by anyone else
+    while their build runs:** an abort removes only the aborted instance's
+    own owner's edges (`SpeculationMP_EvictForeign`, `DemandEdgesPresent`).
+15. **A kill reaches the whole speculative subtree** (R5, R3 eviction, R6
+    `KillSubtree`): exactly on Windows (nested job objects), best-effort on
+    Unix (process groups plus signal forwarding; see "Killing a do-file's
+    tree").
 
 ## Gap found: concurrent traversals turn cycle errors into deadlocks
 
@@ -557,8 +574,10 @@ chain mechanism is path-local. It bites today with two concurrent `redo`
 invocations on a cyclic graph, or one `redo -j2` whose parallel branches
 reach a cycle from different entry points, and would become routine with a
 parallelized `is_ood`. The chosen fix — the waits-for graph — is verified in
-`ParallelEnsure_Cycle`, `Speculation_TrueCycle` and, across sessions and
-crashes, `WaitGraph_*`. `CycleLock_CycleParallel` keeps modeling the earlier chain-only code.
+`SpeculationMP_TrueCycle` (and was in the retired `ParallelEnsure_Cycle`,
+`Speculation_TrueCycle` and, across sessions and crashes, `WaitGraph_*`).
+`CycleLock_CycleParallel`, which kept modeling the earlier chain-only code,
+is retired (git history).
 
 **Status: first implementation refuted; corrected design verified and
 implemented.** Two waits-for graphs were built in parallel: one recorded
@@ -579,7 +598,7 @@ failure shapes reproduced against the first parallel traversal.
 History of the refutation: the original
 waits-for-graph mechanism shipped in `src/waits.rs`
 and `src/parallel.rs`, but adversarial review found the verified theorems
-did not transfer: Speculation.tla assumes one global claim per target,
+did not transfer: Speculation.tla assumed one global claim per target,
 while the implementation claims per process — and the two waits that
 difference creates (a duplicate instance blocking on the kernel target
 lock, and `drain` blocking every ifchange return on all speculative tasks)
@@ -588,7 +607,7 @@ project: a deterministic deadlock (crossed stale recorded deps, 10/10
 hangs), silently-swallowed fabricated `X -> g -> X` cycle errors from
 speculative tasks inheriting `REDO_CHAIN`, and a 64× ifchange-latency
 hostage effect from draining stale speculative builds. Separately,
-`Speculation_Reversed` refutes the old severity rule inside the spec
+`Speculation_Reversed` refuted the old severity rule inside the spec
 itself. The corrected machine — typed edges, creation edges, soft
 eviction, speculation quarantine — is specified and fully verified in
 `SpeculationMP.tla`, and the implementation now matches it. Two
@@ -619,15 +638,17 @@ path-local cycles, and it no longer runs on speculative task threads
   breaks otherwise).
 - LockSession and SharedPaths model no edits of built outputs (see
   Accepted limitations) and a non-interactive overwrite guard. The prompt
-  itself is modeled for its token behavior (TokenPool, TokenPoolPromptLock:
-  `PromptMode`, top level only in the latter) and its speculation rule
+  itself is modeled for its token behavior (TokenPool: `PromptMode`, at
+  every depth, with lock waiters) and its speculation rule
   (SpeculationMP R6); the `all`/`quit` answers are not distinguished from
   per-prompt `yes`/`no`.
-- Content is modeled by identity — every build is distinct (nondeterministic
-  do-files), the worst case for every hash comparison.
-- ParallelEnsure, Speculation and SpeculationMP model the token budget as
-  one flat counter (SpeculationMP: not at all); TokenPool's `ExactBound`
-  (proved above for every depth) justifies it.
+- Content is modeled by identity in LockSession — every build is distinct
+  (nondeterministic do-files), the worst case for every hash comparison.
+  SpeculationMP chooses at each commit whether the content changed (both
+  outcomes explored); ShallowRecheck's do-files are deterministic.
+- SpeculationMP does not model tokens; TokenPool's `ExactBound` (proved
+  above for every depth) covers the budget, and its own-token argument
+  rules out token waits closing a deadlock.
 - After a history flag records a bad step, a model continues as if the step
   had succeeded; flags are read only by invariants.
 - ShallowRecheck has no crashes, failures or cycles, deterministic do-files
@@ -636,7 +657,7 @@ path-local cycles, and it no longer runs on speculative task threads
   edges are replaced at its commit: the unlocked checker of a build in
   flight sees its Uncommitted marker first, and the re-check runs only
   under the lock, after the commit.
-- Model sizes are small (1–5 targets, 2–3 processes or sessions, 1–2 edits,
+- Model sizes are small (1–6 targets, 2–3 processes or sessions, 1–3 edits,
   bounded crashes) but chosen adversarially; every counterexample found
   here needed at most three processes.
 - SpeculationMP's kills do not all cascade alike: R6's `KillSubtree` kills
@@ -650,6 +671,50 @@ path-local cycles, and it no longer runs on speculative task threads
   the builder while a question is open (`HandEditNo` reaches this). The
   implementation's drain-before-return keeps the child process alive until
   the question is answered; the answer is then stale but harmless.
+
+## Killing a do-file's tree (Linux and Windows)
+
+R5, R3's creation-edge eviction and R6's `KillSubtree` all assume a kill
+reaches *everything* the speculative do-file started. `Child::kill`
+reached only the interpreter: a compiler, a `sleep`, a subshell survived,
+holding no token (breaking TokenPool's `Bound`), writing after the target
+lock was released, and — since temp names were per process — able to
+write into a later attempt's `$3` or stdout capture after a reclaim.
+`src/proctree.rs` now gives every do-file that is speculative in its redo
+process a tree of its own:
+
+- **Windows: a job object per speculative do-file.** The do-file is
+  created suspended, assigned to a new job, then resumed, so nothing it
+  starts predates the assignment. Jobs nest (Windows 8+) inside the
+  top-level redo's kill-on-close job, and nested redo processes' jobs nest
+  inside it; `TerminateJobObject` kills the job and every nested job at
+  once — exactly `KillSubtree`. (Before this, a leak was already bounded:
+  the top-level job killed survivors when the session ended.)
+- **Unix: a process group per speculative do-file.** The kill is SIGTERM
+  to the group, a wait (≤ 2 s) for the group to empty, then SIGKILL.
+  Nested redo processes in the group forward the signal to their own
+  speculative groups before dying, and detect the abort themselves through
+  `REDO_SPEC_WATCH`. Weaker than Windows in two ways: a program that leaves
+  its group (`setsid`, daemons) escapes, and below the first nesting level
+  only the forwarded signal is sent (no SIGKILL escalation), so a
+  descendant that traps SIGTERM there survives. Before this, a leak was
+  unbounded.
+- **Demanded do-files are unchanged** on both platforms: they stay in the
+  parent's process group (the terminal's foreground group), so Ctrl-C and
+  tools that prompt on `/dev/tty` behave as before. Only speculation is ever
+  killed, so only speculation needs a tree. Because speculative groups are
+  not in the foreground group, each redo process forwards SIGINT, SIGTERM
+  and SIGHUP to its speculative groups (left alone if the signal was
+  ignored at startup), and hands the terminal back first if an overwrite
+  prompt holds it.
+- Temps are now unique per **attempt** (`$3` is
+  `<t>.redo-tmp.<pid>.<n>`, the capture `stdout.<key>.<pid>.<n>`), so a
+  straggler that escaped anyway cannot write into a later attempt.
+
+Tests: `abandoned_speculation_kills_the_whole_do_file_tree` (both
+platforms; fails on both with the interpreter-only kill) and
+`signal_to_redo_reaches_speculative_process_groups` (Unix; fails without
+forwarding).
 
 ## What model checking cannot close
 

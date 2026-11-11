@@ -3,19 +3,19 @@
 (* The first-principles multi-process ensure machine — the design the      *)
 (* implementation must be rebuilt to match.                                *)
 (*                                                                         *)
-(* WHY THIS SPEC EXISTS. Speculation.tla proves its properties for a       *)
-(* machine with ONE global claim per target and no kernel locks. The       *)
-(* implementation has one claim per target PER PROCESS; second instances   *)
-(* of an in-flight target block on the per-target kernel lock, and every   *)
-(* redo-ifchange return drains ALL of its process's tasks — and neither    *)
-(* of those waits appeared in the shared waits-for graph. Result (both     *)
-(* reproduced against the shipping branch): a deterministic deadlock on    *)
-(* an ACYCLIC project whose stale recorded deps cross two branches         *)
-(* (SpeculationMP_CrossStale is exactly that shape), and fabricated        *)
-(* cycle errors from speculative tasks. Separately, Speculation.tla's      *)
-(* own BWait hard-fails a cycle that rides a SPECULATIVE edge              *)
-(* (Speculation_Reversed.cfg), refuting the "stale edges never invent an   *)
-(* error" claim.                                                           *)
+(* WHY THIS SPEC EXISTS. Speculation.tla (retired; in git history) proved  *)
+(* its properties for a machine with ONE global claim per target and no    *)
+(* kernel locks. The implementation has one claim per target PER PROCESS;  *)
+(* second instances of an in-flight target block on the per-target kernel  *)
+(* lock, and every redo-ifchange return drains ALL of its process's tasks  *)
+(* -- and neither of those waits appeared in the shared waits-for graph.   *)
+(* Result (both reproduced against the shipping branch): a deterministic   *)
+(* deadlock on an ACYCLIC project whose stale recorded deps cross two      *)
+(* branches (SpeculationMP_CrossStale is exactly that shape), and          *)
+(* fabricated cycle errors from speculative tasks. Separately,             *)
+(* Speculation.tla's own BWait hard-fails a cycle that rides a SPECULATIVE *)
+(* edge (Speculation_Reversed.cfg), refuting the "stale edges never invent *)
+(* an error" claim.                                                        *)
 (*                                                                         *)
 (* THE CORRECT MACHINE. This spec models the real execution shape          *)
 (* honestly — multiple processes, per-process registries, per-target       *)
@@ -81,9 +81,20 @@
 (* Tokens are out of scope (TokenPool.tla verifies that budget             *)
 (* independently; token waits cannot deadlock by the own-token argument).  *)
 (* One redo-ifchange call per do-file is modeled; sequential calls repeat  *)
-(* the same protocol. As in Speculation.tla, `clean` (content verdicts)    *)
-(* is frozen at Init and nondeterministic (TLC explores every subset of   *)
-(* Cleanable).                                                             *)
+(* the same protocol.                                                      *)
+(*                                                                         *)
+(* CONTENT. Out-of-date evaluation has is_ood's two parts. `clean`: the    *)
+(* target's OWN inputs (sources, do-file) are unchanged -- frozen at Init  *)
+(* and nondeterministic (TLC explores every subset of Cleanable). Deps:    *)
+(* every recorded dep settled ok AND none was rebuilt with DIFFERENT       *)
+(* content: each commit chooses nondeterministically whether its content   *)
+(* changed (`changed`), so content-hash pruning -- a parent verifying over *)
+(* a dep rebuilt with identical bytes -- is explored, and VerifiedSoundly  *)
+(* checks that no verification rides over a changed dep. (Unlike the       *)
+(* retired Speculation.tla, `clean` is not restricted to targets whose     *)
+(* recorded deps equal their actual deps: the models also explore a clean  *)
+(* target with a stale dep list, which deterministic do-files never        *)
+(* produce -- an over-approximation.)                                      *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -119,6 +130,12 @@ RevActual == ("a" :> {}) @@ ("b" :> {"a"})
 \* A genuinely cyclic project, empty database (pure discovery-time).
 NoRecorded2 == ("a" :> {}) @@ ("b" :> {})
 CycleActual == ("a" :> {"b"}) @@ ("b" :> {"a"})
+\* The database records a cycle the do-files no longer have (StaleCycle:
+\* Recorded <- CycleActual, Actual <- NoRecorded2).
+\* Recorded = actual chain a -> b -> c: content verdicts and
+\* identical-content rebuilds (pruning) two levels deep.
+ChainTargets == {"a", "b", "c"}
+ChainDeps == ("a" :> {"b"}) @@ ("b" :> {"c"}) @@ ("c" :> {})
 RootsAB == {"a", "b"}
 RootsA == {"a"}
 NoTargets == {}
@@ -143,6 +160,22 @@ LinTargets == {"a", "b", "c", "x"}
 LinRecorded == ("a" :> {"b"}) @@ ("b" :> {}) @@ ("c" :> {}) @@ ("x" :> {})
 LinDropActual == ("a" :> {"c"}) @@ ("b" :> {"x"}) @@ ("c" :> {}) @@ ("x" :> {})
 LinKeepActual == ("a" :> {"b"}) @@ ("b" :> {"x"}) @@ ("c" :> {}) @@ ("x" :> {})
+\* Foreign eviction: Top builds s (holding s's lock; its child demands x),
+\* while inside a's child process e's stale record spawns a second,
+\* speculative instance of s that blocks on s's lock. x's do-file demands a,
+\* and that cycle a -> s -> x -> a rides the creation edge a -> s, which is
+\* evicted. The abort must drop only the aborted instance's edges: s -> x
+\* belongs to Top's build, which is still waiting on x. Erasing it (the
+\* former DropWaitsBoth) lets d's later demand d -> s pass the cycle check
+\* and deadlocks this acyclic project (c's checker waits on d, d on s, s on
+\* x, x on a, a on c).
+EvTargets == {"a", "c", "d", "e", "s", "x"}
+EvRecorded == ("a" :> {}) @@ ("c" :> {"d"}) @@ ("d" :> {}) @@ ("e" :> {"s"})
+              @@ ("s" :> {}) @@ ("x" :> {})
+EvActual == ("a" :> {"c", "e"}) @@ ("c" :> {}) @@ ("d" :> {"s"}) @@ ("e" :> {})
+            @@ ("s" :> {"x"}) @@ ("x" :> {"a"})
+RootsAS == {"a", "s"}
+CleanC == {"c"}
 HandX == {"x"}
 HandS == {"s"}
 HandCD == {"c", "d"}
@@ -160,9 +193,12 @@ VARIABLES
     lock,    \* [Targets -> Procs \cup {"-"}] the kernel build lock
     mark,    \* [Targets -> {"-","verified","committed"}] session runid mark
     clean,   \* frozen content verdicts (subset of Cleanable)
-    builds   \* [Targets -> Nat] commit counter (history, for invariants)
+    changed, \* [Targets -> BOOLEAN] its commit changed the content
+    builds,  \* [Targets -> Nat] commit counter (history, for invariants)
+    dsent    \* [Targets -> SUBSET Targets] demand edges inserted by this build
 
-vars == <<ist, grade, cpend, mustR, apend, edges, lock, mark, clean, builds>>
+vars == <<ist, grade, cpend, mustR, apend, edges, lock, mark, clean, changed,
+          builds, dsent>>
 
 (* Instance lifecycle. "new" = claimed, not yet activated. "lockw" =       *)
 (* blocked on the kernel lock (edge-free by design, R1). "sfail" =         *)
@@ -185,7 +221,9 @@ TypeOK ==
     /\ lock \in [Targets -> Procs \cup {"-"}]
     /\ mark \in [Targets -> {"-", "verified", "committed"}]
     /\ clean \subseteq Cleanable \ HandEdited
+    /\ changed \in [Targets -> BOOLEAN]
     /\ builds \in [Targets -> Nat]
+    /\ dsent \in [Targets -> SUBSET Targets]
 
 Init ==
     /\ ist = [p \in Procs |-> [t \in Targets |->
@@ -200,7 +238,9 @@ Init ==
     /\ mark = [t \in Targets |-> "-"]
     \* a hand-edited file never matches its recorded hash: never clean
     /\ clean \in SUBSET (Cleanable \ HandEdited)
+    /\ changed = [t \in Targets |-> FALSE]
     /\ builds = [t \in Targets |-> 0]
+    /\ dsent = [t \in Targets |-> {}]
 
 ----------------------------------------------------------------------------
 (* Reachability over an edge set, by target name.                          *)
@@ -234,6 +274,8 @@ IsCreation(e) == e.soft /\ e.own = e.w /\ e.own # Top
 (* the builder's name as waiter.                                           *)
 DropWaits(E, p, t) == {e \in E : ~(e.own = p /\ e.w = t)}
 DropWaitsBoth(E, p, t) == {e \in E : ~(e.own \in {p, t} /\ e.w = t)}
+DropInstance(E, p, t) ==
+    IF lock[t] = p THEN DropWaitsBoth(E, p, t) ELSE DropWaits(E, p, t)
 
 ----------------------------------------------------------------------------
 (* Activation. A claimed instance first observes the session mark (the     *)
@@ -243,13 +285,14 @@ ActivateSkip(p, t) ==
     /\ ist[p][t] = "new" /\ mark[t] # "-"
     /\ ist' = [ist EXCEPT ![p][t] = "done"]
     /\ UNCHANGED <<grade, cpend, mustR, apend, edges, lock, mark, clean,
-                   builds>>
+                   changed, dsent, builds>>
 
 ActivateCheck(p, t) ==
     /\ ist[p][t] = "new" /\ mark[t] = "-"
     /\ ist' = [ist EXCEPT ![p][t] = "checking"]
     /\ cpend' = [cpend EXCEPT ![p][t] = Recorded[t]]
-    /\ UNCHANGED <<grade, mustR, apend, edges, lock, mark, clean, builds>>
+    /\ UNCHANGED <<grade, mustR, apend, edges, lock, mark, clean, changed,
+                   dsent, builds>>
 
 ----------------------------------------------------------------------------
 (* Checking: speculative fan-out over the RECORDED deps. Once any soft     *)
@@ -276,7 +319,7 @@ CSpawn(p, t, d) ==
                           ELSE edges \cup
                             {[own |-> p, w |-> p, d |-> d, soft |-> TRUE]}
               /\ UNCHANGED <<cpend, mustR>>
-    /\ UNCHANGED <<apend, lock, mark, clean, builds>>
+    /\ UNCHANGED <<apend, lock, mark, clean, changed, dsent, builds>>
 
 (* Wait for an in-flight instance: atomic soft check-and-insert of the     *)
 (* checker edge t -> d. A cycle is SOFT: skip the wait, rebuild.           *)
@@ -291,7 +334,8 @@ CWait(p, t, d) ==
          ELSE /\ edges' = edges \cup
                   {[own |-> p, w |-> t, d |-> d, soft |-> TRUE]}
               /\ UNCHANGED <<cpend, mustR>>
-    /\ UNCHANGED <<ist, grade, apend, lock, mark, clean, builds>>
+    /\ UNCHANGED <<ist, grade, apend, lock, mark, clean, changed, dsent,
+                   builds>>
 
 (* A waited-on dep settled. done: this wait verified. sfail/fail: SOFT —   *)
 (* the parent just cannot verify (R4: speculative outcomes are never       *)
@@ -302,15 +346,26 @@ CObserve(p, t, d) ==
     /\ cpend' = [cpend EXCEPT ![p][t] = @ \ {d}]
     /\ mustR' = IF ist[p][d] = "done" THEN mustR
                 ELSE [mustR EXCEPT ![p][t] = TRUE]
-    /\ UNCHANGED <<ist, grade, apend, edges, lock, mark, clean, builds>>
+    /\ UNCHANGED <<ist, grade, apend, edges, lock, mark, clean, changed,
+                   dsent, builds>>
 
+(* A recorded dep committed in this session with DIFFERENT content: its  *)
+(* hash no longer matches the one t recorded.                              *)
+DepChanged(t) ==
+    \E d \in Recorded[t] : mark[d] = "committed" /\ changed[d]
+
+(* Up to date: every recorded dep settled ok (cpend empty with no soft     *)
+(* failure noted), none was rebuilt with different content, and t's own    *)
+(* inputs are clean.                                                       *)
 Verify(p, t) ==
     /\ ist[p][t] = "checking" /\ cpend[p][t] = {} /\ ~mustR[p][t]
     /\ t \in clean
+    /\ ~DepChanged(t)
     /\ ist' = [ist EXCEPT ![p][t] = "done"]
     /\ mark' = [mark EXCEPT ![t] = "verified"]
     /\ edges' = DropWaits(edges, p, t)
-    /\ UNCHANGED <<grade, cpend, mustR, apend, lock, clean, builds>>
+    /\ UNCHANGED <<grade, cpend, mustR, apend, lock, clean, changed, dsent,
+                   builds>>
 
 (* Take the rebuild path: on any soft failure (including an evicted        *)
 (* checker edge's sticky mustR), or AT ANY TIME once the content verdict   *)
@@ -322,17 +377,14 @@ Verify(p, t) ==
 (* own and are drained (under creation edges) by the enclosing process.    *)
 MoveToBuild(p, t) ==
     /\ ist[p][t] = "checking"
-    /\ mustR[p][t] \/ t \notin clean
+    /\ mustR[p][t] \/ t \notin clean \/ DepChanged(t)
     /\ ist' = [ist EXCEPT ![p][t] = "lockw"]
     /\ cpend' = [cpend EXCEPT ![p][t] = {}]
     /\ edges' = DropWaits(edges, p, t)
-    /\ UNCHANGED <<grade, mustR, apend, lock, mark, clean, builds>>
+    /\ UNCHANGED <<grade, mustR, apend, lock, mark, clean, changed, dsent,
+                   builds>>
 
 ----------------------------------------------------------------------------
-(* The kernel build lock. Blocking here carries no edge; after acquiring,  *)
-(* the session mark is re-checked (the double-checked skip that makes      *)
-(* concurrent claims of one target safe).                                  *)
-
 (* --- R6 lineage helpers ------------------------------------------------ *)
 
 (* The builder process of process p's target: process p exists because    *)
@@ -422,7 +474,10 @@ AcquireLock(p, t) ==
               /\ UNCHANGED <<apend, lock, cpend>>
          ELSE \* demanded, but inside a speculative or orphaned lineage
               KillSubtree(AbortRoot(p))
-    /\ UNCHANGED <<grade, mustR, mark, clean, builds>>
+    \* t's lock is free here, so no build of t is in flight: a new one starts
+    \* with no demands sent
+    /\ dsent' = [dsent EXCEPT ![t] = {}]
+    /\ UNCHANGED <<grade, mustR, mark, clean, changed, builds>>
 
 (* The human answers the overwrite question. *)
 PromptYes(p, t) ==
@@ -430,7 +485,8 @@ PromptYes(p, t) ==
     /\ ist[p][t] = "prompt" /\ lock[t] = p
     /\ ist' = [ist EXCEPT ![p][t] = "brun"]
     /\ apend' = [apend EXCEPT ![t] = Actual[t]]
-    /\ UNCHANGED <<grade, cpend, mustR, edges, lock, mark, clean, builds>>
+    /\ UNCHANGED <<grade, cpend, mustR, edges, lock, mark, clean, changed,
+                   dsent, builds>>
 
 PromptNo(p, t) ==
     /\ "no" \in PromptAnswers
@@ -438,7 +494,8 @@ PromptNo(p, t) ==
     /\ ist' = [ist EXCEPT ![p][t] = "fail"]
     /\ lock' = [lock EXCEPT ![t] = "-"]
     /\ edges' = DropWaitsBoth(edges, p, t)
-    /\ UNCHANGED <<grade, cpend, mustR, apend, mark, clean, builds>>
+    /\ UNCHANGED <<grade, cpend, mustR, apend, mark, clean, changed, dsent,
+                   builds>>
 
 ----------------------------------------------------------------------------
 (* Building: the do-file runs and demands its ACTUAL deps through its      *)
@@ -457,14 +514,15 @@ FailState(p, t) == IF grade[p][t] = "dem" THEN "fail" ELSE "sfail"
 (* quarantined sfail is reclaimed and re-run.                              *)
 BDemand(p, t, d) ==
     /\ ist[p][t] = "brun" /\ lock[t] = p /\ d \in apend[t]
-    /\ [own |-> t, w |-> t, d |-> d, soft |-> FALSE] \notin edges
+    /\ d \notin dsent[t]
     /\ IF CycHard(t, d)
          THEN /\ ist' = [ist EXCEPT ![p][t] = FailState(p, t)]
               /\ lock' = [lock EXCEPT ![t] = "-"]
               /\ apend' = [apend EXCEPT ![t] = {}]
               /\ edges' = DropWaitsBoth(edges, p, t)
-              /\ UNCHANGED grade
+              /\ UNCHANGED <<grade, dsent>>
          ELSE /\ ~Cyc(t, d)
+              /\ dsent' = [dsent EXCEPT ![t] = @ \cup {d}]
               /\ edges' =
                    (edges \ {[own |-> t, w |-> t, d |-> d, soft |-> TRUE]})
                    \cup {[own |-> t, w |-> t, d |-> d, soft |-> FALSE]}
@@ -474,7 +532,7 @@ BDemand(p, t, d) ==
                    ELSE /\ grade' = [grade EXCEPT ![t][d] = "dem"]
                         /\ UNCHANGED ist
               /\ UNCHANGED <<lock, apend>>
-    /\ UNCHANGED <<cpend, mustR, mark, clean, builds>>
+    /\ UNCHANGED <<cpend, mustR, mark, clean, changed, builds>>
 
 (* R3 eviction: the hard demand t -> d found a cycle, but every d ~> t     *)
 (* path rides at least one SOFT edge. The speculation yields: one soft     *)
@@ -483,11 +541,13 @@ BDemand(p, t, d) ==
 (* never an error).                                                        *)
 EvictChecker(p, t, d, e) ==
     /\ ist[p][t] = "brun" /\ lock[t] = p /\ d \in apend[t]
+    /\ d \notin dsent[t]
     /\ Cyc(t, d) /\ ~CycHard(t, d)
     /\ e \in SoftOnPath(t, d) /\ ~IsCreation(e)
     /\ edges' = edges \ {e}
     /\ mustR' = [mustR EXCEPT ![e.own][e.w] = TRUE]
-    /\ UNCHANGED <<ist, grade, cpend, apend, lock, mark, clean, builds>>
+    /\ UNCHANGED <<ist, grade, cpend, apend, lock, mark, clean, changed,
+                   dsent, builds>>
 
 (* A creation edge evicts by ABORTING the speculative instance it guards:  *)
 (* not yet building -> settles sfail directly; mid-build -> the do-file    *)
@@ -499,6 +559,7 @@ EvictChecker(p, t, d, e) ==
 (* creation edge was superseded at upgrade.                                *)
 EvictCreation(p, t, d, e) ==
     /\ ist[p][t] = "brun" /\ lock[t] = p /\ d \in apend[t]
+    /\ d \notin dsent[t]
     /\ Cyc(t, d) /\ ~CycHard(t, d)
     /\ e \in SoftOnPath(t, d) /\ IsCreation(e)
     /\ LET q == e.own
@@ -510,20 +571,20 @@ EvictCreation(p, t, d, e) ==
                  /\ apend' = IF lock[s] = q
                                THEN [apend EXCEPT ![s] = {}] ELSE apend
                  /\ cpend' = [cpend EXCEPT ![q][s] = {}]
-                 /\ edges' = DropWaitsBoth(edges \ {e}, q, s)
+                 /\ edges' = DropInstance(edges \ {e}, q, s)
             ELSE /\ edges' = edges \ {e}
                  /\ UNCHANGED <<ist, lock, apend, cpend>>
-    /\ UNCHANGED <<grade, mustR, mark, clean, builds>>
+    /\ UNCHANGED <<grade, mustR, mark, clean, changed, dsent, builds>>
 
 (* A demanded dep settled: done resolves it; sfail is reclaimed and        *)
 (* re-run; fail is HARD — the demanding build fails.                       *)
 BObserveDone(p, t, d) ==
     /\ ist[p][t] = "brun" /\ lock[t] = p /\ d \in apend[t]
-    /\ [own |-> t, w |-> t, d |-> d, soft |-> FALSE] \in edges
+    /\ d \in dsent[t]
     /\ ist[t][d] = "done"
     /\ apend' = [apend EXCEPT ![t] = @ \ {d}]
     /\ UNCHANGED <<ist, grade, cpend, mustR, edges, lock, mark, clean,
-                   builds>>
+                   changed, dsent, builds>>
 
 BObserveFail(p, t, d) ==
     /\ ist[p][t] = "brun" /\ lock[t] = p /\ d \in apend[t]
@@ -532,21 +593,22 @@ BObserveFail(p, t, d) ==
     /\ lock' = [lock EXCEPT ![t] = "-"]
     /\ apend' = [apend EXCEPT ![t] = {}]
     /\ edges' = DropWaitsBoth(edges, p, t)
-    /\ UNCHANGED <<grade, cpend, mustR, mark, clean, builds>>
+    /\ UNCHANGED <<grade, cpend, mustR, mark, clean, changed, dsent, builds>>
 
 BReclaim(p, t, d) ==
     /\ ist[p][t] = "brun" /\ lock[t] = p /\ d \in apend[t]
-    /\ [own |-> t, w |-> t, d |-> d, soft |-> FALSE] \in edges
+    /\ d \in dsent[t]
     /\ ist[t][d] = "sfail"
     /\ ist' = [ist EXCEPT ![t][d] = "new"]
     /\ grade' = [grade EXCEPT ![t][d] = "dem"]
-    /\ UNCHANGED <<cpend, mustR, apend, edges, lock, mark, clean, builds>>
+    /\ UNCHANGED <<cpend, mustR, apend, edges, lock, mark, clean, changed,
+                   dsent, builds>>
 
 FinishDemands(p, t) ==
     /\ ist[p][t] = "brun" /\ lock[t] = p /\ apend[t] = {}
     /\ ist' = [ist EXCEPT ![p][t] = "bdrain"]
     /\ UNCHANGED <<grade, cpend, mustR, apend, edges, lock, mark, clean,
-                   builds>>
+                   changed, dsent, builds>>
 
 (* R5 — drain cancellation. A draining builder need not WAIT for its       *)
 (* speculative instances: it may abandon any of them, in any in-flight     *)
@@ -566,9 +628,9 @@ AbandonSpec(p, t, s) ==
     /\ lock' = IF lock[s] = t THEN [lock EXCEPT ![s] = "-"] ELSE lock
     /\ apend' = IF lock[s] = t THEN [apend EXCEPT ![s] = {}] ELSE apend
     /\ cpend' = [cpend EXCEPT ![t][s] = {}]
-    /\ edges' = {e \in DropWaitsBoth(edges, t, s) :
+    /\ edges' = {e \in DropInstance(edges, t, s) :
                    ~(e.own = t /\ e.w = t /\ e.d = s)}
-    /\ UNCHANGED <<grade, mustR, mark, clean, builds>>
+    /\ UNCHANGED <<grade, mustR, mark, clean, changed, dsent, builds>>
 
 (* Drain-then-commit: the child process waits for every instance in ITS    *)
 (* registry to settle — waits visible through the creation and demand      *)
@@ -580,9 +642,12 @@ Commit(p, t) ==
     /\ ist' = [ist EXCEPT ![p][t] = "done"]
     /\ mark' = [mark EXCEPT ![t] = "committed"]
     /\ builds' = [builds EXCEPT ![t] = @ + 1]
+    \* the rebuild may reproduce identical bytes (content-hash pruning: a
+    \* parent may still verify over it) or not (every parent must rebuild)
+    /\ \E c \in BOOLEAN : changed' = [changed EXCEPT ![t] = c]
     /\ lock' = [lock EXCEPT ![t] = "-"]
     /\ edges' = DropWaitsBoth(edges, p, t)
-    /\ UNCHANGED <<grade, cpend, mustR, apend, clean>>
+    /\ UNCHANGED <<grade, cpend, mustR, apend, clean, dsent>>
 
 (* The do-file itself fails (nonzero exit).                                *)
 BuildFail(p, t) ==
@@ -592,7 +657,7 @@ BuildFail(p, t) ==
     /\ lock' = [lock EXCEPT ![t] = "-"]
     /\ apend' = [apend EXCEPT ![t] = {}]
     /\ edges' = DropWaitsBoth(edges, p, t)
-    /\ UNCHANGED <<grade, cpend, mustR, mark, clean, builds>>
+    /\ UNCHANGED <<grade, cpend, mustR, mark, clean, changed, dsent, builds>>
 
 ----------------------------------------------------------------------------
 PStep(p, t) ==
@@ -634,6 +699,26 @@ ActualDepsFirst ==
 
 CommitOnce == \A t \in Targets : builds[t] <= 1
 
+(* Content soundness: a target marked verified really was clean, every     *)
+(* recorded dep settled ok in this session (verified or committed), and    *)
+(* none was rebuilt with different content -- verification never rides    *)
+(* over a soft failure or a changed dep (no silent staleness).             *)
+VerifiedSoundly ==
+    \A t \in Targets :
+        mark[t] = "verified" =>
+            /\ t \in clean
+            /\ \A d \in Recorded[t] :
+                   /\ mark[d] # "-"
+                   /\ ~(mark[d] = "committed" /\ changed[d])
+
+(* Coverage, EXPECTED TO BE VIOLATED: a dep rebuilt with identical content *)
+(* lets its parent verify (content-hash pruning is reachable), so          *)
+(* VerifiedSoundly's dep clause is not passing vacuously on a model where  *)
+(* every rebuilt dep forces its parent.                                    *)
+NeverVerifiedOverRebuild ==
+    ~\E t \in Targets :
+        mark[t] = "verified" /\ \E d \in Recorded[t] : mark[d] = "committed"
+
 LockConsistent ==
     \A t \in Targets :
         lock[t] # "-" => ist[lock[t]][t] \in {"prompt", "brun", "bdrain"}
@@ -654,6 +739,12 @@ PromptOnlyDemanded ==
 
 (* For configs where the hand-edited target is never really demanded. *)
 NeverPrompted == \A p \in Procs, t \in Targets : ist[p][t] # "prompt"
+
+DemandEdgesPresent ==
+    \A t \in Targets, d \in Targets :
+        (/\ lock[t] # "-" /\ ist[lock[t]][t] \in {"brun", "bdrain"}
+         /\ d \in dsent[t] /\ ist[t][d] \in InFlight)
+        => [own |-> t, w |-> t, d |-> d, soft |-> FALSE] \in edges
 
 EventuallyQuiescent == <>Quiescent
 
