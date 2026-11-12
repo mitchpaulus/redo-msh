@@ -755,6 +755,40 @@ fn introspection() {
     assert!(ood.lines().any(|l| l == "out.txt"), "expected out.txt ood, got: {ood:?}");
 }
 
+/// `requested` lists what was asked for on a `redo` command line — and only
+/// that: not dependencies, not a `redo` run by a do-file — newest first,
+/// relative to the current directory, failed attempts included.
+#[test]
+fn requested_records_command_line_targets() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("default.gen.do", "args :2: out!\n\"x\" @out writeFile\n");
+    p.write(
+        "sub/top.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'dep.gen']!\n['redo-msh' 'inner.gen']!\n\
+         \"t\" @out writeFile\n",
+    );
+    assert!(p.redo(&["one.gen"]).status.success());
+    assert!(p.redo(&["sub/top.txt"]).status.success());
+    assert!(!p.redo(&["nope.txt"]).status.success());
+    // Asking again moves a target to the front rather than repeating it.
+    assert!(p.redo(&["ONE.gen"]).status.success());
+
+    let listed = p.stdout_of(&["requested"]);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines, ["ONE.gen", "nope.txt", "sub/top.txt"], "requested: {listed:?}");
+
+    // From a subdirectory, names are what you would type there.
+    let out = p.redo_cmd(&["requested", "-l"]).current_dir(p.dir.join("sub")).output().unwrap();
+    let long = String::from_utf8_lossy(&out.stdout).into_owned();
+    let rows: Vec<(&str, &str)> = long.lines().filter_map(|l| l.split_once('\t')).collect();
+    let names: Vec<&str> = rows.iter().map(|r| r.1).collect();
+    assert_eq!(names, ["../ONE.gen", "../nope.txt", "top.txt"], "requested -l: {long:?}");
+    assert!(rows.iter().all(|r| r.0.parse::<u64>().is_ok_and(|s| s > 1_600_000_000)));
+}
+
 // ---- additional ported scenarios (apenwarr t/) -----------------------------
 
 /// `$1`/`$2`/`$3` reach the do-file with the right values. For a

@@ -69,9 +69,39 @@ pub fn normalize(root: &Path, cwd: &Path, input: &Path) -> Option<String> {
     to_root_relative(root, &abs)
 }
 
+/// Express the root-relative key `target` relative to the root-relative
+/// directory key `from` (`""` = the root), with `/` separators — the inverse
+/// of `normalize` for a cwd at `from`. Directory components are matched
+/// case-insensitively, as the database does.
+pub fn relative_key(from: &str, target: &str) -> String {
+    let from: Vec<&str> = from.split('/').filter(|c| !c.is_empty()).collect();
+    let to: Vec<&str> = target.split('/').filter(|c| !c.is_empty()).collect();
+    // The target's last component is its name, never a shared directory.
+    let dirs = to.len().saturating_sub(1);
+    let common = from
+        .iter()
+        .zip(&to[..dirs])
+        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+        .count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&to[common..]);
+    parts.join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_key_inverts_normalize() {
+        assert_eq!(relative_key("", "a/b.txt"), "a/b.txt");
+        assert_eq!(relative_key("a", "a/b.txt"), "b.txt");
+        assert_eq!(relative_key("A", "a/b.txt"), "b.txt");
+        assert_eq!(relative_key("a/c", "a/b.txt"), "../b.txt");
+        assert_eq!(relative_key("x/y", "top.txt"), "../../top.txt");
+        // A directory named like the target is not a shared prefix.
+        assert_eq!(relative_key("a", "a"), "../a");
+    }
 
     #[test]
     fn cleans_dot_and_dotdot() {

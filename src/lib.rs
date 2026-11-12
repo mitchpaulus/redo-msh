@@ -29,8 +29,8 @@ use root::Root;
 use std::path::Path;
 
 /// Dispatch the `redo-msh` umbrella command line. The first argument is a verb
-/// (`root`, `ifchange`, `ifcreate`, `always`, `sources`, `targets`, `ood`,
-/// `tree`); if it is not a known verb, every argument is treated as a target
+/// (`root`, `ifchange`, `ifcreate`, `always`, `sources`, `targets`,
+/// `requested`, `ood`, `tree`); if it is not a known verb, every argument is treated as a target
 /// to build.
 pub fn run(raw_args: &[String]) -> Result<()> {
     // Help and version are recognized in any position, before other parsing.
@@ -54,7 +54,7 @@ pub fn run(raw_args: &[String]) -> Result<()> {
         && matches!(
             verb,
             "root" | "ifchange" | "ifcreate" | "always" | "stamp" | "sources" | "targets"
-                | "ood" | "tree" | "help"
+                | "requested" | "ood" | "tree" | "help"
         )
     {
         anyhow::bail!("--watch applies to building targets, not to `{verb}`");
@@ -68,6 +68,7 @@ pub fn run(raw_args: &[String]) -> Result<()> {
         "stamp" => build::stamp(),
         "sources" => build::cmd_sources(),
         "targets" => build::cmd_targets(),
+        "requested" => build::cmd_requested(&rest),
         "ood" => build::cmd_ood(),
         "tree" => build::cmd_tree(&rest),
         "help" => {
@@ -319,6 +320,10 @@ COMMANDS:
     redo-msh root [dir]           initialize a project root (.redom/) here or at dir
     redo-msh sources              list known source files
     redo-msh targets              list known generated targets
+    redo-msh requested [-l]       list targets asked for on a redo command
+                                  line, most recent first, relative to the
+                                  current directory (for shell completion);
+                                  -l adds the unix time of the last request
     redo-msh ood                  list out-of-date targets (without building)
     redo-msh tree [targets...]    print the dependency tree recorded by the
                                   last run, with per-node parallel width

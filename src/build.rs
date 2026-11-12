@@ -2093,6 +2093,13 @@ fn redo_build(ctx: &Ctx, targets: &[String]) -> Result<()> {
             rels.push(rel);
         }
     }
+    // Remember what was asked for, for shell completion — before building,
+    // so an attempt that fails still counts. A `redo` run by a do-file is
+    // the build's business, not something a user typed. Advisory: a failure
+    // to record must not fail the build.
+    if std::env::var_os(E_SESSION).is_none() {
+        let _ = db::record_requests(&ctx.conn, &rels, now_nanos());
+    }
     let result = crate::parallel::ensure_all(ctx, &rels, true);
     // Speculative dep tasks may still be settling; the run is not over (and
     // the log follower must not be terminated) until they are.
@@ -2127,6 +2134,32 @@ pub fn cmd_targets() -> Result<()> {
     let mut stmt = conn.prepare("SELECT path FROM files WHERE dofile IS NOT NULL ORDER BY path")?;
     for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
         println!("{}", row?);
+    }
+    Ok(())
+}
+
+/// `redo-msh requested [-l]`: list the targets users have asked `redo` for by
+/// name, most recently requested first, as paths relative to the current
+/// directory — ready to hand to a shell's completion. `-l` / `--long`
+/// prefixes each with the unix time (seconds) of its latest request and a tab.
+pub fn cmd_requested(args: &[String]) -> Result<()> {
+    let mut long = false;
+    for a in args {
+        match a.as_str() {
+            "-l" | "--long" => long = true,
+            other => bail!("requested: unknown argument {other:?}"),
+        }
+    }
+    let (root, conn) = open_for_query()?;
+    let cwd = std::env::current_dir()?;
+    let here = crate::paths::normalize(&root.dir, &cwd, Path::new(".")).unwrap_or_default();
+    for (path, at) in db::requests(&conn)? {
+        let shown = crate::paths::relative_key(&here, &path);
+        if long {
+            println!("{}\t{shown}", at / 1_000_000_000);
+        } else {
+            println!("{shown}");
+        }
     }
     Ok(())
 }

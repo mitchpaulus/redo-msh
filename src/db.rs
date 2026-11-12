@@ -362,6 +362,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (waiter, dep, owner)
         );
 
+        -- Targets a user asked for by name on a top-level `redo` command
+        -- line (not dependencies, not a `redo` run from inside a do-file),
+        -- with when each was last asked for. Recorded before the build, so
+        -- failed attempts count too. This is the only record of names that
+        -- exist solely as a request — nothing on disk says what a
+        -- `default*.do` is usually asked to build — and it feeds shell
+        -- completion (`redo-msh requested`).
+        CREATE TABLE IF NOT EXISTS requests (
+            path         TEXT PRIMARY KEY COLLATE NOCASE, -- root-relative, '/' separators
+            requested_at INTEGER NOT NULL                 -- unix nanos of the latest request
+        );
+
         CREATE INDEX IF NOT EXISTS waits_by_owner ON waits(owner);
         CREATE INDEX IF NOT EXISTS waits_by_dep ON waits(dep);
         "#,
@@ -399,6 +411,32 @@ fn migrate_additive(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Note that the user asked for `targets` (root-relative) at `now` (unix
+/// nanos). The latest spelling's case wins, like every other path column.
+pub fn record_requests(conn: &Connection, targets: &[String], now: i64) -> Result<()> {
+    write_txn(conn, |tx| {
+        let mut stmt = tx.prepare(
+            "INSERT INTO requests(path, requested_at) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET path = excluded.path,
+                                             requested_at = excluded.requested_at",
+        )?;
+        for t in targets {
+            stmt.execute(params![t, now])?;
+        }
+        Ok(())
+    })
+}
+
+/// Every requested target with its latest request time, most recent first.
+pub fn requests(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT path, requested_at FROM requests ORDER BY requested_at DESC, path")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 /// The session-wide overwrite decision ("all" / "quit" at a prompt), shared
