@@ -14,9 +14,12 @@ pub mod fsguard;
 pub mod jobserver;
 pub mod lock;
 pub mod logs;
+pub mod parallel;
 pub mod paths;
 pub mod root;
 pub mod stamp;
+pub mod proctree;
+pub mod waits;
 pub mod watch;
 pub mod winjob;
 

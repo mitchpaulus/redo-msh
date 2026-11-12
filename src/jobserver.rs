@@ -262,7 +262,13 @@ fn open_sem(name: &str) -> Option<Jobserver> {
     use windows_sys::Win32::System::Threading::OpenSemaphoreW;
     const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
     const SYNCHRONIZE: u32 = 0x0010_0000;
-    let wname = wide(name);
+    // Some Windows shells rewrite backslashes in inherited environment
+    // values (busybox-w32's `sh` turns `Local\x` into `Local/x`), which made
+    // every redo process below such a do-file fall back to a private,
+    // serial jobserver. A semaphore name contains no other separator, so
+    // map the namespace separator back.
+    let name = name.replace('/', "\\");
+    let wname = wide(&name);
     // SAFETY: opening an existing named semaphore created by the top-level.
     let h = unsafe { OpenSemaphoreW(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, 0, wname.as_ptr()) };
     if h.is_null() {
