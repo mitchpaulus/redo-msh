@@ -231,10 +231,17 @@ mod unix {
                 }
                 let mut sa: libc::sigaction = std::mem::zeroed();
                 sa.sa_sigaction = forward as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                // Hold all three signals back while handling one: a second
+                // signal landing mid-handler (a group-wide kill plus one
+                // passed on by `redo --watch`) would otherwise take its
+                // default action and kill us before every group below has
+                // been signalled. The disposition is reset on entry, so the
+                // closing raise() terminates us once the handler returns.
                 libc::sigemptyset(&mut sa.sa_mask);
-                // Reset to the default on entry, and do not block the signal
-                // while handling it, so the closing raise() terminates us.
-                sa.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+                for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    libc::sigaddset(&mut sa.sa_mask, s);
+                }
+                sa.sa_flags = libc::SA_RESETHAND;
                 libc::sigaction(sig, &sa, std::ptr::null_mut());
             }
         }

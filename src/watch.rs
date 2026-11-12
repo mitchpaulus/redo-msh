@@ -13,6 +13,11 @@
 //! hint. What decides is the database: an item is *dirty* when its content
 //! hash differs from the recorded edge, a recorded output is missing, or an
 //! ifcreate path now exists — so a touch or an identical rewrite does nothing.
+//! A built dependency is held to the same standard as a source: it is dirty
+//! when its content differs from the hash its parent recorded. That is what
+//! notices another redo run rebuilding part of the graph (`redo mid` leaves
+//! `all` stale) and a hand edit to an intermediate target, which the rebuild
+//! then refuses and reports.
 //!
 //! Retry guard: a build that fails, or refuses to overwrite a hand-edited
 //! output (watch mode never prompts; it sets `REDO_NO`), leaves its dirty
@@ -84,6 +89,15 @@ enum Check {
     },
     /// A built output redo recorded: dirty when it is missing.
     Output,
+    /// An edge to a built dependency: dirty when the dependency's content
+    /// differs from the hash its parent recorded. Our own builds rewrite
+    /// these files, so a change seen across one of our builds is not a
+    /// trigger (see `Watcher::changed`).
+    Built {
+        csum: Option<String>,
+        mtime: Option<i64>,
+        size: Option<i64>,
+    },
     /// An ifcreate path (or do-file candidate): dirty when it exists.
     Absent,
 }
@@ -108,9 +122,13 @@ type Snapshot = HashMap<String, Obs>;
 /// `redo --watch [targets...]`: build, then rebuild whenever a dependency
 /// changes, until interrupted.
 pub fn watch(targets: &[String], jobs: usize) -> Result<()> {
-    // Killing the watcher (Ctrl-C, taskkill) must take an in-flight build
-    // with it; Unix gets this from the terminal's process group.
+    // Killing the watcher must take an in-flight build with it. Windows:
+    // the kill-on-close job. Unix: Ctrl-C reaches the build through the
+    // terminal's process group, and a signal sent to the watcher alone is
+    // passed on (`forward`).
     crate::winjob::setup();
+    #[cfg(unix)]
+    forward::install();
     let cwd = std::env::current_dir()?;
     let root = Root::discover(&cwd)?;
     let default_target = ["all".to_string()];
@@ -153,7 +171,7 @@ pub fn watch(targets: &[String], jobs: usize) -> Result<()> {
         let since = stamp::now_nanos();
         let baseline = w.snapshot(&set);
 
-        let mut changed = w.changed(&set, &before, started);
+        let mut changed = w.changed(&set, &before, started, true);
         if changed.is_empty() {
             if ok {
                 eprintln!("redo-msh: watch: build succeeded");
@@ -194,6 +212,7 @@ impl Watcher {
             let tag = match &item.check {
                 Check::Content { csum, .. } => format!("c:{}", csum.as_deref().unwrap_or("")),
                 Check::Output => "o".to_string(),
+                Check::Built { csum, .. } => format!("b:{}", csum.as_deref().unwrap_or("")),
                 Check::Absent => "a".to_string(),
             };
             if item_keys.insert((item.path.to_ascii_lowercase(), tag)) {
@@ -241,7 +260,11 @@ impl Watcher {
                     }),
                     DepKind::IfChange | DepKind::DoFile => {
                         if is_target(&conn, &dep)? {
-                            queue.push_back(dep);
+                            queue.push_back(dep.clone());
+                            add(Item {
+                                path: dep,
+                                check: Check::Built { csum, mtime, size },
+                            });
                         } else {
                             add(Item {
                                 path: dep,
@@ -278,7 +301,7 @@ impl Watcher {
         match &item.check {
             Check::Absent => obs.exists,
             Check::Output => !obs.exists,
-            Check::Content { csum, mtime, size } => {
+            Check::Content { csum, mtime, size } | Check::Built { csum, mtime, size } => {
                 if !obs.exists {
                     return csum.is_some();
                 }
@@ -311,9 +334,26 @@ impl Watcher {
     /// item missing from the baseline counts as changed only if its file was
     /// written after `since` (newly discovered dependencies were stamped
     /// during the build, so they are dirty only if edited after that).
-    fn changed(&mut self, set: &WatchSet, baseline: &Snapshot, since: i64) -> Vec<String> {
+    ///
+    /// `own_build`: the interval spans one of our own builds. That build
+    /// rewrote built dependencies itself, so `Check::Built` items are not
+    /// triggers then. A failed build can leave a parent it never reached
+    /// with a stale edge to a dependency it did rebuild; counting that as a
+    /// change would rebuild at once, and again each time the dependency's
+    /// content came out different. It is left for the next edit instead,
+    /// like any other dirty state a build could not resolve.
+    fn changed(
+        &mut self,
+        set: &WatchSet,
+        baseline: &Snapshot,
+        since: i64,
+        own_build: bool,
+    ) -> Vec<String> {
         let mut out = Vec::new();
         for item in &set.items {
+            if own_build && matches!(item.check, Check::Built { .. }) {
+                continue;
+            }
             let obs = observe(&self.abs(&item.path));
             let moved = match baseline.get(&item.path.to_ascii_lowercase()) {
                 Some(b) => *b != obs,
@@ -357,7 +397,7 @@ impl Watcher {
             // as in `watch`.
             let next_since = stamp::now_nanos();
             let next = self.snapshot(set);
-            let changed = self.changed(set, &baseline, since);
+            let changed = self.changed(set, &baseline, since, false);
             if !changed.is_empty() {
                 return Ok(changed);
             }
@@ -405,9 +445,15 @@ fn run_build(exe: &Path, jobs: usize, targets: &[String]) -> Result<bool> {
     if std::env::var("REDO_YES").as_deref() != Ok("1") {
         cmd.env("REDO_NO", "1");
     }
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("running {}", exe.display()))?;
+    #[cfg(unix)]
+    forward::set_child(child.id());
+    let status = child.wait();
+    #[cfg(unix)]
+    forward::set_child(0);
+    let status = status.with_context(|| format!("waiting for {}", exe.display()))?;
     Ok(status.success())
 }
 
@@ -483,4 +529,85 @@ fn output_recorded(conn: &Connection, target: &str) -> Result<bool> {
         )
         .optional()?;
     Ok(matches!(csum, Some(Some(_))))
+}
+
+/// Passing a signal sent to the watcher alone on to the build it is running.
+///
+/// The build stays in the watcher's process group (it must share the
+/// terminal's foreground group: Ctrl-C, and do-files that read `/dev/tty`),
+/// so a terminal signal reaches it without help. `kill <watcher>` — a
+/// supervisor, an editor's task runner — does not, and the build would run
+/// on as an orphan.
+///
+/// Only a signal sent by a process (`si_code == SI_USER`) is passed on; one
+/// the terminal generated has already been delivered to the whole group.
+/// If the watcher leads its process group, as it does when started from an
+/// interactive shell, the group is the build tree and all of it is
+/// signalled: do-files, nested redo processes, which in turn signal the
+/// groups of their speculative do-files (`proctree.rs`). Otherwise the group
+/// also holds whatever started the watcher, so only the build's top-level
+/// redo is signalled — what signalling a plain `redo` does.
+#[cfg(unix)]
+mod forward {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    static CHILD: AtomicI32 = AtomicI32::new(0);
+    static LEADER: AtomicBool = AtomicBool::new(false);
+
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    /// The pid of the build in flight; 0 when there is none.
+    pub fn set_child(pid: u32) {
+        CHILD.store(pid as i32, Ordering::Release);
+    }
+
+    /// Install the handler for SIGINT, SIGTERM and SIGHUP. Signals ignored
+    /// when we started (`nohup`, a background job of a non-interactive
+    /// shell) stay ignored.
+    pub fn install() {
+        // SAFETY: plain libc calls; the handler performs only
+        // async-signal-safe operations (atomic loads, kill, raise).
+        unsafe {
+            LEADER.store(libc::getpgrp() == libc::getpid(), Ordering::Release);
+            for sig in SIGNALS {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0
+                    || old.sa_sigaction == libc::SIG_IGN
+                {
+                    continue;
+                }
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = on_signal
+                    as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+                    as libc::sighandler_t;
+                // Hold all three back while handling one. The disposition is
+                // reset on entry, so the closing raise() (and our own copy of
+                // a group-wide kill) terminates us once the handler returns.
+                libc::sigemptyset(&mut sa.sa_mask);
+                for s in SIGNALS {
+                    libc::sigaddset(&mut sa.sa_mask, s);
+                }
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+                libc::sigaction(sig, &sa, std::ptr::null_mut());
+            }
+        }
+    }
+
+    extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        // SAFETY: only async-signal-safe calls; `info` is valid under
+        // SA_SIGINFO.
+        unsafe {
+            if !info.is_null() && (*info).si_code == libc::SI_USER {
+                if LEADER.load(Ordering::Acquire) {
+                    libc::kill(0, sig);
+                } else {
+                    let child = CHILD.load(Ordering::Acquire);
+                    if child > 0 {
+                        libc::kill(child, sig);
+                    }
+                }
+            }
+            libc::raise(sig);
+        }
+    }
 }

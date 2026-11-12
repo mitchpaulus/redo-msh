@@ -1811,14 +1811,17 @@ struct Watching {
 
 impl Watching {
     fn start(p: &Project, args: &[&str]) -> Watching {
+        Watching::start_with(p, args, |_| {})
+    }
+
+    fn start_with(p: &Project, args: &[&str], setup: impl FnOnce(&mut Command)) -> Watching {
         use std::io::BufRead;
-        let mut child = p
-            .redo_cmd(args)
-            .env("REDO_WATCH_INTERVAL_MS", "50")
+        let mut cmd = p.redo_cmd(args);
+        cmd.env("REDO_WATCH_INTERVAL_MS", "50")
             .env_remove("REDO_YES")
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn redo-msh --watch");
+            .stderr(std::process::Stdio::piped());
+        setup(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn redo-msh --watch");
         let err = child.stderr.take().expect("stderr piped");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -2061,6 +2064,103 @@ fn watch_parallel_refuses_deep_hand_edit_without_looping() {
     w.wait_for(WATCHING, 4);
     assert_eq!(p.read("mid"), "A2\nB2\n");
     assert_eq!(w.count("build succeeded"), 3, "{}", w.seen.join("\n"));
+}
+
+const TOP_MID_DOS: [(&str, &str); 2] = [
+    ("top.do", "redo-ifchange mid\ncat mid > \"$3\"\n"),
+    ("mid.do", "redo-ifchange a.src\necho mid >> build.log\ncat a.src > \"$3\"\n"),
+];
+
+/// Another redo run that rebuilds part of the watched graph (`redo mid`)
+/// leaves the watched target stale: its recorded edge to `mid` no longer
+/// matches `mid`. The watcher must notice and rebuild, even though every
+/// source edge is up to date again by then.
+#[test]
+fn watch_rebuilds_after_external_partial_build() {
+    let Some(p) = sh_project() else { return };
+    for (name, body) in TOP_MID_DOS {
+        p.write(name, body);
+    }
+    p.write("a.src", "v1\n");
+    let mut w = Watching::start(&p, &["--watch", "top"]);
+    w.wait_for(WATCHING, 1);
+    assert_eq!(p.read("top"), "v1\n");
+
+    p.write("a.src", "v2\n");
+    let out = p.redo(&["mid"]);
+    assert!(out.status.success(), "external build failed: {}", stderr(&out));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while p.read("top") != "v2\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "top stayed stale after an external build of mid:\n{}",
+            w.seen.join("\n")
+        );
+        w.idle_for(50);
+    }
+    // Settles: the external build's output is not a reason to keep rebuilding.
+    let waits = w.count(WATCHING);
+    w.wait_for(WATCHING, waits.max(2));
+    w.idle_for(500);
+    let builds = w.count("rebuilding");
+    w.idle_for(500);
+    assert_eq!(w.count("rebuilding"), builds, "{}", w.seen.join("\n"));
+    assert!(p.lines("build.log") <= 3, "mid rebuilt too often:\n{}", w.seen.join("\n"));
+}
+
+/// A hand edit to an intermediate target, with no source change, is noticed:
+/// the rebuild refuses it and says so, once, and removing the file recovers.
+#[test]
+fn watch_reports_hand_edited_intermediate_target() {
+    let Some(p) = sh_project() else { return };
+    for (name, body) in TOP_MID_DOS {
+        p.write(name, body);
+    }
+    p.write("a.src", "v1\n");
+    let mut w = Watching::start(&p, &["--watch", "top"]);
+    w.wait_for(WATCHING, 1);
+
+    let mid = p.dir.join("mid");
+    make_writable(&mid);
+    std::fs::write(&mid, "HAND\n").unwrap();
+    w.wait_for("Refusing to overwrite", 1);
+    w.wait_for(WATCHING, 2);
+    w.idle_for(500);
+    assert_eq!(w.count("rebuilding"), 1, "refusal must not loop:\n{}", w.seen.join("\n"));
+    assert_eq!(p.read("mid"), "HAND\n");
+    assert_eq!(p.read("top"), "v1\n");
+
+    std::fs::remove_file(&mid).unwrap();
+    w.wait_for("build succeeded", 2);
+    assert_eq!(p.read("mid"), "v1\n");
+}
+
+/// A signal sent to the watcher alone (not Ctrl-C, which the terminal gives
+/// to the whole foreground group) must take the build in flight with it.
+/// The watcher leads its own process group here, as under an interactive
+/// shell.
+#[cfg(unix)]
+#[test]
+fn signal_to_watcher_alone_stops_the_build() {
+    let Some(p) = sh_project() else { return };
+    p.write("all.do", "echo started > started.txt\nsleep 3\necho leaked > leak.txt\n");
+    let mut w = Watching::start_with(&p, &["--watch"], |cmd| {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !p.exists("started.txt") {
+        assert!(std::time::Instant::now() < deadline, "the build never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: signalling the one process we spawned.
+    unsafe {
+        libc::kill(w.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(w.exit().signal(), Some(libc::SIGTERM));
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(!p.exists("leak.txt"), "the build outlived the watcher");
 }
 
 /// A run that waited for a target's lock may skip it because another run
