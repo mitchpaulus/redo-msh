@@ -49,6 +49,11 @@ const SETTLE: Duration = Duration::from_millis(100);
 /// ...but never longer than this.
 const SETTLE_MAX: Duration = Duration::from_secs(2);
 
+/// A sequential stat pass slower than this switches polling to
+/// `STAT_THREADS` threads (see `Watcher::note_pass`).
+const SLOW_PASS: Duration = Duration::from_millis(50);
+const STAT_THREADS: usize = 32;
+
 /// An item first seen after a build counts as changed during that build if
 /// its mtime is at most this much older than the build's start (filesystem
 /// timestamps can lag the clock slightly).
@@ -104,20 +109,51 @@ enum Check {
 
 #[derive(Debug, Clone)]
 struct Item {
-    /// Root-relative path, `/`-separated (the database key).
-    path: String,
+    /// Index into `WatchSet::paths`.
+    path: u32,
     check: Check,
 }
 
+/// One file to stat. Several items may share it (a built dependency is
+/// both an `Output` and a `Built` edge), and it is stat'ed once for all.
+struct WatchPath {
+    /// Root-relative path, `/`-separated (the database key).
+    rel: String,
+    /// `rel` joined to the root, built once rather than at every poll.
+    abs: PathBuf,
+}
+
 /// Everything one watch cycle polls, derived from the database.
+#[derive(Default)]
 struct WatchSet {
     items: Vec<Item>,
+    paths: Vec<WatchPath>,
+    /// Case-folded path (the database's NOCASE identity) -> index in `paths`.
+    index: HashMap<String, u32>,
     /// Targets visited while collecting `items`.
     nodes: Vec<String>,
 }
 
-/// Observations keyed by case-folded path (the database's NOCASE identity).
-type Snapshot = HashMap<String, Obs>;
+impl WatchSet {
+    fn intern(&mut self, root: &Path, rel: &str) -> u32 {
+        if let Some(&i) = self.index.get(&rel.to_ascii_lowercase()) {
+            return i;
+        }
+        let i = self.paths.len() as u32;
+        self.paths.push(WatchPath { rel: rel.to_string(), abs: root.join(rel) });
+        self.index.insert(rel.to_ascii_lowercase(), i);
+        i
+    }
+
+    /// The observation `snap` (taken of this set) holds for `rel`, a path
+    /// that may belong to another set.
+    fn lookup(&self, snap: &Snapshot, rel_folded: &str) -> Option<Obs> {
+        self.index.get(rel_folded).map(|&i| snap[i as usize])
+    }
+}
+
+/// Observations of a `WatchSet`'s paths, in `WatchSet::paths` order.
+type Snapshot = Vec<Obs>;
 
 /// `redo --watch [targets...]`: build, then rebuild whenever a dependency
 /// changes, until interrupted.
@@ -146,6 +182,7 @@ pub fn watch(targets: &[String], jobs: usize) -> Result<()> {
     let mut w = Watcher {
         root,
         hashes: HashMap::new(),
+        stat_threads: std::cell::Cell::new(1),
     };
     let mut roots = requested.clone();
     let mut set = w.load(&roots, &requested)?;
@@ -165,13 +202,13 @@ pub fn watch(targets: &[String], jobs: usize) -> Result<()> {
             roots.extend(set.nodes.iter().cloned());
             roots.extend(w.uncommitted()?);
         }
-        set = w.load(&roots, &requested)?;
-        // Taken before the check below, so an edit landing between the two
-        // is caught by one or the other.
+        let old = std::mem::replace(&mut set, w.load(&roots, &requested)?);
+        // The check below judges this same observation, so an edit landing
+        // after it differs from the baseline at the next poll.
         let since = stamp::now_nanos();
         let baseline = w.snapshot(&set);
 
-        let mut changed = w.changed(&set, &before, started, true);
+        let mut changed = w.changed(&set, &baseline, &old, &before, started, true);
         if changed.is_empty() {
             if ok {
                 eprintln!("redo-msh: watch: build succeeded");
@@ -194,6 +231,8 @@ struct Watcher {
     /// Content hashes by path, valid while the stat is unchanged, so a
     /// touched-but-identical file is hashed once rather than every poll.
     hashes: HashMap<String, (Obs, Option<String>)>,
+    /// How many threads stat the watch set; raised by `note_pass`.
+    stat_threads: std::cell::Cell<usize>,
 }
 
 impl Watcher {
@@ -206,19 +245,27 @@ impl Watcher {
     /// never recorded (a failed build may stop before reaching it).
     fn load(&self, roots: &[String], requested: &[String]) -> Result<WatchSet> {
         let conn = self.root.open_db()?;
-        let mut items = Vec::new();
-        let mut item_keys = HashSet::new();
-        let mut add = |item: Item| {
-            let tag = match &item.check {
-                Check::Content { csum, .. } => format!("c:{}", csum.as_deref().unwrap_or("")),
-                Check::Output => "o".to_string(),
-                Check::Built { csum, .. } => format!("b:{}", csum.as_deref().unwrap_or("")),
-                Check::Absent => "a".to_string(),
+        // One read transaction: a consistent view of the graph, and one lock
+        // round-trip instead of one per query.
+        let txn = conn.unchecked_transaction()?;
+        let mut set = WatchSet::default();
+        let mut item_keys: HashSet<(u32, u8, Option<String>)> = HashSet::new();
+        let root = self.root.dir.clone();
+        let mut add = |set: &mut WatchSet, rel: &str, check: Check| {
+            let path = set.intern(&root, rel);
+            let key = match &check {
+                Check::Content { csum, .. } => (path, 0, csum.clone()),
+                Check::Output => (path, 1, None),
+                Check::Built { csum, .. } => (path, 2, csum.clone()),
+                Check::Absent => (path, 3, None),
             };
-            if item_keys.insert((item.path.to_ascii_lowercase(), tag)) {
-                items.push(item);
+            if item_keys.insert(key) {
+                set.items.push(Item { path, check });
             }
         };
+        // A dependency shared by many targets (a common header) is looked up
+        // once.
+        let mut target_memo: HashMap<String, bool> = HashMap::new();
 
         // A requested target redo has no record of has no edges to watch, so
         // watch its do-file and the more specific candidates instead. A
@@ -230,11 +277,10 @@ impl Watcher {
             }
             let (found, candidates) = crate::dofile::find(&self.root, t);
             for path in candidates.into_iter().chain(found.map(|d| d.dofile_rel)) {
-                add(Item { path, check: Check::Absent });
+                add(&mut set, &path, Check::Absent);
             }
         }
 
-        let mut nodes = Vec::new();
         let mut seen = HashSet::new();
         let mut queue: VecDeque<String> = roots.iter().cloned().collect();
         while let Some(target) = queue.pop_front() {
@@ -242,10 +288,7 @@ impl Watcher {
                 continue;
             }
             if output_recorded(&conn, &target)? {
-                add(Item {
-                    path: target.clone(),
-                    check: Check::Output,
-                });
+                add(&mut set, &target, Check::Output);
             }
             for (kind, dep, csum, mtime, size) in edges(&conn, &target)? {
                 let Some(dep) = dep else { continue };
@@ -254,29 +297,30 @@ impl Watcher {
                     // when something else triggers a build, and uncommitted
                     // ones are retried by an edit to what they depend on.
                     DepKind::Always | DepKind::Uncommitted => {}
-                    DepKind::IfCreate => add(Item {
-                        path: dep,
-                        check: Check::Absent,
-                    }),
+                    DepKind::IfCreate => add(&mut set, &dep, Check::Absent),
                     DepKind::IfChange | DepKind::DoFile => {
-                        if is_target(&conn, &dep)? {
-                            queue.push_back(dep.clone());
-                            add(Item {
-                                path: dep,
-                                check: Check::Built { csum, mtime, size },
-                            });
+                        let folded = dep.to_ascii_lowercase();
+                        let built = match target_memo.get(&folded) {
+                            Some(&b) => b,
+                            None => {
+                                let b = is_target(&conn, &dep)?;
+                                target_memo.insert(folded, b);
+                                b
+                            }
+                        };
+                        if built {
+                            add(&mut set, &dep, Check::Built { csum, mtime, size });
+                            queue.push_back(dep);
                         } else {
-                            add(Item {
-                                path: dep,
-                                check: Check::Content { csum, mtime, size },
-                            });
+                            add(&mut set, &dep, Check::Content { csum, mtime, size });
                         }
                     }
                 }
             }
-            nodes.push(target);
+            set.nodes.push(target);
         }
-        Ok(WatchSet { items, nodes })
+        drop(txn);
+        Ok(set)
     }
 
     /// Targets whose last build failed or crashed before committing.
@@ -290,14 +334,56 @@ impl Watcher {
     }
 
     fn snapshot(&self, set: &WatchSet) -> Snapshot {
-        set.items
-            .iter()
-            .map(|it| (it.path.to_ascii_lowercase(), observe(&self.abs(&it.path))))
-            .collect()
+        let threads = self.stat_threads.get();
+        if threads <= 1 || set.paths.len() < threads * 8 {
+            let t = Instant::now();
+            let snap = set.paths.iter().map(|p| observe(&p.abs)).collect();
+            self.note_pass(t.elapsed());
+            return snap;
+        }
+        let chunk = set.paths.len().div_ceil(threads);
+        std::thread::scope(|sc| {
+            let workers: Vec<_> = set
+                .paths
+                .chunks(chunk)
+                .map(|c| sc.spawn(move || c.iter().map(|p| observe(&p.abs)).collect::<Vec<_>>()))
+                .collect();
+            let mut snap = Vec::with_capacity(set.paths.len());
+            for w in workers {
+                snap.extend(w.join().expect("stat worker panicked"));
+            }
+            snap
+        })
+    }
+
+    /// Whether any path's stat differs from `baseline` (a snapshot of this
+    /// same set). The idle poll: on a fast filesystem it allocates nothing
+    /// and stops at the first change.
+    fn moved(&self, set: &WatchSet, baseline: &Snapshot) -> bool {
+        if self.stat_threads.get() > 1 {
+            return self.snapshot(set) != *baseline;
+        }
+        let t = Instant::now();
+        let moved = set.paths.iter().zip(baseline).any(|(p, b)| observe(&p.abs) != *b);
+        if !moved {
+            self.note_pass(t.elapsed());
+        }
+        moved
+    }
+
+    /// A full sequential pass over the watch set took `took`. Where a stat
+    /// is a round-trip to another machine or to the Windows host (WSL
+    /// drvfs: about a millisecond each), one pass can outlast the polling
+    /// period many times over; the wait is latency, not CPU, so stat from
+    /// several threads from then on.
+    fn note_pass(&self, took: Duration) {
+        if took > SLOW_PASS {
+            self.stat_threads.set(STAT_THREADS);
+        }
     }
 
     /// Whether `item` disagrees with what the database recorded.
-    fn is_dirty(&mut self, item: &Item, obs: Obs) -> bool {
+    fn is_dirty(&mut self, set: &WatchSet, item: &Item, obs: Obs) -> bool {
         match &item.check {
             Check::Absent => obs.exists,
             Check::Output => !obs.exists,
@@ -308,7 +394,7 @@ impl Watcher {
                 if *mtime == Some(obs.mtime) && *size == Some(obs.size) {
                     return false;
                 }
-                self.current_csum(&item.path, obs).as_deref() != csum.as_deref()
+                self.current_csum(&set.paths[item.path as usize].rel, obs).as_deref() != csum.as_deref()
             }
         }
     }
@@ -342,25 +428,42 @@ impl Watcher {
     /// change would rebuild at once, and again each time the dependency's
     /// content came out different. It is left for the next edit instead,
     /// like any other dirty state a build could not resolve.
+    ///
+    /// `now` is the current snapshot of `set`; `baseline` is a snapshot of
+    /// `base_set`, which may be an earlier load.
     fn changed(
         &mut self,
         set: &WatchSet,
+        now: &Snapshot,
+        base_set: &WatchSet,
         baseline: &Snapshot,
         since: i64,
         own_build: bool,
     ) -> Vec<String> {
         let mut out = Vec::new();
+        let mut reported = vec![false; set.paths.len()];
+        let same_set = std::ptr::eq(set, base_set);
         for item in &set.items {
             if own_build && matches!(item.check, Check::Built { .. }) {
                 continue;
             }
-            let obs = observe(&self.abs(&item.path));
-            let moved = match baseline.get(&item.path.to_ascii_lowercase()) {
-                Some(b) => *b != obs,
+            let i = item.path as usize;
+            if reported[i] {
+                continue;
+            }
+            let obs = now[i];
+            let before = if same_set {
+                Some(baseline[i])
+            } else {
+                base_set.lookup(baseline, &set.paths[i].rel.to_ascii_lowercase())
+            };
+            let moved = match before {
+                Some(b) => b != obs,
                 None => obs.exists && obs.mtime >= since - MTIME_SLACK_NANOS,
             };
-            if moved && self.is_dirty(item, obs) && !out.contains(&item.path) {
-                out.push(item.path.clone());
+            if moved && self.is_dirty(set, item, obs) {
+                reported[i] = true;
+                out.push(set.paths[i].rel.clone());
             }
         }
         out
@@ -387,17 +490,17 @@ impl Watcher {
         loop {
             loop {
                 std::thread::sleep(interval);
-                if self.snapshot(set) != baseline {
+                if self.moved(set, &baseline) {
                     break;
                 }
             }
             self.settle(set);
-            *set = self.load(roots, requested)?;
-            // The next baseline, taken before the check for the same reason
-            // as in `watch`.
+            let old = std::mem::replace(set, self.load(roots, requested)?);
+            // The next baseline, which is also what the check judges, for
+            // the same reason as in `watch`.
             let next_since = stamp::now_nanos();
             let next = self.snapshot(set);
-            let changed = self.changed(set, &baseline, since, false);
+            let changed = self.changed(set, &next, &old, &baseline, since, false);
             if !changed.is_empty() {
                 return Ok(changed);
             }
@@ -486,7 +589,7 @@ type Edge = (DepKind, Option<String>, Option<String>, Option<i64>, Option<i64>);
 
 fn edges(conn: &Connection, target: &str) -> Result<Vec<Edge>> {
     let mut stmt =
-        conn.prepare("SELECT kind, dep, csum, mtime, size FROM deps WHERE target = ?1")?;
+        conn.prepare_cached("SELECT kind, dep, csum, mtime, size FROM deps WHERE target = ?1")?;
     let rows = stmt.query_map(params![target], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -510,24 +613,19 @@ fn edges(conn: &Connection, target: &str) -> Result<Vec<Edge>> {
 /// was at least started (a first build that failed has edges but no do-file
 /// recorded in `files` yet).
 fn is_target(conn: &Connection, path: &str) -> Result<bool> {
-    Ok(conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND dofile IS NOT NULL)
              OR EXISTS(SELECT 1 FROM deps WHERE target = ?1)",
-        params![path],
-        |r| r.get(0),
-    )?)
+    )?;
+    Ok(stmt.query_row(params![path], |r| r.get(0))?)
 }
 
 /// Whether `target` is a generated target with a recorded output file
 /// (phony targets record none).
 fn output_recorded(conn: &Connection, target: &str) -> Result<bool> {
-    let csum: Option<Option<String>> = conn
-        .query_row(
-            "SELECT csum FROM files WHERE path = ?1 AND dofile IS NOT NULL",
-            params![target],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let mut stmt =
+        conn.prepare_cached("SELECT csum FROM files WHERE path = ?1 AND dofile IS NOT NULL")?;
+    let csum: Option<Option<String>> = stmt.query_row(params![target], |r| r.get(0)).optional()?;
     Ok(matches!(csum, Some(Some(_))))
 }
 
