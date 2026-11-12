@@ -776,17 +776,28 @@ fn requested_records_command_line_targets() {
     // Asking again moves a target to the front rather than repeating it.
     assert!(p.redo(&["ONE.gen"]).status.success());
 
+    // By default only what a do-file can build is listed; `-a` keeps the rest.
     let listed = p.stdout_of(&["requested"]);
     let lines: Vec<&str> = listed.lines().collect();
-    assert_eq!(lines, ["ONE.gen", "nope.txt", "sub/top.txt"], "requested: {listed:?}");
+    assert_eq!(lines, ["ONE.gen", "sub/top.txt"], "requested: {listed:?}");
+    let listed = p.stdout_of(&["requested", "-a"]);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines, ["ONE.gen", "nope.txt", "sub/top.txt"], "requested -a: {listed:?}");
 
     // From a subdirectory, names are what you would type there.
-    let out = p.redo_cmd(&["requested", "-l"]).current_dir(p.dir.join("sub")).output().unwrap();
+    let out =
+        p.redo_cmd(&["requested", "-a", "-l"]).current_dir(p.dir.join("sub")).output().unwrap();
     let long = String::from_utf8_lossy(&out.stdout).into_owned();
     let rows: Vec<(&str, &str)> = long.lines().filter_map(|l| l.split_once('\t')).collect();
     let names: Vec<&str> = rows.iter().map(|r| r.1).collect();
     assert_eq!(names, ["../ONE.gen", "../nope.txt", "top.txt"], "requested -l: {long:?}");
     assert!(rows.iter().all(|r| r.0.parse::<u64>().is_ok_and(|s| s > 1_600_000_000)));
+
+    // A target whose do-file goes away drops out of the default listing.
+    std::fs::remove_file(p.dir.join("default.gen.do")).unwrap();
+    let listed = p.stdout_of(&["requested"]);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines, ["sub/top.txt"], "requested after removing do-file: {listed:?}");
 }
 
 // ---- additional ported scenarios (apenwarr t/) -----------------------------

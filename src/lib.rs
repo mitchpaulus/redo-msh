@@ -320,10 +320,13 @@ COMMANDS:
     redo-msh root [dir]           initialize a project root (.redom/) here or at dir
     redo-msh sources              list known source files
     redo-msh targets              list known generated targets
-    redo-msh requested [-l]       list targets asked for on a redo command
-                                  line, most recent first, relative to the
-                                  current directory (for shell completion);
-                                  -l adds the unix time of the last request
+    redo-msh requested [-a] [-l]  list targets asked for on a redo command
+                                  line that a .do file can still build, most
+                                  recent first, relative to the current
+                                  directory (for shell completion); -a lists
+                                  every request, even typos and targets whose
+                                  .do file is gone; -l adds the unix time of
+                                  the last request
     redo-msh ood                  list out-of-date targets (without building)
     redo-msh tree [targets...]    print the dependency tree recorded by the
                                   last run, with per-node parallel width

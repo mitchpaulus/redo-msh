@@ -2138,15 +2138,24 @@ pub fn cmd_targets() -> Result<()> {
     Ok(())
 }
 
-/// `redo-msh requested [-l]`: list the targets users have asked `redo` for by
-/// name, most recently requested first, as paths relative to the current
-/// directory — ready to hand to a shell's completion. `-l` / `--long`
-/// prefixes each with the unix time (seconds) of its latest request and a tab.
+/// `redo-msh requested [-a] [-l]`: list the targets users have asked `redo`
+/// for by name, most recently requested first, as paths relative to the
+/// current directory — ready to hand to a shell's completion. Only requests
+/// that could be built right now (a do-file is found for them) are listed, so
+/// typos and targets whose do-file has since gone stay out of the way;
+/// `-a` / `--all` lists every recorded request. `-l` / `--long` prefixes each
+/// with the unix time (seconds) of its latest request and a tab.
 pub fn cmd_requested(args: &[String]) -> Result<()> {
     let mut long = false;
+    let mut all = false;
     for a in args {
         match a.as_str() {
             "-l" | "--long" => long = true,
+            "-a" | "--all" => all = true,
+            "-al" | "-la" => {
+                long = true;
+                all = true;
+            }
             other => bail!("requested: unknown argument {other:?}"),
         }
     }
@@ -2154,6 +2163,9 @@ pub fn cmd_requested(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let here = crate::paths::normalize(&root.dir, &cwd, Path::new(".")).unwrap_or_default();
     for (path, at) in db::requests(&conn)? {
+        if !all && crate::dofile::find(&root, &path).0.is_none() {
+            continue;
+        }
         let shown = crate::paths::relative_key(&here, &path);
         if long {
             println!("{}\t{shown}", at / 1_000_000_000);
