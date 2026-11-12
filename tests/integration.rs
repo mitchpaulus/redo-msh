@@ -1794,6 +1794,375 @@ fn concurrent_runs_build_shared_dependency_once() {
     }
 }
 
+// ---- watch mode -------------------------------------------------------------
+
+/// Printed by the watcher each time it settles into waiting for changes.
+const WATCHING: &str = "redo-msh: watch: watching";
+
+/// A running `redo-msh --watch`, its stderr collected on a thread so a test can
+/// wait for progress lines. Killed on drop; tests drop it only while it is
+/// waiting for changes, so no build is cut short (a killed build would leave
+/// a stray do-file holding locks).
+struct Watching {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl Watching {
+    fn start(p: &Project, args: &[&str]) -> Watching {
+        Watching::start_with(p, args, |_| {})
+    }
+
+    fn start_with(p: &Project, args: &[&str], setup: impl FnOnce(&mut Command)) -> Watching {
+        use std::io::BufRead;
+        let mut cmd = p.redo_cmd(args);
+        cmd.env("REDO_WATCH_INTERVAL_MS", "50")
+            .env_remove("REDO_YES")
+            .stderr(std::process::Stdio::piped());
+        setup(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn redo-msh --watch");
+        let err = child.stderr.take().expect("stderr piped");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(err).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Watching {
+            child,
+            lines: rx,
+            seen: Vec::new(),
+        }
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.seen.iter().filter(|l| l.contains(needle)).count()
+    }
+
+    /// Block until `n` stderr lines in total have contained `needle`.
+    fn wait_for(&mut self, needle: &str, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.count(needle) < n {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => self.seen.push(line),
+                Err(_) => panic!(
+                    "timed out waiting for {n}x {needle:?}; stderr so far:\n{}",
+                    self.seen.join("\n")
+                ),
+            }
+        }
+    }
+
+    /// Block until the watcher exits on its own; return its status, with all
+    /// of its stderr collected.
+    fn exit(&mut self) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("watcher did not exit; stderr so far:\n{}", self.seen.join("\n"));
+            }
+            self.idle_for(50);
+        };
+        // The reader thread ends at EOF, dropping its sender.
+        while let Ok(line) = self.lines.recv_timeout(std::time::Duration::from_secs(5)) {
+            self.seen.push(line);
+        }
+        status
+    }
+
+    /// Collect whatever arrives for `ms` milliseconds, to show that nothing
+    /// else happens.
+    fn idle_for(&mut self, ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match self.lines.recv_timeout(left) {
+                Ok(line) => self.seen.push(line),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+const COPY_A_DO: &str = "args :2: out!\n\"r\\n\" \"out.log\" appendFile\n['redo-msh' 'ifchange' 'a.txt']!\n\"a.txt\" readFile @out writeFile\n";
+
+/// Editing a source rebuilds; rewriting it with identical bytes does not.
+#[test]
+fn watch_rebuilds_on_change_not_on_touch() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "alpha\n");
+    p.write("out.txt.do", COPY_A_DO);
+    let mut w = Watching::start(&p, &["--watch", "out.txt"]);
+    w.wait_for(WATCHING, 1);
+    assert_eq!(p.read("out.txt"), "alpha\n");
+
+    p.write("a.txt", "changed\n");
+    w.wait_for(WATCHING, 2);
+    assert_eq!(p.read("out.txt"), "changed\n");
+    assert_eq!(p.lines("out.log"), 2);
+
+    p.write("a.txt", "changed\n"); // identical content, new mtime
+    w.idle_for(500);
+    assert_eq!(p.lines("out.log"), 2, "identical content must not rebuild");
+    assert_eq!(w.count("rebuilding"), 1, "stderr:\n{}", w.seen.join("\n"));
+}
+
+/// A hand-edited output is refused, not prompted for, and the refusal does not
+/// rebuild in a loop. Deleting the output lets the next build replace it.
+#[test]
+fn watch_refuses_hand_edit_without_looping() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "v1\n");
+    p.write("out.txt.do", COPY_A_DO);
+    let mut w = Watching::start(&p, &["--watch", "out.txt"]);
+    w.wait_for(WATCHING, 1);
+
+    let out_path = p.dir.join("out.txt");
+    make_writable(&out_path);
+    std::fs::write(&out_path, "HAND\n").unwrap();
+    p.write("a.txt", "v2\n");
+    w.wait_for("Refusing to overwrite", 1);
+    w.wait_for(WATCHING, 2);
+    w.idle_for(500);
+    assert_eq!(w.count("rebuilding"), 1, "refusal must not loop:\n{}", w.seen.join("\n"));
+    assert_eq!(p.read("out.txt"), "HAND\n");
+
+    std::fs::remove_file(&out_path).unwrap();
+    w.wait_for(WATCHING, 3);
+    assert_eq!(p.read("out.txt"), "v2\n");
+}
+
+/// A failing dependency drops out of the recorded graph (its parent records
+/// no edge to it); the watcher must still see the edit that fixes it.
+#[test]
+fn watch_retries_failed_dependency_after_fix() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "a.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'b.txt']!\n\"b.txt\" readFile @out writeFile\n",
+    );
+    p.write("b.txt.do", "['redo-msh' 'ifchange' 'no-such-dep']!\n");
+    let mut w = Watching::start(&p, &["--watch", "a.txt"]);
+    w.wait_for("build failed", 1);
+    w.wait_for(WATCHING, 1);
+    assert!(!p.exists("a.txt"));
+
+    p.write("b.txt.do", "args :2: out!\n\"fixed\\n\" @out writeFile\n");
+    w.wait_for("build succeeded", 1);
+    assert_eq!(p.read("a.txt"), "fixed\n");
+}
+
+/// A target with no do-file fails at once instead of waiting for one; so
+/// does a source file, which has nothing to rebuild.
+#[test]
+fn watch_fails_without_dofile() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "alpha\n");
+    for args in [&["--watch"][..], &["--watch", "a.txt"], &["--watch", "nope"]] {
+        let mut w = Watching::start(&p, args);
+        assert!(!w.exit().success(), "{args:?}");
+        assert_eq!(w.count("no .do file found"), 1, "{args:?}:\n{}", w.seen.join("\n"));
+        assert_eq!(w.count(WATCHING), 0, "{args:?}:\n{}", w.seen.join("\n"));
+    }
+}
+
+/// Deleting a watched target's do-file ends the watch with an error.
+#[test]
+fn watch_stops_when_dofile_removed() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("all.do", "\"built\\n\" \"all.log\" appendFile\n");
+    let mut w = Watching::start(&p, &["--watch"]);
+    w.wait_for(WATCHING, 1);
+
+    std::fs::remove_file(p.dir.join("all.do")).unwrap();
+    assert!(!w.exit().success());
+    assert_eq!(w.count("no .do file found"), 1, "{}", w.seen.join("\n"));
+    assert_eq!(p.lines("all.log"), 1);
+}
+
+#[test]
+fn watch_rejects_non_build_commands() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    let out = p.redo(&["--watch", "ood"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--watch applies to building targets"), "{}", stderr(&out));
+}
+
+/// Watch mode over the speculative parallel engine (`-j4`). Each rebuild
+/// re-checks `mid` from its recorded edges, so the leaves are activated
+/// speculatively. A hand-edited leaf must be refused exactly as at `-j1`:
+/// the speculative attempt aborts quietly, the real demand reports the
+/// refusal, and the failed build neither loops nor loses the watch on the
+/// leaf, so removing the hand edit recovers.
+#[test]
+fn watch_parallel_refuses_deep_hand_edit_without_looping() {
+    let Some(p) = sh_project() else { return };
+    p.write("all.do", "redo-ifchange mid\n");
+    p.write("mid.do", "redo-ifchange leaf1 leaf2\ncat leaf1 leaf2 > \"$3\"\n");
+    p.write(
+        "default.do",
+        "case $1 in\n  leaf*) redo-ifchange \"$1.src\"; echo \"$1\" >> build.log; cat \"$1.src\" > \"$3\" ;;\n  *) exit 1 ;;\nesac\n",
+    );
+    p.write("leaf1.src", "a\n");
+    p.write("leaf2.src", "b\n");
+    let mut w = Watching::start(&p, &["--watch", "-j4"]);
+    w.wait_for(WATCHING, 1);
+    assert_eq!(p.read("mid"), "a\nb\n");
+    assert_eq!(p.lines("build.log"), 2);
+
+    // An edit rebuilds only the leaf it reaches.
+    p.write("leaf1.src", "A2\n");
+    w.wait_for(WATCHING, 2);
+    assert_eq!(p.read("mid"), "A2\nb\n");
+    assert_eq!(p.lines("build.log"), 3, "only leaf1 reruns");
+
+    let leaf2 = p.dir.join("leaf2");
+    make_writable(&leaf2);
+    std::fs::write(&leaf2, "HAND\n").unwrap();
+    p.write("leaf2.src", "B2\n");
+    w.wait_for("Refusing to overwrite", 1);
+    w.wait_for("build failed", 1);
+    w.wait_for(WATCHING, 3);
+    w.idle_for(500);
+    assert_eq!(w.count("rebuilding"), 2, "refusal must not loop:\n{}", w.seen.join("\n"));
+    assert_eq!(p.read("leaf2"), "HAND\n");
+    assert_eq!(p.read("mid"), "A2\nb\n");
+
+    std::fs::remove_file(&leaf2).unwrap();
+    w.wait_for(WATCHING, 4);
+    assert_eq!(p.read("mid"), "A2\nB2\n");
+    assert_eq!(w.count("build succeeded"), 3, "{}", w.seen.join("\n"));
+}
+
+const TOP_MID_DOS: [(&str, &str); 2] = [
+    ("top.do", "redo-ifchange mid\ncat mid > \"$3\"\n"),
+    ("mid.do", "redo-ifchange a.src\necho mid >> build.log\ncat a.src > \"$3\"\n"),
+];
+
+/// Another redo run that rebuilds part of the watched graph (`redo mid`)
+/// leaves the watched target stale: its recorded edge to `mid` no longer
+/// matches `mid`. The watcher must notice and rebuild, even though every
+/// source edge is up to date again by then.
+#[test]
+fn watch_rebuilds_after_external_partial_build() {
+    let Some(p) = sh_project() else { return };
+    for (name, body) in TOP_MID_DOS {
+        p.write(name, body);
+    }
+    p.write("a.src", "v1\n");
+    let mut w = Watching::start(&p, &["--watch", "top"]);
+    w.wait_for(WATCHING, 1);
+    assert_eq!(p.read("top"), "v1\n");
+
+    p.write("a.src", "v2\n");
+    let out = p.redo(&["mid"]);
+    assert!(out.status.success(), "external build failed: {}", stderr(&out));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while p.read("top") != "v2\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "top stayed stale after an external build of mid:\n{}",
+            w.seen.join("\n")
+        );
+        w.idle_for(50);
+    }
+    // Settles: the external build's output is not a reason to keep rebuilding.
+    let waits = w.count(WATCHING);
+    w.wait_for(WATCHING, waits.max(2));
+    w.idle_for(500);
+    let builds = w.count("rebuilding");
+    w.idle_for(500);
+    assert_eq!(w.count("rebuilding"), builds, "{}", w.seen.join("\n"));
+    assert!(p.lines("build.log") <= 3, "mid rebuilt too often:\n{}", w.seen.join("\n"));
+}
+
+/// A hand edit to an intermediate target, with no source change, is noticed:
+/// the rebuild refuses it and says so, once, and removing the file recovers.
+#[test]
+fn watch_reports_hand_edited_intermediate_target() {
+    let Some(p) = sh_project() else { return };
+    for (name, body) in TOP_MID_DOS {
+        p.write(name, body);
+    }
+    p.write("a.src", "v1\n");
+    let mut w = Watching::start(&p, &["--watch", "top"]);
+    w.wait_for(WATCHING, 1);
+
+    let mid = p.dir.join("mid");
+    make_writable(&mid);
+    std::fs::write(&mid, "HAND\n").unwrap();
+    w.wait_for("Refusing to overwrite", 1);
+    w.wait_for(WATCHING, 2);
+    w.idle_for(500);
+    assert_eq!(w.count("rebuilding"), 1, "refusal must not loop:\n{}", w.seen.join("\n"));
+    assert_eq!(p.read("mid"), "HAND\n");
+    assert_eq!(p.read("top"), "v1\n");
+
+    std::fs::remove_file(&mid).unwrap();
+    w.wait_for("build succeeded", 2);
+    assert_eq!(p.read("mid"), "v1\n");
+}
+
+/// A signal sent to the watcher alone (not Ctrl-C, which the terminal gives
+/// to the whole foreground group) must take the build in flight with it.
+/// The watcher leads its own process group here, as under an interactive
+/// shell.
+#[cfg(unix)]
+#[test]
+fn signal_to_watcher_alone_stops_the_build() {
+    let Some(p) = sh_project() else { return };
+    p.write("all.do", "echo started > started.txt\nsleep 3\necho leaked > leak.txt\n");
+    let mut w = Watching::start_with(&p, &["--watch"], |cmd| {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !p.exists("started.txt") {
+        assert!(std::time::Instant::now() < deadline, "the build never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: signalling the one process we spawned.
+    unsafe {
+        libc::kill(w.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(w.exit().signal(), Some(libc::SIGTERM));
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(!p.exists("leak.txt"), "the build outlived the watcher");
+}
+
 /// A run that waited for a target's lock may skip it because another run
 /// just rebuilt it, but only if that run's own view of the target's
 /// buildable deps agrees. Here run B rebuilds `t` over `d`, then `d.src` is
