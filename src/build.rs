@@ -82,6 +82,51 @@ pub struct Ctx {
     pub wanted: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// Everything a task thread's [`Ctx`] needs except its database connection
+/// (see `Ctx::child_for_thread`). Fields mean what they do on `Ctx`.
+pub(crate) struct ThreadSeed {
+    root: Root,
+    session: i64,
+    depth: usize,
+    pub(crate) chain: Vec<String>,
+    target: Option<String>,
+    tasks: Arc<crate::parallel::Registry>,
+    jobs: Arc<Jobserver>,
+    config: crate::config::Config,
+    log_sink: Option<PathBuf>,
+    pub(crate) spec_watch: Vec<crate::waits::EdgeRef>,
+    pub(crate) abandon: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) demanded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) wanted: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl ThreadSeed {
+    /// Complete the context with a pooled or freshly opened connection.
+    /// Call on the thread that will use it.
+    pub(crate) fn into_ctx(self) -> Result<Ctx> {
+        let conn = match self.tasks.take_conn() {
+            Some(c) => c,
+            None => self.root.open_db()?,
+        };
+        Ok(Ctx {
+            root: self.root,
+            conn,
+            session: self.session,
+            depth: self.depth,
+            chain: self.chain,
+            target: self.target,
+            tasks: self.tasks,
+            jobs: self.jobs,
+            config: self.config,
+            log_sink: self.log_sink,
+            spec_watch: self.spec_watch,
+            abandon: self.abandon,
+            demanded: self.demanded,
+            wanted: self.wanted,
+        })
+    }
+}
+
 const E_ROOT: &str = "REDO_ROOT";
 const E_TARGET: &str = "REDO_TARGET";
 const E_SESSION: &str = "REDO_SESSION";
@@ -96,6 +141,7 @@ impl Ctx {
     /// start a fresh session, and initialize the jobserver for `j` parallel
     /// jobs.
     pub fn top_level(j: usize) -> Result<Ctx> {
+        let _p = crate::profile::span("ctx.init", "top level");
         crate::winjob::setup();
         let cwd = std::env::current_dir()?;
         let root = Root::discover(&cwd)?;
@@ -144,6 +190,7 @@ impl Ctx {
     /// inheriting session/chain/target from the environment. Falls back to a
     /// fresh top-level context when invoked outside a build.
     pub fn from_env() -> Result<Ctx> {
+        let _p = crate::profile::span("ctx.init", "from environment");
         let root = match std::env::var_os(E_ROOT) {
             Some(p) => Root {
                 dir: PathBuf::from(p),
@@ -198,14 +245,22 @@ impl Ctx {
     /// shared registry + jobserver, but its own SQLite connection (rusqlite
     /// connections are not shareable across threads; idle ones are recycled
     /// through the registry's pool — `run_task` returns them).
-    pub(crate) fn child_for_thread(&self) -> Result<Ctx> {
-        let conn = match self.tasks.take_conn() {
-            Some(c) => c,
-            None => self.root.open_db()?,
-        };
-        Ok(Ctx {
+    ///
+    /// Returns a seed rather than the context: the connection is acquired by
+    /// `ThreadSeed::into_ctx` ON the task's thread. Opening one has to read
+    /// the database, which blocks behind any commit in progress; done on the
+    /// spawning thread, a fan-out over N deps opened N connections one after
+    /// another, each stuck behind the commit of the task spawned just before
+    /// it — a convoy that serialized the whole "parallel" check.
+    /// The process's waits-graph connection (`waits.rs`), for one operation.
+    /// Never hold it across anything that blocks or re-enters.
+    pub(crate) fn waits(&self) -> Result<crate::parallel::WaitsConn<'_>> {
+        self.tasks.waits(&self.root)
+    }
+
+    pub(crate) fn child_for_thread(&self) -> ThreadSeed {
+        ThreadSeed {
             root: self.root.clone(),
-            conn,
             session: self.session,
             depth: self.depth,
             chain: self.chain.clone(),
@@ -215,10 +270,10 @@ impl Ctx {
             config: self.config.clone(),
             log_sink: self.log_sink.clone(),
             spec_watch: self.spec_watch.clone(),
-            abandon: None,   // `spawn_task` sets these for its task
+            abandon: None, // `spawn_task` sets these for its task
             demanded: None,
             wanted: None,
-        })
+        }
     }
 
 
@@ -386,6 +441,7 @@ fn exact_dofile_exists(root: &Root, target_rel: &str) -> bool {
 /// so it stays buildable; the overwrite guard in `build_inner` then refuses
 /// or prompts before clobbering the user's file.
 pub(crate) fn is_target(ctx: &Ctx, path_rel: &str) -> Result<bool> {
+    let _p = crate::profile::tally("ood", "is_target (target or source?)");
     let abs = ctx.root.dir.join(path_rel);
     let exists_as_file = fs::metadata(&abs).map(|m| !m.is_dir()).unwrap_or(false);
     if exists_as_file
@@ -466,6 +522,21 @@ fn adopt_pending(conn: &Connection, target: &str, dofile: &str, stamp: &Stamp) -
     Ok(())
 }
 
+/// Commit a small independent write through the process's group commit:
+/// concurrent task threads' writes share one transaction (see
+/// `db::GroupCommit`). Returns once the write is committed.
+pub(crate) fn group_write(
+    ctx: &Ctx,
+    job: impl Fn(&Connection) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    ctx.tasks.writes.run(&ctx.conn, Box::new(job))
+}
+
+/// `waits::clear_waiter` on the process's waits-graph connection.
+pub(crate) fn clear_waiter(ctx: &Ctx, waiter: &str) -> Result<()> {
+    crate::waits::clear_waiter(&*ctx.waits()?, waiter)
+}
+
 pub(crate) fn file_runid(conn: &Connection, path: &str) -> Result<Option<i64>> {
     let r = conn
         .query_row("SELECT runid FROM files WHERE path = ?1", params![path], |row| {
@@ -478,6 +549,7 @@ pub(crate) fn file_runid(conn: &Connection, path: &str) -> Result<Option<i64>> {
 // ---- filesystem commit helpers ---------------------------------------------
 
 fn fsync_file(path: &Path) -> Result<()> {
+    let _p = crate::profile::span("fsync", &path.to_string_lossy());
     if let Ok(f) = fs::File::open(path) {
         let _ = f.sync_all();
     }
@@ -825,7 +897,7 @@ fn check_not_hand_edited(ctx: &Ctx, target_rel: &str, target_abs: &Path) -> Resu
 fn abort_unless_lineage_demanded(ctx: &Ctx, target_rel: &str) -> Result<()> {
     // Nearest creation edge first: this thread's own, then the process's.
     for e in ctx.spec_watch.iter().rev() {
-        if crate::waits::abort_creation(&ctx.root, &ctx.conn, e)? {
+        if crate::waits::abort_creation(&ctx.root, &*ctx.waits()?, e)? {
             jlog(ctx, || {
                 format!(
                     "{target_rel}: hand-edited; aborting the speculative lineage \
@@ -1183,6 +1255,7 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     let _lock = match crate::lock::try_lock_target(&ctx.root, target_rel)? {
         Some(lock) => lock,
         None => {
+            let _p = crate::profile::span("lock.wait", target_rel);
             emit_event(ctx, &crate::logs::Event::Waiting {
                 session: ctx.session,
                 target: target_rel.to_string(),
@@ -1223,6 +1296,7 @@ pub fn build(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
             return mark_verified(ctx, target_rel);
         }
     }
+    let _p = crate::profile::span("build", target_rel);
     build_inner(ctx, target_rel, force)
 }
 
@@ -1282,6 +1356,7 @@ fn is_ood_shallow(ctx: &Ctx, target: &str) -> Result<bool> {
 /// Run the target's do-file and commit its output. Assumes the per-target lock
 /// is held and a build has been determined necessary.
 fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
+    let prep_span = crate::profile::span("build.prep", target_rel);
     let target_abs = ctx.root.dir.join(target_rel);
 
     // An existing file that redo never generated is a source when only a
@@ -1513,9 +1588,22 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
     // speculative lineage stays in its parent's tree, which the lineage's
     // owner kills as a whole.
     let own_tree = ctx.abandon.is_some();
+    drop(prep_span);
+    let speculative = ctx.abandon.is_some() || !ctx.spec_watch.is_empty();
+    let mut run_span = crate::profile::span("dofile.run", target_rel);
+    run_span.detail(|| {
+        format!(
+            "{} {}{}",
+            interp.join(" "),
+            df.dofile_rel,
+            // A speculative run is polled (25ms) rather than waited on.
+            if speculative { " (speculative: exit polled every 25ms)" } else { "" }
+        )
+    });
+    let spawn_span = crate::profile::span("dofile.spawn", target_rel);
     let mut child = crate::proctree::spawn(&mut command, own_tree)
         .map_err(|e| interpreter_spawn_error(e, &interp, &df.dofile_abs, child_path.as_deref()))?;
-    let speculative = ctx.abandon.is_some() || !ctx.spec_watch.is_empty();
+    drop(spawn_span);
     let status = if !speculative {
         child.wait()?
     } else {
@@ -1537,6 +1625,8 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
             thread::sleep(std::time::Duration::from_millis(25));
         }
     };
+    drop(run_span);
+    let _commit_span = crate::profile::span("commit", target_rel);
     if let Some(g) = done_guard.as_mut() {
         // Signal death has no code; classify it as failed (exit 1).
         g.record_exit(status.code().unwrap_or(1));
@@ -1582,8 +1672,12 @@ fn build_inner(ctx: &Ctx, target_rel: &str, force: bool) -> Result<()> {
             record_pending(&ctx.conn, target_rel, &out)?;
         }
         crash_point("before-rename");
-        atomic_rename(&tmp3_abs, &target_abs)?;
+        {
+            let _p = crate::profile::span("rename", target_rel);
+            atomic_rename(&tmp3_abs, &target_abs)?;
+        }
         if let Some(parent) = target_abs.parent() {
+            let _p = crate::profile::span("fsync", &parent.to_string_lossy());
             fsync_dir(parent);
         }
         crash_point("after-rename");
@@ -1631,7 +1725,9 @@ fn emit_event(ctx: &Ctx, event: &crate::logs::Event) {
 /// it is out of date and has a do-file) and record the dependency edge from the
 /// current `REDO_TARGET`.
 pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
+    let who = ctx.target.as_deref().unwrap_or("-");
     // Classify all inputs first.
+    let phase = crate::profile::span("ifchange.classify", who);
     let mut items: Vec<(String, PathBuf, bool)> = Vec::with_capacity(inputs.len());
     for input in inputs {
         let dep_rel = normalize_target(&ctx.root, input)?;
@@ -1643,15 +1739,27 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
         items.push((dep_rel, dep_abs, buildable));
     }
 
+    drop(phase);
+
     // Source files: stamp/refresh now (cheap, serial).
+    let phase = crate::profile::span("ifchange.sources", who);
+    // Hash outside the transaction; one commit for all the rows.
+    let mut source_stamps = Vec::new();
     for (dep_rel, dep_abs, buildable) in &items {
         if !buildable {
             vlog(ctx, || {
                 format!("{dep_rel}: source file (nothing builds it); refreshing its stamp")
             });
-            let stamp = stamp::stamp_file(dep_abs)?;
-            upsert_file(&ctx.conn, dep_rel, None, None, stamp.as_ref(), ctx.session)?;
+            source_stamps.push((dep_rel, stamp::stamp_file(dep_abs)?));
         }
+    }
+    if !source_stamps.is_empty() {
+        db::write_txn(&ctx.conn, |conn| {
+            for (dep_rel, stamp) in &source_stamps {
+                upsert_file(conn, dep_rel, None, None, stamp.as_ref(), ctx.session)?;
+            }
+            Ok(())
+        })?;
     }
 
     // Buildable targets: bring up to date, in parallel under the jobserver.
@@ -1660,7 +1768,13 @@ pub fn ifchange(ctx: &Ctx, inputs: &[String]) -> Result<()> {
         .filter(|(_, _, b)| *b)
         .map(|(d, _, _)| d.clone())
         .collect();
-    build_parallel(ctx, &buildables)?;
+    drop(phase);
+    {
+        let mut p = crate::profile::span("ifchange.wait", who);
+        p.detail(|| format!("{} buildable of {} deps", buildables.len(), items.len()));
+        build_parallel(ctx, &buildables)?;
+    }
+    let _phase = crate::profile::span("ifchange.record", who);
 
     // Record the edges from the parent target (serial, on our connection).
     // Stamps (which may hash file contents) are computed before the
@@ -1714,7 +1828,7 @@ fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
         // Happy path first: every cycle-free demand edge goes in as one
         // batched transaction; only deps whose edge hit a cycle take the
         // per-dep evict/retry loop.
-        let inserted = crate::waits::try_demand_batch(&ctx.root, &ctx.conn, parent, deps)?;
+        let inserted = crate::waits::try_demand_batch(&ctx.root, &*ctx.waits()?, parent, deps)?;
         for (d, ok) in deps.iter().zip(inserted) {
             if !ok {
                 demand_edge(ctx, parent, d)?;
@@ -1728,7 +1842,7 @@ fn build_parallel(ctx: &Ctx, deps: &[String]) -> Result<()> {
     // cross-branch cycle is resolved by eviction, never by hanging here.
     crate::parallel::drain(ctx);
     if let Some(parent) = &ctx.target {
-        let _ = crate::waits::clear_waiter(&ctx.conn, parent);
+        let _ = clear_waiter(ctx, parent);
     }
     result
 }
@@ -1746,7 +1860,10 @@ fn demand_edge(ctx: &Ctx, parent: &str, dep: &str) -> Result<()> {
     let mut stabilize = 0u32;
     loop {
         crate::parallel::abort_check(ctx)?;
-        match crate::waits::try_demand(&ctx.root, &ctx.conn, parent, dep)? {
+        // Bound first: a guard in the `match` scrutinee would be held across
+        // the arms, which take the waits connection again.
+        let outcome = crate::waits::try_demand(&ctx.root, &*ctx.waits()?, parent, dep)?;
+        match outcome {
             DemandOutcome::Inserted => return Ok(()),
             DemandOutcome::Evicted { aborted_lineage: a } => {
                 jlog(ctx, || {
@@ -1763,7 +1880,7 @@ fn demand_edge(ctx: &Ctx, parent: &str, dep: &str) -> Result<()> {
             DemandOutcome::RealCycle => {
                 if !gc_done {
                     gc_done = true;
-                    crate::waits::gc_dead_edges(&ctx.root, &ctx.conn)?;
+                    crate::waits::gc_dead_edges(&ctx.root, &*ctx.waits()?)?;
                     continue;
                 }
                 if aborted_lineage && stabilize < 400 {
@@ -1771,7 +1888,7 @@ fn demand_edge(ctx: &Ctx, parent: &str, dep: &str) -> Result<()> {
                     thread::sleep(std::time::Duration::from_millis(25));
                     continue;
                 }
-                let _ = crate::waits::clear_waiter(&ctx.conn, parent);
+                let _ = clear_waiter(ctx, parent);
                 let path = if ctx.chain.is_empty() {
                     parent.to_string()
                 } else {
@@ -1796,11 +1913,11 @@ pub fn ensure(ctx: &Ctx, target: &str) -> Result<()> {
 /// cache, so later `ensure` calls in the same session short-circuit.
 pub(crate) fn mark_verified(ctx: &Ctx, target: &str) -> Result<()> {
     let _ = current_csum(ctx, target)?; // refresh mtime/size/csum cache
-    ctx.conn.execute(
-        "UPDATE files SET runid = ?1 WHERE path = ?2",
-        params![ctx.session, target],
-    )?;
-    Ok(())
+    let (session, target) = (ctx.session, target.to_string());
+    group_write(ctx, move |c| {
+        c.execute("UPDATE files SET runid = ?1 WHERE path = ?2", params![session, target])?;
+        Ok(())
+    })
 }
 
 /// The current content hash of a file, using the **guarded fast path**:
@@ -1813,6 +1930,7 @@ pub(crate) fn mark_verified(ctx: &Ctx, target: &str) -> Result<()> {
 ///
 /// Returns `Ok(None)` if the file does not exist.
 pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> {
+    let mut prof = crate::profile::tally("csum", "stat + cached hash trusted");
     let abs = ctx.root.dir.join(path_rel);
     let meta = match fs::metadata(&abs) {
         Ok(m) => m,
@@ -1822,7 +1940,7 @@ pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> 
     let mtime = stamp::mtime_nanos(&meta);
     let size = if meta.is_dir() { 0 } else { meta.len() as i64 };
 
-    let cached = files_stamp(&ctx.conn, path_rel)?;
+    let (has_row, cached) = files_stamp(&ctx.conn, path_rel)?;
     if let Some((rm, rs, rc, rh)) = &cached {
         if *rm == mtime && *rs == size && stat_is_trustworthy(mtime) && !stamp_is_racy(mtime, *rh)
         {
@@ -1838,6 +1956,7 @@ pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> 
         }
     }
 
+    prof.rename("stat + re-hash + cache update");
     let hashed_at = stamp::now_nanos();
     let csum = if meta.is_dir() {
         stamp::DIR_CSUM.to_string()
@@ -1865,11 +1984,24 @@ pub(crate) fn current_csum(ctx: &Ctx, path_rel: &str) -> Result<Option<String>> 
     // refreshed while its content still matches the record: that leaves the
     // evidence as it was, and it is what lets a freshly built output (hashed
     // within the racy margin of its own mtime) earn the fast path at all.
-    ctx.conn.execute(
-        "UPDATE files SET mtime = ?1, size = ?2, csum = ?3, hashed_at = ?4
-         WHERE path = ?5 AND (dofile IS NULL OR csum = ?3)",
-        params![mtime, size, csum, hashed_at, path_rel],
-    )?;
+    //
+    // With no row there is nothing to refresh, and the UPDATE would still
+    // queue for the database's write lock. Do-files are the common case:
+    // they are recorded as edges, never as `files` rows, and every target
+    // sharing a `default.*.do` checks it.
+    if has_row {
+        let (path, c) = (path_rel.to_string(), csum.clone());
+        group_write(ctx, move |conn| {
+            conn.execute(
+                "UPDATE files SET mtime = ?1, size = ?2, csum = ?3, hashed_at = ?4
+                 WHERE path = ?5 AND (dofile IS NULL OR csum = ?3)",
+                params![mtime, size, c, hashed_at, path],
+            )?;
+            Ok(())
+        })?;
+    } else {
+        prof.rename("stat + re-hash (no cache row)");
+    }
     Ok(Some(csum))
 }
 
@@ -1901,8 +2033,9 @@ fn stamp_is_racy(mtime_nanos: i64, hashed_at: Option<i64>) -> bool {
 /// A file row's cached stamp: `(mtime, size, csum, hashed_at)`.
 type CachedStamp = (i64, i64, String, Option<i64>);
 
-/// Fetch a file row's cached stamp, only if mtime, size and csum are present.
-fn files_stamp(conn: &Connection, path: &str) -> Result<Option<CachedStamp>> {
+/// Whether a file row exists, and its cached stamp if mtime, size and csum
+/// are all present.
+fn files_stamp(conn: &Connection, path: &str) -> Result<(bool, Option<CachedStamp>)> {
     let row = conn
         .query_row(
             "SELECT mtime, size, csum, hashed_at FROM files WHERE path = ?1",
@@ -1918,8 +2051,9 @@ fn files_stamp(conn: &Connection, path: &str) -> Result<Option<CachedStamp>> {
         )
         .optional()?;
     Ok(match row {
-        Some((Some(m), Some(s), Some(c), h)) => Some((m, s, c, h)),
-        _ => None,
+        Some((Some(m), Some(s), Some(c), h)) => (true, Some((m, s, c, h))),
+        Some(_) => (true, None),
+        None => (false, None),
     })
 }
 
@@ -1979,14 +2113,20 @@ pub fn ifcreate(ctx: &Ctx, inputs: &[String]) -> Result<()> {
         Some(p) => p,
         None => bail!("redo-msh ifcreate must be called from within a do-file"),
     };
+    let mut deps = Vec::with_capacity(inputs.len());
     for input in inputs {
         let dep_rel = normalize_target(&ctx.root, input)?;
         if ctx.root.dir.join(&dep_rel).exists() {
             bail!("redo-msh ifcreate: {dep_rel:?} already exists");
         }
-        record_dep(&ctx.conn, parent, DepKind::IfCreate, Some(&dep_rel), None)?;
+        deps.push(dep_rel);
     }
-    Ok(())
+    db::write_txn(&ctx.conn, |conn| {
+        for dep_rel in &deps {
+            record_dep(conn, parent, DepKind::IfCreate, Some(dep_rel), None)?;
+        }
+        Ok(())
+    })
 }
 
 /// `redo-msh always`: mark the current target as always out of date.
@@ -2007,11 +2147,37 @@ pub fn always(ctx: &Ctx) -> Result<()> {
 /// writer to the terminal while we build (I1). Engine errors are returned to
 /// `main` and printed only after the follower has drained.
 pub fn redo(targets: &[String], j: usize) -> Result<()> {
+    crate::profile::begin_run();
+    let result = redo_run(targets, j);
+    crate::profile::end_run();
+    result
+}
+
+fn redo_run(targets: &[String], j: usize) -> Result<()> {
     let mut ctx = Ctx::top_level(j)?;
-    gc_temps(&ctx.root); // sweep temp files left by any crashed build
+    crate::profile::info("jobs", &j.to_string());
+    crate::profile::info("root", &ctx.root.dir.display().to_string());
+    crate::profile::info(
+        "journal mode",
+        &format!("{:?}", db::choose_journal_mode(&ctx.root.db_path())),
+    );
+    {
+        let _p = crate::profile::span("gc.temps", "");
+        gc_temps(&ctx.root); // sweep temp files left by any crashed build
+    }
     // Sweep wait edges (and liveness locks) left by dead processes, so a
     // crashed traversal can never fabricate a cycle error in this run.
-    crate::waits::gc_sweep(&ctx.root, &ctx.conn);
+    {
+        let _p = crate::profile::span("gc.waits", "");
+        let replaced = match ctx.waits() {
+            Ok(c) => crate::waits::gc_sweep(&ctx.root, &c),
+            Err(_) => false,
+        };
+        if replaced {
+            // Our connection is to the file that was just replaced.
+            ctx.tasks.reset_waits();
+        }
+    }
 
     // The liveness lock goes on a sentinel file that is never read or
     // written, NOT on the run log: Windows kernel locks are mandatory, so a
@@ -2023,11 +2189,17 @@ pub fn redo(targets: &[String], j: usize) -> Result<()> {
     let run_lock = acquire_run_lock(&run_lock_path)?;
     fs::File::create(&run_log)
         .with_context(|| format!("creating run log {}", run_log.display()))?;
-    crate::logs::gc_logs(&ctx.root, ctx.session);
+    {
+        let _p = crate::profile::span("gc.logs", "");
+        crate::logs::gc_logs(&ctx.root, ctx.session);
+    }
     ctx.log_sink = Some(run_log.clone());
     let follower = crate::logs::follow_start(ctx.root.clone(), ctx.session);
 
-    let result = redo_build(&ctx, targets);
+    let result = {
+        let _p = crate::profile::span("top.build", "");
+        redo_build(&ctx, targets)
+    };
 
     // Terminate the run trace so the follower's root frame pops; join before
     // anyone else may print (I1). The run log itself is ours to remove — the
@@ -2037,7 +2209,10 @@ pub fn redo(targets: &[String], j: usize) -> Result<()> {
         exit: if result.is_ok() { 0 } else { 1 },
         target: crate::logs::RUN_TARGET.to_string(),
     });
-    follower.join();
+    {
+        let _p = crate::profile::span("top.follower_tail", "");
+        follower.join();
+    }
     // Remove our files while still holding the lock, the run log first: a
     // sweeper treats a missing sentinel as a dead run, so the sentinel must
     // be the last thing to go. (With REDO_KEEP_LOGS the run log stays; the

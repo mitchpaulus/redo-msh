@@ -1592,43 +1592,45 @@ fn explicit_redo_of_forgotten_target_refuses_then_heals_with_yes() {
 /// its own do-file finishes and replaying everything else as one late dump.
 /// `b` grabs `shared`'s lock first; `a` waits on it, and `shared`'s output
 /// must stream under `a`'s block — before `a` resumes — not after `b`.
+///
+/// The follower walks siblings in the order their builds started, and which
+/// of two parallel siblings starts first is a race, so the do-files pin the
+/// order themselves with marker files: `a` starts before `b` is asked for,
+/// and `a` asks for `shared` only once `b`'s build of it is running.
 #[cfg(unix)]
 #[test]
 fn waiting_on_lock_follows_the_holder_live() {
-    if skip() {
-        return;
-    }
-    let p = Project::new();
+    let Some(p) = sh_project() else { return };
     p.write(
         "shared.txt.do",
-        "args :2: out!\n\
-         0 i!\n\
-         (\n\
-         \t@i 5 >= if break end\n\
-         \t\"SHARED\" wle\n\
-         \t['sleep' '0.1']!\n\
-         \t@i 1 + i!\n\
-         ) loop\n\
-         \"s\\n\" @out writeFile\n",
+        ": > shared.started\n\
+         for i in 1 2 3 4 5; do echo SHARED >&2; sleep 0.1; done\n\
+         echo s > \"$3\"\n",
     );
     p.write(
         "a.txt.do",
-        "args :2: out!\n\
-         ['sleep' '0.2']!\n\
-         \"A-1\" wle\n\
-         ['redo-msh' 'ifchange' 'shared.txt']!\n\
-         \"A-2\" wle\n\
-         \"a\\n\" @out writeFile\n",
+        ": > a.started\n\
+         while [ ! -e shared.started ]; do sleep 0.02; done\n\
+         echo A-1 >&2\n\
+         redo-ifchange shared.txt\n\
+         echo A-2 >&2\n\
+         echo a > \"$3\"\n",
     );
     p.write(
         "b.txt.do",
-        "args :2: out!\n\
-         \"B-1\" wle\n\
-         ['redo-msh' 'ifchange' 'shared.txt']!\n\
-         \"B-2\" wle\n\
-         \"b\\n\" @out writeFile\n",
+        "echo B-1 >&2\n\
+         redo-ifchange shared.txt\n\
+         echo B-2 >&2\n\
+         echo b > \"$3\"\n",
     );
-    p.write("all.do", "['redo-msh' 'ifchange' 'a.txt' 'b.txt']!\n");
+    p.write(
+        "all.do",
+        "redo-ifchange a.txt &\n\
+         a=$!\n\
+         while [ ! -e a.started ]; do sleep 0.02; done\n\
+         redo-ifchange b.txt\n\
+         wait $a\n",
+    );
 
     let out = p.redo(&["-j2", "all"]);
     assert!(out.status.success(), "build failed: {}", stderr(&out));
@@ -2347,4 +2349,51 @@ fn signal_to_redo_reaches_speculative_process_groups() {
         !p.exists("leak.txt"),
         "a speculative do-file's process survived the signal that killed redo"
     );
+}
+
+/// `--profile` writes one report covering every redo process of the run:
+/// the top level and the `redo-msh ifchange` a do-file runs.
+#[test]
+fn profile_reports_the_whole_process_tree() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "alpha\n");
+    p.write(
+        "app.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'a.txt']!\n\"a.txt\" readFile @out writeFile\n",
+    );
+    let out = p
+        .redo_cmd(&["--profile=prof.txt", "app.txt"])
+        .env_remove("REDO_PROFILE")
+        .env_remove("REDO_PROFILE_T0")
+        .output()
+        .expect("failed to spawn redo-msh");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("profile written to"), "{}", stderr(&out));
+    assert_eq!(p.read("app.txt"), "alpha\n");
+
+    let prof = p.read("prof.txt");
+    assert!(prof.starts_with("# redo-msh profile"), "{prof}");
+    assert!(prof.contains("## Headline"), "{prof}");
+    let spans: Vec<Vec<&str>> = prof
+        .lines()
+        .filter(|l| l.starts_with("S\t"))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    let has = |cat: &str, name: &str| spans.iter().any(|f| f[4] == cat && f[5] == name);
+    assert!(has("dofile.run", "app.txt"), "{prof}");
+    assert!(has("commit", "app.txt"), "{prof}");
+    // The child process recorded itself under the target whose do-file ran it.
+    assert!(
+        spans.iter().any(|f| f[4] == "proc" && f[5] == "app.txt" && f[6].starts_with("redo-msh")),
+        "{prof}"
+    );
+    assert!(prof.lines().any(|l| l.starts_with("T\t") && l.contains("\tsql\t")), "{prof}");
+
+    // Without the flag nothing is written.
+    std::fs::remove_file(p.dir.join("prof.txt")).unwrap();
+    assert!(p.redo(&["app.txt"]).status.success());
+    assert!(!p.exists("prof.txt") && !p.exists("redo-profile.txt"));
 }

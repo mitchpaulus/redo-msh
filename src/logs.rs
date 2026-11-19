@@ -156,6 +156,7 @@ impl Event {
 /// live display for one target but never the build, so errors are deliberately
 /// swallowed here rather than propagated into build results.
 pub fn event_append(sink: &Path, event: &Event) {
+    let _p = crate::profile::tally("log", "event append");
     let line = event.encode();
     if let Ok(mut f) = OpenOptions::new().append(true).open(sink) {
         let _ = f.write_all(line.as_bytes());
@@ -200,6 +201,7 @@ pub fn event_parse(line: &[u8]) -> Option<Event> {
 /// reading a complete, immutable stream; a follower opening the path sees
 /// either the old instance or the new one, never a truncated file.
 pub fn create_log(path: &Path) -> Result<()> {
+    let _p = crate::profile::tally("log", "create target log");
     let dir = path.parent().expect("log path has a parent directory");
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let tmp = dir.join(format!(
