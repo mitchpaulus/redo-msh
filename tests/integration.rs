@@ -2348,3 +2348,50 @@ fn signal_to_redo_reaches_speculative_process_groups() {
         "a speculative do-file's process survived the signal that killed redo"
     );
 }
+
+/// `--profile` writes one report covering every redo process of the run:
+/// the top level and the `redo-msh ifchange` a do-file runs.
+#[test]
+fn profile_reports_the_whole_process_tree() {
+    if skip() {
+        return;
+    }
+    let p = Project::new();
+    p.write("a.txt", "alpha\n");
+    p.write(
+        "app.txt.do",
+        "args :2: out!\n['redo-msh' 'ifchange' 'a.txt']!\n\"a.txt\" readFile @out writeFile\n",
+    );
+    let out = p
+        .redo_cmd(&["--profile=prof.txt", "app.txt"])
+        .env_remove("REDO_PROFILE")
+        .env_remove("REDO_PROFILE_T0")
+        .output()
+        .expect("failed to spawn redo-msh");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("profile written to"), "{}", stderr(&out));
+    assert_eq!(p.read("app.txt"), "alpha\n");
+
+    let prof = p.read("prof.txt");
+    assert!(prof.starts_with("# redo-msh profile"), "{prof}");
+    assert!(prof.contains("## Headline"), "{prof}");
+    let spans: Vec<Vec<&str>> = prof
+        .lines()
+        .filter(|l| l.starts_with("S\t"))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    let has = |cat: &str, name: &str| spans.iter().any(|f| f[4] == cat && f[5] == name);
+    assert!(has("dofile.run", "app.txt"), "{prof}");
+    assert!(has("commit", "app.txt"), "{prof}");
+    // The child process recorded itself under the target whose do-file ran it.
+    assert!(
+        spans.iter().any(|f| f[4] == "proc" && f[5] == "app.txt" && f[6].starts_with("redo-msh")),
+        "{prof}"
+    );
+    assert!(prof.lines().any(|l| l.starts_with("T\t") && l.contains("\tsql\t")), "{prof}");
+
+    // Without the flag nothing is written.
+    std::fs::remove_file(p.dir.join("prof.txt")).unwrap();
+    assert!(p.redo(&["app.txt"]).status.success());
+    assert!(!p.exists("prof.txt") && !p.exists("redo-profile.txt"));
+}

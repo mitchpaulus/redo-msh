@@ -105,6 +105,7 @@ fn candidates(target_rel: &str) -> Vec<Candidate> {
 /// candidates that preceded it. Returns `Ok(None)` if no do-file exists (the
 /// target is a source file), with all candidates collected as `absent`.
 pub fn find(root: &Root, target_rel: &str) -> (Option<DoFile>, Vec<String>) {
+    let _p = crate::profile::tally("dofile", "find (stat candidates up the tree)");
     let mut absent = Vec::new();
     for c in candidates(target_rel) {
         let dofile_abs = root.dir.join(&c.dofile_rel);

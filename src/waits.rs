@@ -34,6 +34,20 @@
 //! own `name -> deps` edges bridge the lock wait (proven safe by the
 //! model).
 //!
+//! Storage: the graph lives in its own SQLite database, `.redom/waits.db`,
+//! opened with `synchronous=OFF` ([`open`]). It has to be a file — the
+//! processes of a build share it — but it is transient state: every edge
+//! belongs to a live process and is garbage the moment that process dies.
+//! Committing it durably bought nothing and cost a full flush per edge
+//! change, which on a slow filesystem was half of an up-to-date check's
+//! wall time. With syncing off a commit is a few buffered writes. The
+//! rollback journal (or WAL) is kept, so a redo process killed mid-commit —
+//! routine: speculative lineages are killed by design — cannot leave the
+//! file half-written; only an OS crash or power loss can, and
+//! [`gc_sweep`] rebuilds a damaged file at the next run's start. Being a
+//! separate database also means edge traffic no longer queues behind the
+//! build database's (durable, slow) commits, or blocks its readers.
+//!
 //! Liveness: every edge records an `owner` — this process, identified by
 //! pid plus a nonce — and each owner holds a kernel file lock
 //! (`.redom/locks/w.<owner>.lock`) for its whole lifetime. The kernel
@@ -50,6 +64,65 @@ use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const DB_NAME: &str = "waits.db";
+
+pub fn db_path(root: &Root) -> PathBuf {
+    root.redo_dir().join(DB_NAME)
+}
+
+/// Open the waits-graph database for `root`, creating it if needed.
+pub fn open(root: &Root) -> Result<Connection> {
+    let _p = crate::profile::span("waits.open", "");
+    let path = db_path(root);
+    fs::create_dir_all(root.redo_dir())
+        .with_context(|| format!("creating {}", root.redo_dir().display()))?;
+    match open_at(&path) {
+        Ok(c) => Ok(c),
+        // Nothing in this file is worth an error: if it cannot be opened as
+        // a database (damaged by a power loss), start it over.
+        Err(_) => {
+            db::wipe(&path);
+            open_at(&path).with_context(|| format!("opening {}", path.display()))
+        }
+    }
+}
+
+fn open_at(path: &std::path::Path) -> Result<Connection> {
+    let mode = db::choose_journal_mode(path);
+    // A WAL-format file cannot be read where WAL's shared memory cannot be
+    // mapped (the project moved filesystems); its contents are disposable.
+    if mode == db::JournalMode::Persist && db::is_wal_format(path) {
+        db::wipe(path);
+    }
+    let mut conn = Connection::open(path)?;
+    if crate::profile::enabled() {
+        conn.profile(Some(crate::profile::sql_hook));
+    }
+    db::install_busy_handler(&conn)?;
+    let journal = match mode {
+        db::JournalMode::Wal => "WAL",
+        db::JournalMode::Persist => "PERSIST",
+    };
+    conn.pragma_update(None, "journal_mode", journal)?;
+    conn.pragma_update(None, "synchronous", "OFF")?;
+    // One row per live wait edge `waiter -> dep`; names are stored
+    // lowercased. `kind` is an `EdgeKind`; `owner` identifies the inserting
+    // process for liveness GC. No statement here writes once the table
+    // exists.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS waits (
+             waiter TEXT NOT NULL,
+             dep    TEXT NOT NULL,
+             owner  TEXT NOT NULL,
+             kind   INTEGER NOT NULL,
+             PRIMARY KEY (waiter, dep, owner)
+         );
+         CREATE INDEX IF NOT EXISTS waits_by_owner ON waits(owner);
+         CREATE INDEX IF NOT EXISTS waits_by_dep ON waits(dep);",
+    )?;
+    Ok(conn)
+}
 
 /// Edge types (rule R2). Stored as the integer in `waits.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +203,7 @@ fn ensure_liveness(root: &Root) -> Result<()> {
     if held.is_some() {
         return Ok(());
     }
+    let _p = crate::profile::span("waits.liveness", "");
     match acquire_liveness(root) {
         Ok(f) => {
             *held = Some(f);
@@ -501,6 +575,18 @@ pub fn clear_waiter(conn: &Connection, waiter: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rule R5's abandonment: delete this process's CREATION edge
+/// `waiter -> dep` so the lineage watching it unwinds. Guarded on kind: an
+/// upgrade race must not delete a demand edge. `waiter` and `dep` must be
+/// pre-lowercased.
+pub fn abandon_creation(conn: &Connection, waiter: &str, dep: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM waits WHERE owner = ?1 AND waiter = ?2 AND dep = ?3 AND kind = ?4",
+        params![owner_id(), waiter, dep, EdgeKind::Creation as i64],
+    )?;
+    Ok(())
+}
+
 /// Delete edges whose owner is provably dead (liveness lock free/missing).
 pub fn gc_dead_edges(root: &Root, conn: &Connection) -> Result<()> {
     let owners: Vec<String> = {
@@ -520,12 +606,28 @@ pub fn gc_dead_edges(root: &Root, conn: &Connection) -> Result<()> {
 /// their liveness lock files. A file is removed only while holding its lock
 /// (winnable ⇒ owner dead), held across the unlink so a concurrent starter
 /// that just created the same path detects the race and recreates it.
-pub fn gc_sweep(root: &Root, conn: &Connection) {
+///
+/// Returns true if the database file was found damaged and replaced: the
+/// caller's connection is then stale and must be reopened.
+pub fn gc_sweep(root: &Root, conn: &Connection) -> bool {
+    // The one integrity check per run (see the module docs: syncing is off,
+    // so a power loss can damage the file). A damaged graph is emptied by
+    // replacing the file; processes of a concurrent run that still hold the
+    // old one were already failing on it.
+    let sound = conn
+        .query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0))
+        .map(|s| s == "ok")
+        .unwrap_or(false);
+    if !sound {
+        eprintln!("redo-msh: {} was damaged; starting it over", db_path(root).display());
+        db::wipe(&db_path(root));
+        return true;
+    }
     let _ = gc_dead_edges(root, conn);
     let dir = root.locks_dir();
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return false,
     };
     for e in entries.flatten() {
         let name = e.file_name();
@@ -550,6 +652,7 @@ pub fn gc_sweep(root: &Root, conn: &Connection) {
             let _ = fs2::FileExt::unlock(&f);
         }
     }
+    false
 }
 
 // ---- speculation watch serialization (REDO_SPEC_WATCH) ---------------------
@@ -594,10 +697,30 @@ mod tests {
         Root { dir }
     }
 
+    /// The graph's own database: unsynced, and disposable — a file that is
+    /// not a database is replaced rather than reported.
+    #[test]
+    fn waits_database_is_unsynced_and_self_healing() {
+        let root = test_root("opendb");
+        let conn = open(&root).unwrap();
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 0, "synchronous must be OFF");
+        try_soft(&root, &conn, "a", "b", EdgeKind::Checker).unwrap();
+        assert!(!gc_sweep(&root, &conn), "a sound file is kept");
+        drop(conn);
+
+        std::fs::write(db_path(&root), b"this is not a sqlite database, not at all").unwrap();
+        let conn = open(&root).unwrap();
+        let edges: i64 = conn.query_row("SELECT count(*) FROM waits", [], |r| r.get(0)).unwrap();
+        assert_eq!(edges, 0);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&root.dir);
+    }
+
     #[test]
     fn soft_cycle_is_refused_and_edge_not_inserted() {
         let root = test_root("softcycle");
-        let conn = db::open(&root.db_path()).unwrap();
+        let conn = open(&root).unwrap();
 
         assert_eq!(
             try_soft(&root, &conn, "a", "b", EdgeKind::Checker).unwrap(),
@@ -643,7 +766,7 @@ mod tests {
     #[test]
     fn all_hard_cycle_is_a_real_error() {
         let root = test_root("hardcycle");
-        let conn = db::open(&root.db_path()).unwrap();
+        let conn = open(&root).unwrap();
 
         assert_eq!(
             try_demand(&root, &conn, "a", "b").unwrap(),
@@ -661,7 +784,7 @@ mod tests {
     #[test]
     fn demand_evicts_checker_edge_and_then_inserts() {
         let root = test_root("evictchk");
-        let conn = db::open(&root.db_path()).unwrap();
+        let conn = open(&root).unwrap();
 
         // A speculative checker wait a -> b...
         assert_eq!(
@@ -694,7 +817,7 @@ mod tests {
     #[test]
     fn demand_evicts_creation_edge_and_cuts_the_instance_loose() {
         let root = test_root("evictcre");
-        let conn = db::open(&root.db_path()).unwrap();
+        let conn = open(&root).unwrap();
 
         // ctx speculatively spawned s (creation ctx -> s); s's own build
         // then HARD-demanded x (a real running do-file inside the
@@ -742,7 +865,7 @@ mod tests {
     #[test]
     fn evicting_creation_edge_keeps_foreign_builders_demands() {
         let root = test_root("evictforeign");
-        let conn = db::open(&root.db_path()).unwrap();
+        let conn = open(&root).unwrap();
 
         // Another (live) process builds s and demands x.
         conn.execute(
@@ -788,7 +911,7 @@ mod tests {
     #[test]
     fn demand_upgrade_supersedes_creation_edge_and_stays_alive() {
         let root = test_root("upgrade");
-        let conn = db::open(&root.db_path()).unwrap();
+        let conn = open(&root).unwrap();
 
         assert_eq!(
             try_soft(&root, &conn, "ctx", "d", EdgeKind::Creation).unwrap(),
@@ -823,7 +946,7 @@ mod tests {
     #[test]
     fn dead_owner_edges_are_not_cycles() {
         let root = test_root("dead");
-        let conn = db::open(&root.db_path()).unwrap();
+        let conn = open(&root).unwrap();
 
         // Plant an edge from a fabricated dead owner (no liveness lock).
         conn.execute(

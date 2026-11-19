@@ -44,6 +44,7 @@ fn lock_path_for_key(root: &Root, key: &str) -> PathBuf {
 }
 
 fn open_lock_file(root: &Root, target_rel: &str) -> Result<File> {
+    let _p = crate::profile::tally("lock", "open lock file");
     let dir = root.locks_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("creating lock dir {}", dir.display()))?;

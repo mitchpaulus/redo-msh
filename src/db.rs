@@ -15,10 +15,12 @@
 //!     basis for change detection; `mtime`/`size` are fast-path accelerators.
 //!
 //! A `meta` table holds the schema version and the monotonic `runid` build
-//! counter (clock-independent), and the session-wide overwrite decisions. A
-//! `waits` table is the shared waits-for graph that turns a dependency cycle
-//! between concurrent builds into an error instead of a deadlock (see
-//! `waits.rs`).
+//! counter (clock-independent), and the session-wide overwrite decisions.
+//!
+//! The shared waits-for graph (which turns a dependency cycle between
+//! concurrent builds into an error instead of a deadlock) is NOT here: it
+//! is transient, so it lives in its own unsynced database (see `waits.rs`).
+//! The `waits` table this schema still creates is unused.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -74,11 +76,25 @@ impl DepKind {
 /// cache, so rebuilding is always safe (the next build just does more work
 /// once). This avoids silently misreading an incompatible layout.
 pub fn open(db_path: &Path) -> Result<Connection> {
+    let mut span = crate::profile::span("db.open", "");
     let mode = choose_journal_mode(db_path);
+    span.detail(|| format!("journal mode {mode:?}"));
     if mode == JournalMode::Persist {
         // A WAL-format database cannot even be read here (its shared-memory
         // map fails), so this must happen before the version probe below.
         convert_from_wal_if_needed(db_path)?;
+    }
+    // Fast path: a database stamped by this exact schema needs no version
+    // probe and no schema statements. Every redo process — and every task
+    // thread — opens a connection, and on a slow filesystem the dozen
+    // idempotent statements of `init_schema` (two of them writes) cost more
+    // than the rest of an up-to-date check.
+    if db_path.exists() {
+        let conn = connect(db_path, mode)?;
+        if schema_stamp(&conn) == Some(SCHEMA_STAMP) {
+            return Ok(conn);
+        }
+        // Dropped here: the slow path may need to wipe the file.
     }
     if let Some(found) = incompatible_version(db_path)? {
         if !upgrade_in_place(db_path, found)? {
@@ -89,10 +105,39 @@ pub fn open(db_path: &Path) -> Result<Connection> {
             wipe(db_path);
         }
     }
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("opening database {}", db_path.display()))?;
-    apply_pragmas(&conn, mode)?;
+    let conn = connect(db_path, mode)?;
     init_schema(&conn)?;
+    // Stamp last: only a database on which every statement above succeeded
+    // may skip them. Racing initializers all write the same value.
+    conn.pragma_update(None, "user_version", SCHEMA_STAMP)?;
+    Ok(conn)
+}
+
+/// The value of `PRAGMA user_version` on a database whose schema is exactly
+/// what this binary's `init_schema` produces. It combines `SCHEMA_VERSION`
+/// with a revision of the additive migrations: **bump `ADDITIVE_REV` whenever
+/// `init_schema` or `migrate_additive` gains a statement**, or databases
+/// stamped by the previous binary will never receive it.
+///
+/// Binaries from before the stamp ignore it. They cannot invalidate it
+/// either: on a version mismatch they wipe the file (the stamp goes with
+/// it), and their own schema statements are a subset of ours. An in-place
+/// upgrade from a *stamped* older schema must clear the stamp itself.
+const ADDITIVE_REV: i64 = 1;
+const SCHEMA_STAMP: i64 = SCHEMA_VERSION * 1000 + ADDITIVE_REV;
+
+fn schema_stamp(conn: &Connection) -> Option<i64> {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()
+}
+
+/// Open a connection and apply the per-connection settings (no schema work).
+fn connect(db_path: &Path, mode: JournalMode) -> Result<Connection> {
+    let mut conn = Connection::open(db_path)
+        .with_context(|| format!("opening database {}", db_path.display()))?;
+    if crate::profile::enabled() {
+        conn.profile(Some(crate::profile::sql_hook));
+    }
+    apply_pragmas(&conn, mode)?;
     Ok(conn)
 }
 
@@ -110,7 +155,7 @@ pub enum JournalMode {
 /// otherwise by classifying the filesystem under the database's directory.
 /// A pure function of environment + path, so every concurrent redo-msh
 /// process computes the same answer for the same database.
-fn choose_journal_mode(db_path: &Path) -> JournalMode {
+pub fn choose_journal_mode(db_path: &Path) -> JournalMode {
     if let Ok(v) = std::env::var("REDO_JOURNAL_MODE") {
         match v.to_ascii_lowercase().as_str() {
             "wal" => return JournalMode::Wal,
@@ -135,7 +180,7 @@ fn choose_journal_mode(db_path: &Path) -> JournalMode {
 /// is in WAL format (read/write format version 2). Read directly from the
 /// header because opening a WAL database through SQLite is exactly what
 /// fails on an mmap-unsafe filesystem.
-fn is_wal_format(db_path: &Path) -> bool {
+pub(crate) fn is_wal_format(db_path: &Path) -> bool {
     use std::io::Read;
     let mut header = [0u8; 20];
     match std::fs::File::open(db_path).and_then(|mut f| f.read_exact(&mut header)) {
@@ -237,7 +282,7 @@ fn upgrade_in_place(db_path: &Path, found: i64) -> Result<bool> {
 }
 
 /// Remove the database and its sidecar files (both journal modes).
-fn wipe(db_path: &Path) {
+pub(crate) fn wipe(db_path: &Path) {
     let _ = std::fs::remove_file(db_path);
     let _ = std::fs::remove_file(sidecar(db_path, "-wal"));
     let _ = std::fs::remove_file(sidecar(db_path, "-shm"));
@@ -250,6 +295,15 @@ fn sidecar(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The busy handler every redo connection uses (see `apply_pragmas`).
+pub(crate) fn install_busy_handler(conn: &Connection) -> Result<()> {
+    conn.busy_handler(Some(|count| {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        (count as u64) < BUSY_TIMEOUT.as_micros() as u64 / 200
+    }))?;
+    Ok(())
+}
+
 fn apply_pragmas(conn: &Connection, mode: JournalMode) -> Result<()> {
     // The busy handler must be set before journal_mode: the mode change
     // itself takes locks and can contend with concurrent peers. A custom
@@ -258,10 +312,7 @@ fn apply_pragmas(conn: &Connection, mode: JournalMode) -> Result<()> {
     // write transactions collide constantly, and paying 1-25ms per
     // collision serializes the build far below the database's actual
     // throughput. 200µs x 300k retries preserves the 60s overall budget.
-    conn.busy_handler(Some(|count| {
-        std::thread::sleep(std::time::Duration::from_micros(200));
-        (count as u64) < BUSY_TIMEOUT.as_micros() as u64 / 200
-    }))?;
+    install_busy_handler(conn)?;
     match mode {
         JournalMode::Wal => {
             // WAL: many readers + one writer; preferred for the parallel peer
@@ -293,11 +344,136 @@ fn apply_pragmas(conn: &Connection, mode: JournalMode) -> Result<()> {
 /// could deadlock two upgrading readers). This matters in both journal modes
 /// (WAL still has a single writer) and doubly under PERSIST, where readers
 /// and the writer also contend.
+#[track_caller]
 pub fn write_txn<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let mut span = if crate::profile::enabled() {
+        let at = std::panic::Location::caller();
+        crate::profile::span("db.txn", &format!("{}:{}", at.file(), at.line()))
+    } else {
+        crate::profile::span("db.txn", "")
+    };
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let begin_us = span.elapsed_us();
+    span.detail(|| format!("write lock after {begin_us}us"));
     let out = f(&tx)?;
     tx.commit()?;
     Ok(out)
+}
+
+/// One queued write: a few statements that need no result beyond success.
+/// `Fn`, not `FnOnce`: a batch that fails as a whole is retried job by job.
+pub type WriteJob = Box<dyn Fn(&Connection) -> Result<()> + Send>;
+
+/// Group commit for a process's small independent writes.
+///
+/// The parallel engine's task threads each issue one-statement writes
+/// ("verified this run", stamp-cache refreshes, wait-edge cleanup). As
+/// separate commits those serialize on the database's single write lock and
+/// pay a full durable commit each — hundreds of milliseconds apiece on a
+/// slow filesystem under the rollback journal, which made an up-to-date
+/// check of N targets cost N commits.
+///
+/// Here a writer queues its job and blocks until it is committed. Whoever
+/// finds no commit in progress becomes the leader: it takes everything
+/// queued, runs it as ONE transaction on its own connection, and publishes
+/// the results. Jobs that arrive meanwhile queue up for the next leader, so
+/// the batch size adapts to exactly how slow commits are. Nothing is
+/// deferred: `run` returns only after the caller's write is committed, so
+/// every ordering the engine relies on (a target is marked verified before
+/// its task settles, a wait edge is gone before its build starts) holds
+/// exactly as with a direct write.
+#[derive(Default)]
+pub struct GroupCommit {
+    state: std::sync::Mutex<GroupState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GroupState {
+    queue: Vec<(u64, WriteJob)>,
+    done: std::collections::HashMap<u64, std::result::Result<(), String>>,
+    leader: bool,
+    next_id: u64,
+}
+
+impl GroupCommit {
+    /// Commit `job`, batched with any other writes queued in this process.
+    /// `conn` is the caller's connection, used if the caller ends up leading.
+    pub fn run(&self, conn: &Connection, job: WriteJob) -> Result<()> {
+        // Inside an open transaction the write simply joins it (and a
+        // nested BEGIN would fail).
+        if !conn.is_autocommit() {
+            return job(conn);
+        }
+        let mut st = self.state.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.queue.push((id, job));
+        loop {
+            if let Some(res) = st.done.remove(&id) {
+                return res.map_err(|m| anyhow::anyhow!(m));
+            }
+            if st.leader {
+                st = self.cv.wait(st).unwrap();
+                continue;
+            }
+            // No commit in progress and our job is not done, so it is still
+            // queued: lead, and it is in the batch we take.
+            st.leader = true;
+            let batch = std::mem::take(&mut st.queue);
+            drop(st);
+            // Leadership is handed back on every exit, including a panic in
+            // a job: followers wait without a timeout.
+            let mut handback = Handback { group: self, results: Vec::new(), ids: Vec::new() };
+            handback.ids = batch.iter().map(|(id, _)| *id).collect();
+            handback.results = commit_batch(conn, &batch);
+            drop(handback);
+            st = self.state.lock().unwrap();
+        }
+    }
+}
+
+struct Handback<'a> {
+    group: &'a GroupCommit,
+    ids: Vec<u64>,
+    results: Vec<std::result::Result<(), String>>,
+}
+
+impl Drop for Handback<'_> {
+    fn drop(&mut self) {
+        let mut st = self.group.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.leader = false;
+        let mut results = std::mem::take(&mut self.results).into_iter();
+        for id in &self.ids {
+            let res = results
+                .next()
+                .unwrap_or_else(|| Err("internal error: write batch panicked".to_string()));
+            st.done.insert(*id, res);
+        }
+        self.group.cv.notify_all();
+    }
+}
+
+/// Run a batch as one transaction. If that fails, the batch is rolled back
+/// and each job gets its own transaction, so one bad write cannot fail (or
+/// be blamed on) its neighbours.
+fn commit_batch(conn: &Connection, batch: &[(u64, WriteJob)]) -> Vec<std::result::Result<(), String>> {
+    let mut span = crate::profile::span("db.group", "");
+    span.detail(|| format!("{} writes in one commit", batch.len()));
+    let whole = write_txn(conn, |c| {
+        for (_, job) in batch {
+            job(c)?;
+        }
+        Ok(())
+    });
+    match whole {
+        Ok(()) => batch.iter().map(|_| Ok(())).collect(),
+        Err(e) if batch.len() == 1 => vec![Err(format!("{e:#}"))],
+        Err(_) => batch
+            .iter()
+            .map(|(_, job)| write_txn(conn, |c| job(c)).map_err(|e| format!("{e:#}")))
+            .collect(),
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -335,6 +511,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS deps_by_target ON deps(target);
 
+        -- UNUSED since the waits-for graph moved to its own database
+        -- (`.redom/waits.db`, see waits.rs); kept so binaries from before
+        -- the move, which still use it here, find the layout they expect.
         -- The shared waits-for graph (see waits.rs), implementing the
         -- machine verified in verification/SpeculationMP.tla: one row per
         -- live wait edge "some traversal of `waiter` is blocked until
@@ -546,6 +725,9 @@ mod tests {
                 [],
             )
             .unwrap();
+            // A database really written by an older schema carries no (or
+            // another) stamp; ours would vouch for the current schema.
+            conn.pragma_update(None, "user_version", 0).unwrap();
         }
 
         // Reopening detects the mismatch and rebuilds from scratch.
@@ -561,6 +743,76 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 0, "stale data must be wiped on a schema mismatch");
 
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database this binary initialized is stamped, and a stamped database
+    /// is opened without re-running the schema statements; an unstamped one
+    /// of the current schema (written by a binary from before the stamp) is
+    /// initialized once more, keeping its data, and stamped.
+    #[test]
+    fn stamped_database_skips_schema_setup() {
+        let dir = std::env::temp_dir().join(format!("redo-msh-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        {
+            let conn = open(&path).unwrap();
+            assert_eq!(schema_stamp(&conn), Some(SCHEMA_STAMP));
+            conn.execute("INSERT INTO files(path) VALUES ('kept.txt')", []).unwrap();
+            // Proof the fast path runs no schema statement: with the table
+            // gone, a stamped open must not recreate it.
+            conn.execute_batch("DROP TABLE requests").unwrap();
+        }
+        {
+            let conn = open(&path).unwrap();
+            assert!(conn.prepare("SELECT 1 FROM requests").is_err());
+            conn.pragma_update(None, "user_version", 0).unwrap();
+        }
+        let conn = open(&path).unwrap();
+        assert!(conn.prepare("SELECT 1 FROM requests").is_ok());
+        assert_eq!(schema_stamp(&conn), Some(SCHEMA_STAMP));
+        let rows: i64 = conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent writers' jobs all commit, and each caller gets its own
+    /// job's result even when a batch-mate fails.
+    #[test]
+    fn group_commit_commits_every_job_and_isolates_failures() {
+        let dir = std::env::temp_dir().join(format!("redo-msh-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        drop(open(&path).unwrap());
+        let group = std::sync::Arc::new(GroupCommit::default());
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let (group, path) = (group.clone(), path.clone());
+                std::thread::spawn(move || {
+                    let conn = open(&path).unwrap();
+                    let bad = i % 4 == 0;
+                    let res = group.run(
+                        &conn,
+                        Box::new(move |c| {
+                            if bad {
+                                c.execute("INSERT INTO no_such_table VALUES (1)", [])?;
+                            }
+                            c.execute("INSERT INTO files(path) VALUES (?1)", [format!("f{i}")])?;
+                            Ok(())
+                        }),
+                    );
+                    assert_eq!(res.is_err(), bad, "job {i}: {res:?}");
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let rows: i64 = conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 12);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

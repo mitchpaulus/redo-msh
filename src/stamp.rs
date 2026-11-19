@@ -49,9 +49,12 @@ pub fn mtime_nanos(meta: &fs::Metadata) -> i64 {
 
 /// blake3 hash of a file's contents, as hex.
 pub fn hash_file(path: &Path) -> Result<String> {
+    let mut span = crate::profile::span("hash", &path.to_string_lossy());
     let mut hasher = blake3::Hasher::new();
     let mut f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    io::copy(&mut f, &mut hasher).with_context(|| format!("reading {}", path.display()))?;
+    let bytes =
+        io::copy(&mut f, &mut hasher).with_context(|| format!("reading {}", path.display()))?;
+    span.detail(|| format!("{bytes} bytes"));
     Ok(hasher.finalize().to_hex().to_string())
 }
 

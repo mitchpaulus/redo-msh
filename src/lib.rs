@@ -16,6 +16,7 @@ pub mod lock;
 pub mod logs;
 pub mod parallel;
 pub mod paths;
+pub mod profile;
 pub mod root;
 pub mod stamp;
 pub mod proctree;
@@ -33,6 +34,13 @@ use std::path::Path;
 /// `requested`, `ood`, `tree`); if it is not a known verb, every argument is treated as a target
 /// to build.
 pub fn run(raw_args: &[String]) -> Result<()> {
+    profile::process_start();
+    let result = run_inner(raw_args);
+    profile::finish_process(&profile::describe_process("redo-msh", raw_args));
+    result
+}
+
+fn run_inner(raw_args: &[String]) -> Result<()> {
     // Help and version are recognized in any position, before other parsing.
     // (A target literally named `-h` must be given as a path, e.g. `./-h`.)
     if raw_args.iter().any(|a| a == "-h" || a == "--help") {
@@ -85,6 +93,7 @@ pub fn run(raw_args: &[String]) -> Result<()> {
 /// top-level `redo` build command; otherwise the fixed verb applies to all
 /// arguments. Handles its own error reporting and process exit.
 pub fn forward(verb: Option<&str>) -> ! {
+    profile::process_start();
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let prog = prog_name(verb);
 
@@ -107,6 +116,7 @@ pub fn forward(verb: Option<&str>) -> ! {
             1
         }
     };
+    profile::finish_process(&profile::describe_process(verb.unwrap_or("redo"), &raw));
     std::process::exit(code);
 }
 
@@ -137,6 +147,8 @@ OPTIONS:
                      unless --yes is given)
     -v, --verbose    explain every rebuild/up-to-date decision as it is made
     --debug-jobs     trace jobserver tokens and parallel target groups
+    --profile[=FILE] write a timing profile of the run to FILE
+                     (default: redo-profile.txt)
     -h, --help       show this help
     --version        print version
 {dash_note}"
@@ -282,6 +294,11 @@ pub fn extract_jobs(args: &[String]) -> Result<(usize, Vec<String>)> {
         } else if a == "--debug-jobs" {
             // Trace jobserver tokens and parallel groups; inherited too.
             std::env::set_var("REDO_DEBUG_JOBS", "1");
+        } else if a == "--profile" {
+            // Time the whole run into a report file; inherited too.
+            profile::request(None);
+        } else if let Some(p) = a.strip_prefix("--profile=") {
+            profile::request(Some(p));
         } else {
             rest.push(a.clone());
         }
@@ -346,6 +363,10 @@ OPTIONS:
                                   it is made (also: REDO_VERBOSE=1)
     --debug-jobs                  trace jobserver tokens and parallel target
                                   groups (also: REDO_DEBUG_JOBS=1)
+    --profile[=FILE]              write a timing profile of the whole run (every
+                                  redo process in it) to FILE, default
+                                  redo-profile.txt: where the time went, per
+                                  target, per SQL statement, per phase
     --version                     print version
     -h, --help                    show this help
 

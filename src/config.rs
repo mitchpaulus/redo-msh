@@ -121,6 +121,7 @@ impl Config {
     /// Load `redo.toml` from the project root. A missing file yields the empty
     /// (all-defaults) configuration; a malformed file is an error.
     pub fn load(root: &Path) -> Result<Config> {
+        let _p = crate::profile::span("config.load", "");
         let path = root.join("redo.toml");
         match std::fs::read_to_string(&path) {
             Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
