@@ -8,3 +8,5 @@
 verification/states/
 verification/*.out
 verification/*.old
+
+redo-profile.txt
